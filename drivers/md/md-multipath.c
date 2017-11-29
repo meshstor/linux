@@ -25,7 +25,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include "md.h"
-#include "multipath.h"
+#include "md-multipath.h"
 
 #define MAX_WORK_PER_DISK 128
 
@@ -134,7 +134,7 @@ static bool multipath_make_request(struct mddev *mddev, struct bio * bio)
 	__bio_clone_fast(&mp_bh->bio, bio);
 
 	mp_bh->bio.bi_iter.bi_sector += multipath->rdev->data_offset;
-	mp_bh->bio.bi_bdev = multipath->rdev->bdev;
+	bio_set_dev(&mp_bh->bio, multipath->rdev->bdev);
 	mp_bh->bio.bi_opf |= REQ_FAILFAST_TRANSPORT;
 	mp_bh->bio.bi_end_io = multipath_end_request;
 	mp_bh->bio.bi_private = mp_bh;
@@ -243,7 +243,6 @@ static void print_multipath_conf (struct mpconf *conf)
 static int multipath_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 {
 	struct mpconf *conf = mddev->private;
-	struct request_queue *q;
 	int err = -EEXIST;
 	int path;
 	struct multipath_info *p;
@@ -257,7 +256,6 @@ static int multipath_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 
 	for (path = first; path <= last; path++)
 		if ((p=conf->multipaths+path)->rdev == NULL) {
-			q = rdev->bdev->bd_disk->queue;
 			disk_stack_limits(mddev->gendisk, rdev->bdev,
 					  rdev->data_offset << 9);
 
@@ -345,17 +343,17 @@ static void multipathd(struct md_thread *thread)
 
 		if ((mp_bh->path = multipath_map (conf))<0) {
 			pr_err("multipath: %s: unrecoverable IO read error for block %llu\n",
-			       bdevname(bio->bi_bdev,b),
+			       bio_devname(bio, b),
 			       (unsigned long long)bio->bi_iter.bi_sector);
 			multipath_end_bh_io(mp_bh, BLK_STS_IOERR);
 		} else {
 			pr_err("multipath: %s: redirecting sector %llu to another IO path\n",
-			       bdevname(bio->bi_bdev,b),
+			       bio_devname(bio, b),
 			       (unsigned long long)bio->bi_iter.bi_sector);
 			*bio = *(mp_bh->master_bio);
 			bio->bi_iter.bi_sector +=
 				conf->multipaths[mp_bh->path].rdev->data_offset;
-			bio->bi_bdev = conf->multipaths[mp_bh->path].rdev->bdev;
+			bio_set_dev(bio, conf->multipaths[mp_bh->path].rdev->bdev);
 			bio->bi_opf |= REQ_FAILFAST_TRANSPORT;
 			bio->bi_end_io = multipath_end_request;
 			bio->bi_private = mp_bh;
