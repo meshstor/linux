@@ -4372,9 +4372,15 @@ static unsigned int raid10_nr_stripes(struct r10conf *conf)
 	return raid_disks / conf->geo.near_copies;
 }
 
-static int raid10_set_queue_limits(struct mddev *mddev)
+/*
+ * Take @conf explicitly and derive the chunk size from its (new) geometry
+ * rather than from mddev->chunk_sectors, so this can also be called from
+ * raid10_takeover_raid1() before level_store() commits mddev->chunk_sectors.
+ * For an already-running array the two are identical.
+ */
+static int raid10_set_queue_limits(struct mddev *mddev, struct r10conf *conf)
 {
-	struct r10conf *conf = mddev->private;
+	unsigned int chunk_sectors = conf->geo.chunk_mask + 1;
 	struct queue_limits lim;
 	int err;
 
@@ -4382,8 +4388,8 @@ static int raid10_set_queue_limits(struct mddev *mddev)
 	lim.max_write_zeroes_sectors = 0;
 	lim.max_hw_wzeroes_unmap_sectors = 0;
 	lim.logical_block_size = mddev->logical_block_size;
-	lim.io_min = mddev->chunk_sectors << 9;
-	lim.chunk_sectors = mddev->chunk_sectors;
+	lim.io_min = chunk_sectors << 9;
+	lim.chunk_sectors = chunk_sectors;
 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
@@ -4463,7 +4469,7 @@ static int raid10_run(struct mddev *mddev)
 	}
 
 	if (!mddev_is_dm(conf->mddev)) {
-		int err = raid10_set_queue_limits(mddev);
+		int err = raid10_set_queue_limits(mddev, conf);
 
 		if (err) {
 			ret = err;
@@ -4668,12 +4674,231 @@ static void *raid10_takeover_raid0(struct mddev *mddev, sector_t size, int devs)
 	return conf;
 }
 
+static void *raid10_takeover_raid1(struct mddev *mddev)
+{
+	struct md_rdev *rdev;
+	struct r10conf *conf;
+	int new_chunk;
+
+	/*
+	 * raid1 -> raid10 takeover: zero-copy personality swap into
+	 * raid10_near(near_copies = raid_disks). Valid only when every
+	 * disk already carries full data (byte-identity invariant). The
+	 * helper runs all preconditions before mutating any mddev field
+	 * so that a refusal leaves the array unchanged.
+	 *
+	 * level_store() commits the personality swap by freeing the old
+	 * raid1 conf, an irreversible step, and only then calls raid10_run().
+	 * To keep that post-swap window from stranding a private==NULL array
+	 * on failure, every operation that can fail is done here, before the
+	 * swap: setup_conf() builds the r10conf and raid10_set_queue_limits()
+	 * -- raid10_run()'s only post-swap failure point -- is validated too.
+	 * A failure here refuses the takeover cleanly instead.
+	 */
+
+	if (mddev->major_version == 0) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: v0.90 metadata cannot represent raid10 layout\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (mddev->reshape_position != MaxSector) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: reshape in progress or unclean reshape_position\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (mddev->external_size) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: array_sectors explicitly set; takeover would expose hidden sectors\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (mddev->raid_disks < 2) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: need at least 2 disks\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * near_copies in new_layout below occupies only the low 8 bits, so
+	 * raid_disks must be <= 255. A v1.x raid1 is not capped at 255
+	 * members; without this guard raid_disks >= 256 aliases into a
+	 * smaller near_copies (e.g. 258 -> 2), which setup_conf() accepts as
+	 * a striping geometry that does not match the on-disk mirror layout
+	 * -> silent corruption.
+	 */
+	if (mddev->raid_disks > 255) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: %d disks exceeds the 255 the raid10 near_copies layout can encode\n",
+			mdname(mddev), mddev->raid_disks);
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (mddev->degraded > 0) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: array is degraded\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * The byte-identity invariant only holds when every member is fully
+	 * in sync. resync_offset < MaxSector means an initial or interrupted
+	 * resync has not completed (e.g. a frozen resync, or an array
+	 * assembled mid-resync), so the legs may diverge past that point.
+	 * Refuse rather than stamp the array clean and suppress the
+	 * reconstruction raid10_run() would otherwise start. This mirrors
+	 * raid5_takeover_raid1(), which likewise leaves resync_offset
+	 * untouched and lets the new personality resync a non-clean array.
+	 */
+	if (mddev->resync_offset != MaxSector) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: array is not fully in sync (resync incomplete)\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * Byte-identity needs every active member fully in sync and a plain
+	 * mirror: no write-mostly leg (its data may lag) and no replacement in
+	 * flight. degraded == 0 and resync_offset == MaxSector already imply
+	 * In_sync today, but assert it explicitly so the invariant survives
+	 * future raid1 degraded-counting changes. One pass covers all three.
+	 */
+	rdev_for_each(rdev, mddev) {
+		if (rdev->raid_disk >= 0 &&
+		    !test_bit(In_sync, &rdev->flags)) {
+			pr_warn("md/raid10:%s: raid1->raid10 takeover refused: member is not in sync\n",
+				mdname(mddev));
+			return ERR_PTR(-EINVAL);
+		}
+		if (test_bit(WriteMostly, &rdev->flags)) {
+			pr_warn("md/raid10:%s: raid1->raid10 takeover refused: write-mostly member present\n",
+				mdname(mddev));
+			return ERR_PTR(-EINVAL);
+		}
+		if (test_bit(Replacement, &rdev->flags)) {
+			pr_warn("md/raid10:%s: raid1->raid10 takeover refused: replacement in flight\n",
+				mdname(mddev));
+			return ERR_PTR(-EINVAL);
+		}
+	}
+
+	if (mddev->bitmap_info.max_write_behind != 0) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: write-behind bitmap configured\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (mddev_is_clustered(mddev)) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: clustered arrays not supported\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * level_store() already rejects with -EBUSY when MD_RECOVERY_RUNNING
+	 * is set, and mddev_suspend_and_lock prevents a new sync thread from
+	 * starting while we hold the lock. Re-check the same bit here as
+	 * defense in depth so a future refactor of level_store cannot let a
+	 * live sync thread race the personality swap.
+	 *
+	 * Do NOT test the whole mddev->recovery bitfield: residual flags
+	 * like MD_RECOVERY_NEEDED, MD_RECOVERY_DONE, MD_RECOVERY_INTR and
+	 * MD_RECOVERY_FROZEN may be set after a completed resync or by
+	 * intermediate sysfs writes (e.g., mdadm --grow writes chunk_size,
+	 * layout and raid_disks before level, and each may set NEEDED).
+	 * None of those represent an active operation.
+	 */
+	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: sync thread is running\n",
+			mdname(mddev));
+		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * Pick the chunk size. raid1 has no chunking (mddev->chunk_sectors
+	 * == 0 on entry) and raid1_reshape() rejects chunk_sectors writes,
+	 * so default to 512 KiB (1024 sectors), matching mdadm's
+	 * DEFAULT_CHUNK.
+	 *
+	 * raid10_size() floors the array to a whole number of chunks, but
+	 * raid1_size() does not, so a chunk that does not divide the member
+	 * size would silently shrink the array and drop the tail (where ext4
+	 * backup superblocks and the last extent live). For near_copies ==
+	 * raid_disks every disk holds a full sequential copy regardless of
+	 * chunk size, so the byte-identity invariant is independent of the
+	 * chunk: shrink it (as raid5_takeover_raid1() does) until it divides
+	 * dev_sectors, and refuse outright if not even the minimum PAGE_SIZE
+	 * chunk fits, rather than shrink the array under a live filesystem.
+	 */
+	new_chunk = mddev->chunk_sectors ? : 1024;
+	while (new_chunk > (PAGE_SIZE >> 9) &&
+	       (mddev->dev_sectors & (new_chunk - 1)))
+		new_chunk >>= 1;
+	if (mddev->dev_sectors & (new_chunk - 1)) {
+		pr_warn("md/raid10:%s: raid1->raid10 takeover refused: member size %llu sectors is not chunk-aligned; takeover would shrink the array and lose the tail\n",
+			mdname(mddev), (unsigned long long)mddev->dev_sectors);
+		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * Preconditions pass. Commit the new geometry and let setup_conf()
+	 * stand up the r10conf. All values set here match what
+	 * raid10_takeover_raid0() does for its own case, adjusted for
+	 * near_copies = raid_disks.
+	 *
+	 * resync_offset is deliberately left untouched: a clean raid1
+	 * already carries MaxSector (preserving the zero-copy fast path),
+	 * and the resync_offset == MaxSector precondition above guarantees
+	 * it. Forcing it here would mark a non-clean array clean.
+	 */
+	mddev->new_level = 10;
+	/* near=N, far=1, no offset (raid_disks <= 255 guaranteed above) */
+	mddev->new_layout = (1 << 8) | mddev->raid_disks;
+	mddev->new_chunk_sectors = new_chunk;
+	mddev->delta_disks = 0;
+
+	conf = setup_conf(mddev);
+	if (IS_ERR(conf))
+		return conf;
+
+	/*
+	 * Validate (and, while the array is suspended, apply) the raid10 queue
+	 * limits now -- before level_store() commits the swap. This is the one
+	 * step in raid10_run() that can fail after the swap, so doing it here
+	 * turns that failure into a clean refusal instead of a private==NULL
+	 * raid10 array left online to oops on the next I/O. raid10_run()
+	 * re-applies the same limits harmlessly once the swap is committed.
+	 */
+	if (!mddev_is_dm(mddev)) {
+		int err = raid10_set_queue_limits(mddev, conf);
+
+		if (err) {
+			/*
+			 * setup_conf() registered the raid10 kthread into
+			 * conf->thread; raid10_run() (which would move it to
+			 * mddev->thread) has not run yet, and raid10_free_conf()
+			 * does not touch conf->thread. Unregister it here so the
+			 * refusal does not leak the kthread.
+			 */
+			md_unregister_thread(mddev, &conf->thread);
+			raid10_free_conf(conf);
+			pr_warn("md/raid10:%s: raid1->raid10 takeover refused: cannot set raid10 queue limits (err=%d)\n",
+				mdname(mddev), err);
+			return ERR_PTR(err);
+		}
+	}
+
+	return conf;
+}
+
 static void *raid10_takeover(struct mddev *mddev)
 {
 	struct r0conf *raid0_conf;
 
 	/* raid10 can take over:
 	 *  raid0 - providing it has only two drives
+	 *  raid1 - into raid10_near(N,N), zero-copy
+	 *          (see raid10_takeover_raid1)
 	 */
 	if (mddev->level == 0) {
 		/* for raid0 takeover only one zone is supported */
@@ -4687,6 +4912,8 @@ static void *raid10_takeover(struct mddev *mddev)
 			raid0_conf->strip_zone->zone_end,
 			raid0_conf->strip_zone->nb_dev);
 	}
+	if (mddev->level == 1)
+		return raid10_takeover_raid1(mddev);
 	return ERR_PTR(-EINVAL);
 }
 
