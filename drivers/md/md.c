@@ -4218,7 +4218,22 @@ level_store(struct mddev *mddev, const char *buf, size_t len)
 		mddev->in_sync = 1;
 		timer_delete_sync(&mddev->safemode_timer);
 	}
-	pers->run(mddev);
+	rv = pers->run(mddev);
+	if (rv) {
+		/*
+		 * oldpers->free() has already destroyed the old
+		 * personality state above, so there is nothing to
+		 * roll back to. Surface the failure loudly, skip
+		 * the superblock update so on-disk metadata still
+		 * reflects whatever the last good write left
+		 * behind, and return -EIO. The admin must stop
+		 * and reassemble the array.
+		 */
+		pr_crit("md: %s: new personality %s run() failed after level change (err=%zd); array is in an inconsistent state and must be stopped\n",
+			mdname(mddev), pers->head.name, rv);
+		rv = -EIO;
+		goto out_unlock;
+	}
 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
 	if (!mddev->thread)
 		md_update_sb(mddev, 1);
