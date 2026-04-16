@@ -26,6 +26,7 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/blkdev.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/ratelimit.h>
@@ -395,6 +396,25 @@ static void raid1_end_read_request(struct bio *bio)
 	update_head_pos(r1_bio->read_disk, r1_bio);
 
 	if (uptodate) {
+		u64 sample = ktime_get_ns() - r1_bio->submit_ns;
+		u64 old = rdev->latency_ewma_ns;
+
+		if (sample > MD_LATENCY_CLAMP_NS)
+			sample = MD_LATENCY_CLAMP_NS;
+
+		/*
+		 * Integer EWMA with alpha = 1/16 (shift 4):
+		 *   new = old + (sample - old) / 16
+		 * Cold-start: seed directly from first sample so the
+		 * cost function works from the very first completed IO.
+		 * Signed subtraction via s64 cast handles sample < old.
+		 */
+		if (unlikely(old == 0))
+			rdev->latency_ewma_ns = sample;
+		else
+			rdev->latency_ewma_ns = old +
+				(u64)((s64)(sample - old) >> MD_EWMA_SHIFT);
+
 		set_bit(R1BIO_Uptodate, &r1_bio->state);
 	} else if (test_bit(FailFast, &rdev->flags) &&
 		 test_bit(R1BIO_FailFast, &r1_bio->state)) {
@@ -784,6 +804,9 @@ struct read_balance_ctl {
 	int min_pending_disk;
 	int sequential_disk;
 	int readable_disks;
+	u64 min_cost;		/* latency_ewma_ns * (nr_pending + 1) */
+	int min_cost_disk;
+	u64 runner_up_cost;	/* second-best cost, for 12.5% tiebreak */
 };
 
 static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
@@ -795,6 +818,9 @@ static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
 		.min_pending_disk       = -1,
 		.min_pending            = UINT_MAX,
 		.sequential_disk	= -1,
+		.min_cost_disk		= -1,
+		.min_cost		= U64_MAX,
+		.runner_up_cost		= U64_MAX,
 	};
 
 	for (disk = 0 ; disk < conf->raid_disks * 2 ; disk++) {
@@ -842,6 +868,19 @@ static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
 			ctl.closest_dist = dist;
 			ctl.closest_dist_disk = disk;
 		}
+
+		{
+			u64 cost = rdev->latency_ewma_ns *
+				   (u64)(pending + 1);
+
+			if (cost < ctl.min_cost) {
+				ctl.runner_up_cost = ctl.min_cost;
+				ctl.min_cost = cost;
+				ctl.min_cost_disk = disk;
+			} else if (cost < ctl.runner_up_cost) {
+				ctl.runner_up_cost = cost;
+			}
+		}
 	}
 
 	/*
@@ -852,10 +891,23 @@ static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
 		return ctl.sequential_disk;
 
 	/*
-	 * If all disks are rotational, choose the closest disk. If any disk is
-	 * non-rotational, choose the disk with less pending request even the
-	 * disk is rotational, which might/might not be optimal for raids with
-	 * mixed ratation/non-rotational disks depending on workload.
+	 * Latency-aware cost-based pick with 12.5% tiebreak. When the
+	 * winner is only marginally better than the runner-up (cost delta
+	 * within cost >> 3), fall back to the historical closest-distance
+	 * heuristic so symmetric mirrors don't ping-pong between legs and
+	 * defeat read-ahead / head-locality.
+	 */
+	if (ctl.min_cost_disk != -1) {
+		if (ctl.runner_up_cost != U64_MAX &&
+		    ctl.runner_up_cost - ctl.min_cost < ctl.min_cost >> 3 &&
+		    ctl.closest_dist_disk != -1)
+			return ctl.closest_dist_disk;
+		return ctl.min_cost_disk;
+	}
+
+	/*
+	 * No cost-based winner (no readable disks reached the cost stage).
+	 * Fall through to the historical logic for safety.
 	 */
 	if (ctl.min_pending_disk != -1 &&
 	    (READ_ONCE(conf->nonrot_disks) || ctl.min_pending == 0))
@@ -1428,6 +1480,7 @@ static void raid1_read_request(struct mddev *mddev, struct bio *bio,
 	        read_bio->bi_opf |= MD_FAILFAST;
 	read_bio->bi_private = r1_bio;
 	mddev_trace_remap(mddev, read_bio, r1_bio->sector);
+	r1_bio->submit_ns = ktime_get_ns();
 	submit_bio_noacct(read_bio);
 	return;
 

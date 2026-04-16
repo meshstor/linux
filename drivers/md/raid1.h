@@ -152,6 +152,14 @@ struct r1bio {
 	struct bio		*behind_master_bio;
 
 	/*
+	 * Submit-time timestamp (ktime_get_ns()) for the read path.
+	 * Stamped in raid1_read_request right before submit_bio_noacct,
+	 * consumed in raid1_end_read_request to update rdev->latency_ewma_ns.
+	 * Only meaningful on the read path; unused for writes.
+	 */
+	u64			submit_ns;
+
+	/*
 	 * if the IO is in WRITE direction, then multiple bios are used.
 	 * We choose the number when they are allocated.
 	 */
