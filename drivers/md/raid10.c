@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/blkdev.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/ratelimit.h>
@@ -391,6 +392,25 @@ static void raid10_end_read_request(struct bio *bio)
 	update_head_pos(slot, r10_bio);
 
 	if (uptodate) {
+		if (!test_bit(R10BIO_IsReshape, &r10_bio->state)) {
+			u64 sample = ktime_get_ns() - r10_bio->submit_ns;
+			u64 old = rdev->latency_ewma_ns;
+
+			if (sample > MD_LATENCY_CLAMP_NS)
+				sample = MD_LATENCY_CLAMP_NS;
+
+			/*
+			 * Integer EWMA with alpha = 1/16. Cold-start:
+			 * seed directly from first sample so the cost
+			 * function works immediately. See raid1.c for
+			 * the full rationale.
+			 */
+			if (unlikely(old == 0))
+				rdev->latency_ewma_ns = sample;
+			else
+				rdev->latency_ewma_ns = old +
+					(u64)((s64)(sample - old) >> MD_EWMA_SHIFT);
+		}
 		/*
 		 * Set R10BIO_Uptodate in our master bio, so that
 		 * we will return a good error code to the higher
@@ -730,10 +750,14 @@ static struct md_rdev *read_balance(struct r10conf *conf,
 	int best_good_sectors;
 	sector_t new_distance, best_dist;
 	struct md_rdev *best_dist_rdev, *best_pending_rdev, *rdev = NULL;
+	struct md_rdev *best_cost_rdev = NULL;
 	int do_balance;
 	int best_dist_slot, best_pending_slot;
+	int best_cost_slot = -1;
 	bool has_nonrot_disk = false;
 	unsigned int min_pending;
+	u64 best_cost = U64_MAX;
+	u64 runner_up_cost = U64_MAX;
 	struct geom *geo = &conf->geo;
 
 	raid10_find_phys(conf, r10_bio);
@@ -747,6 +771,17 @@ static struct md_rdev *read_balance(struct r10conf *conf,
 	clear_bit(R10BIO_FailFast, &r10_bio->state);
 
 	if (raid1_should_read_first(conf->mddev, this_sector, sectors))
+		do_balance = 0;
+
+	/*
+	 * Reshape reads must not go through the latency-aware cost
+	 * function: the reshape_request path calls us with R10BIO_IsReshape
+	 * set, and reshape has its own invariants around which physical copy
+	 * supplies the source data. Force the "first valid copy" walk that
+	 * the resync path also uses — this preserves pre-patch behaviour
+	 * for reshape exactly.
+	 */
+	if (test_bit(R10BIO_IsReshape, &r10_bio->state))
 		do_balance = 0;
 
 	for (slot = 0; slot < conf->copies ; slot++) {
@@ -815,6 +850,20 @@ static struct md_rdev *read_balance(struct r10conf *conf,
 			best_pending_rdev = rdev;
 		}
 
+		if (do_balance) {
+			u64 cost = rdev->latency_ewma_ns *
+				   (u64)(pending + 1);
+
+			if (cost < best_cost) {
+				runner_up_cost = best_cost;
+				best_cost = cost;
+				best_cost_slot = slot;
+				best_cost_rdev = rdev;
+			} else if (cost < runner_up_cost) {
+				runner_up_cost = cost;
+			}
+		}
+
 		if (best_dist_slot >= 0)
 			/* At least 2 disks to choose from so failfast is OK */
 			set_bit(R10BIO_FailFast, &r10_bio->state);
@@ -839,7 +888,24 @@ static struct md_rdev *read_balance(struct r10conf *conf,
 		}
 	}
 	if (slot >= conf->copies) {
-		if (has_nonrot_disk) {
+		if (do_balance && best_cost_slot >= 0) {
+			/*
+			 * Cost-based pick with 12.5% tiebreak: if the winner
+			 * is only marginally better than the runner-up, fall
+			 * back to the closest-distance heuristic to avoid
+			 * ping-ponging on symmetric mirrors. Matches the
+			 * raid1 sibling patch's tiebreak rule.
+			 */
+			if (runner_up_cost != U64_MAX &&
+			    runner_up_cost - best_cost < best_cost >> 3 &&
+			    best_dist_slot >= 0) {
+				slot = best_dist_slot;
+				rdev = best_dist_rdev;
+			} else {
+				slot = best_cost_slot;
+				rdev = best_cost_rdev;
+			}
+		} else if (has_nonrot_disk) {
 			slot = best_pending_slot;
 			rdev = best_pending_rdev;
 		} else {
@@ -1236,6 +1302,7 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
 	        read_bio->bi_opf |= MD_FAILFAST;
 	read_bio->bi_private = r10_bio;
 	mddev_trace_remap(mddev, read_bio, r10_bio->sector);
+	r10_bio->submit_ns = ktime_get_ns();
 	submit_bio_noacct(read_bio);
 	return;
 err_handle:
