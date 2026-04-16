@@ -1202,6 +1202,18 @@ static void llbitmap_start_write(struct mddev *mddev, sector_t offset,
 		page_start++;
 	}
 
+	/*
+	 * Single-chunk writes to an already-Dirty region are a no-op for the
+	 * state machine: state_machine[BitDirty][BitmapActionStartwrite] is
+	 * BitNone. The barrier ref above prevents the daemon from clearing
+	 * Dirty on this page, so the read is stable for this IO.
+	 */
+	if (likely(start == end &&
+		   !mddev->degraded &&
+		   !raid_is_456(mddev) &&
+		   llbitmap_read(llbitmap, start) == BitDirty))
+		return;
+
 	llbitmap_state_machine(llbitmap, start, end, BitmapActionStartwrite);
 }
 
