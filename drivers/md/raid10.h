@@ -129,6 +129,18 @@ struct r10bio {
 	int			read_slot;
 
 	struct list_head	retry_list;
+
+	/*
+	 * Submit-time timestamp for the read path (ktime_get_ns()).
+	 * Stamped in raid10_read_request right before submit_bio_noacct,
+	 * consumed in raid10_end_read_request to update rdev->latency_ewma_ns.
+	 * NOT stamped on the reshape path (reshape_request calls read_balance
+	 * with R10BIO_IsReshape set) and NOT consumed by the EWMA update when
+	 * R10BIO_IsReshape is set; reshape reads bypass the cost function
+	 * entirely. Only meaningful on the normal read path.
+	 */
+	u64			submit_ns;
+
 	/*
 	 * if the IO is in WRITE direction, then multiple bios are used,
 	 * one for each copy.
