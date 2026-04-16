@@ -756,6 +756,20 @@ static enum llbitmap_state llbitmap_state_machine(struct llbitmap *llbitmap,
 			goto write_bitmap;
 		}
 
+		/*
+		 * Writes to already-Dirty bits transition to BitNone on
+		 * non-degraded, non-raid456 arrays. Skip the rest of the
+		 * loop body — the barrier ref held by the caller prevents
+		 * the daemon from racing the state read.
+		 */
+		if (likely(action == BitmapActionStartwrite &&
+			   c == BitDirty &&
+			   !mddev->degraded &&
+			   !level_456)) {
+			start++;
+			continue;
+		}
+
 		if (c == BitNeedSync || c == BitNeedSyncUnwritten)
 			need_resync = !mddev->degraded;
 
