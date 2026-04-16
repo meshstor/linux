@@ -27,6 +27,16 @@
  */
 #define	NR_RAID_BIOS 256
 
+/*
+ * Latency-aware read balance constants (used by raid1/raid10).
+ * latency_ewma_ns on struct md_rdev is updated on each successful
+ * read completion with an EWMA of sample latency; read_balance
+ * uses cost = latency_ewma_ns * (nr_pending + 1) to pick the
+ * lowest-cost mirror leg.
+ */
+#define MD_EWMA_SHIFT		4		/* EWMA alpha = 1/16 */
+#define MD_LATENCY_CLAMP_NS	10000000ULL	/* 10 ms per-sample clamp */
+
 enum md_submodule_type {
 	MD_PERSONALITY = 0,
 	MD_CLUSTER,
@@ -196,6 +206,10 @@ struct md_rdev {
 					 * only maintained for arrays that
 					 * support hot removal
 					 */
+	u64		latency_ewma_ns; /* EWMA of read completion latency (ns);
+					  * input to read-balance cost function;
+					  * see MD_EWMA_* in this header.
+					  */
 	atomic_t	read_errors;	/* number of consecutive read errors that
 					 * we have tried to ignore.
 					 */
