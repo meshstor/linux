@@ -2,30 +2,6 @@
 #ifndef _RAID1_H
 #define _RAID1_H
 
-/*
- * each barrier unit size is 64MB fow now
- * note: it must be larger than RESYNC_DEPTH
- */
-#define BARRIER_UNIT_SECTOR_BITS	17
-#define BARRIER_UNIT_SECTOR_SIZE	(1<<17)
-/*
- * In struct r1conf, the following members are related to I/O barrier
- * buckets,
- *	atomic_t	*nr_pending;
- *	atomic_t	*nr_waiting;
- *	atomic_t	*nr_queued;
- *	atomic_t	*barrier;
- * Each of them points to array of atomic_t variables, each array is
- * designed to have BARRIER_BUCKETS_NR elements and occupy a single
- * memory page. The data width of atomic_t variables is 4 bytes, equal
- * to 1<<(ilog2(sizeof(atomic_t))), BARRIER_BUCKETS_NR_BITS is defined
- * as (PAGE_SHIFT - ilog2(sizeof(int))) to make sure an array of
- * atomic_t variables with BARRIER_BUCKETS_NR elements just exactly
- * occupies a single memory page.
- */
-#define BARRIER_BUCKETS_NR_BITS		(PAGE_SHIFT - ilog2(sizeof(atomic_t)))
-#define BARRIER_BUCKETS_NR		(1<<BARRIER_BUCKETS_NR_BITS)
-
 /* Note: raid1_info.rdev can be set to NULL asynchronously by raid1_remove_disk.
  * There are three safe ways to access raid1_info.rdev.
  * 1/ when holding mddev->reconfig_mutex
@@ -186,9 +162,4 @@ enum r1bio_state {
 	R1BIO_FailFast,
 };
 
-static inline int sector_to_idx(sector_t sector)
-{
-	return hash_long(sector >> BARRIER_UNIT_SECTOR_BITS,
-			 BARRIER_BUCKETS_NR_BITS);
-}
 #endif
