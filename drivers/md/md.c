@@ -3263,6 +3263,14 @@ static struct rdev_sysfs_entry rdev_errors =
 __ATTR(errors, S_IRUGO|S_IWUSR, errors_show, errors_store);
 
 static ssize_t
+latency_ewma_show(struct md_rdev *rdev, char *page)
+{
+	return sprintf(page, "%llu\n", rdev->latency_ewma_ns);
+}
+static struct rdev_sysfs_entry rdev_latency_ewma =
+__ATTR(latency_ewma_ns, 0444, latency_ewma_show, NULL);
+
+static ssize_t
 slot_show(struct md_rdev *rdev, char *page)
 {
 	if (test_bit(Journal, &rdev->flags))
@@ -3708,6 +3716,7 @@ static struct attribute *rdev_default_attrs[] = {
 	&rdev_unack_bad_blocks.attr,
 	&rdev_ppl_sector.attr,
 	&rdev_ppl_size.attr,
+	&rdev_latency_ewma.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(rdev_default);
