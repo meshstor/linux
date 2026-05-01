@@ -1,0 +1,30 @@
+# meshstor-md DKMS out-of-tree wrapper Makefile
+# Rendered from dkms/Makefile.in at tarball build time.
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+obj-m := md_mod.o md-llbitmap.o raid0.o raid1.o raid10.o raid456.o
+
+md_mod-y     := md.o md-bitmap.o md-autodetect.o
+raid456-y    := raid5.o raid5-cache.o raid5-ppl.o
+raid1-y      := raid1.o raid1-10.o
+raid10-y     := raid10.o raid1-10.o
+# md-llbitmap and raid0 are single-file modules, no -y override needed
+
+ccflags-y += -I$(M)/compat
+ccflags-y += -include $(M)/compat/compat.h
+ccflags-y += -DCONFIG_MD_RAID0=1
+ccflags-y += -DCONFIG_MD_RAID1=1
+ccflags-y += -DCONFIG_MD_RAID10=1
+ccflags-y += -DCONFIG_MD_RAID456=1
+ccflags-y += -DCONFIG_MD_BITMAP=1
+ccflags-y += -DCONFIG_MD_LLBITMAP=1
+
+all:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+
+modules_install:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
