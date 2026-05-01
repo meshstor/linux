@@ -1,0 +1,4 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+This package contains code from the Linux kernel's drivers/md/ subsystem,
+licensed under GPL-2.0-or-later. See individual source files for SPDX headers.
