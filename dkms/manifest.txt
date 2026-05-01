@@ -2,9 +2,11 @@ md.c
 md.h
 md-bitmap.c
 md-bitmap.h
+md-cluster.h
 md-llbitmap.c
 md-autodetect.c
 raid0.c
+raid0.h
 raid1.c
 raid1.h
 raid10.c
