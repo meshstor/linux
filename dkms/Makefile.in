@@ -7,9 +7,9 @@ obj-m := md_mod.o md-llbitmap.o raid0.o raid1.o raid10.o raid456.o
 
 md_mod-y     := md.o md-bitmap.o md-autodetect.o
 raid456-y    := raid5.o raid5-cache.o raid5-ppl.o
-raid1-y      := raid1.o raid1-10.o
-raid10-y     := raid10.o raid1-10.o
-# md-llbitmap and raid0 are single-file modules, no -y override needed
+# raid1.ko = raid1.o, raid10.ko = raid10.o, both single-object modules per upstream.
+# raid1-10.c is shipped (in manifest) and #included by raid1.c and raid10.c.
+# md-llbitmap and raid0 are also single-file modules, no -y override needed.
 
 ccflags-y += -I$(M)/compat
 ccflags-y += -include $(M)/compat/compat.h
