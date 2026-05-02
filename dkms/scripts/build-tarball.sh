@@ -75,11 +75,21 @@ KDIR_FOR_DETECT="${KDIR:-/lib/modules/$(uname -r)/build}"
         echo "#define HAVE_WQ_PERCPU 1"
     fi
     # Signature detection: block_device_operations.getgeo callback type.
-    # When upstream changes from (struct block_device *) to (struct gendisk *),
-    # we'll detect the new form and skip the compat wrapper.
     if [ -f "$KDIR_FOR_DETECT/include/linux/blkdev.h" ] && \
        grep -qE "int \(\*getgeo\)\(struct gendisk" "$KDIR_FOR_DETECT/include/linux/blkdev.h"; then
         echo "#define HAVE_GETGEO_GENDISK 1"
+    fi
+    # badblocks_check sector_t-typed args 3 and 5 (r10+ has sector_t; r9/5.14 has int).
+    # Declaration spans multiple lines — use awk to flatten.
+    if [ -f "$KDIR_FOR_DETECT/include/linux/badblocks.h" ] && \
+       awk 'BEGIN{RS=";"} /badblocks_check.*sector_t \*bad_sectors/' \
+           "$KDIR_FOR_DETECT/include/linux/badblocks.h" | grep -q .; then
+        echo "#define HAVE_BADBLOCKS_CHECK_SECTOR_T_OUTPUTS 1"
+    fi
+    # alloc_page_buffers 2-arg form (r10+); 3-arg with bool retry on r9.
+    if [ -f "$KDIR_FOR_DETECT/include/linux/buffer_head.h" ] && \
+       grep -qE "alloc_page_buffers\(struct page \*page, unsigned long size\)" "$KDIR_FOR_DETECT/include/linux/buffer_head.h"; then
+        echo "#define HAVE_ALLOC_PAGE_BUFFERS_2ARG 1"
     fi
     echo ""
     echo "#endif /* MESHSTOR_MS_FEATURE_FLAGS_H */"
