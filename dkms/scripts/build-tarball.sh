@@ -21,6 +21,14 @@ done < dkms/manifest.txt
 # Copy compat layer
 cp -r dkms/compat "$OUT/"
 
+# Apply compat patches in glob-sorted order. See dkms/patches/README.md.
+shopt -s nullglob
+for p in dkms/patches/*.patch; do
+    echo "Applying $(basename "$p")"
+    patch -p1 -d "$OUT" --no-backup-if-mismatch < "$p"
+done
+shopt -u nullglob
+
 # Render templates with version substituted
 sed "s/@VERSION@/$VER/g" dkms/dkms.conf.in > "$OUT/dkms.conf"
 sed "s/@VERSION@/$VER/g" dkms/Makefile.in  > "$OUT/Makefile"

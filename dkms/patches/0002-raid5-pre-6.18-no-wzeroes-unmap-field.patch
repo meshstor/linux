@@ -1,0 +1,23 @@
+Backport: raid5_set_limits guards max_hw_wzeroes_unmap_sectors pre-6.18
+
+The struct queue_limits.max_hw_wzeroes_unmap_sectors field was added
+in upstream around kernel 6.18 (see commit 0c1af234 "md: init
+queue_limits->max_hw_wzeroes_unmap_sectors parameter"). Older kernels'
+struct queue_limits has no such field.
+
+The single assignment in raid5_set_limits initializes it to 0, which
+matches the implicit default when the field doesn't exist. Guard the
+assignment with a version check.
+
+--- a/raid5.c
++++ b/raid5.c
+@@ -7790,7 +7790,9 @@ static int raid5_set_limits(struct mddev *mddev)
+ 	lim.discard_granularity = stripe;
+ 	lim.max_hw_discard_sectors = 0;
+ 	lim.max_write_zeroes_sectors = 0;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
++#endif
+ 	mddev_stack_rdev_limits(mddev, &lim, 0);
+ 	return queue_limits_set(mddev->gendisk->queue, &lim);
+ }
