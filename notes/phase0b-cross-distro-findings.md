@@ -13,6 +13,39 @@ distros' kernel-devel/headers packages.
 | **Ubuntu 26.04 LTS** | 6.17.0-28-generic | ✅ Clean | 3 .ko | 6 shims compiled out — kernel has them natively |
 | **Ubuntu 24.04 LTS GA** | 6.8.0-116-generic | ⚠️ Out of scope | — | See "GA 6.8 architectural gap" below |
 
+## Why RHEL 9.7 (5.14) builds but Ubuntu 24.04 GA (6.8) doesn't
+
+The naive expectation is that older kernel = more compat work. The actual
+expectation requires understanding **distro backport policy**, not just
+version numbers.
+
+| Symbol/field | First upstream version | Ubuntu 24.04 GA (6.8) | RHEL 9.7 (nominally 5.14) | RHEL 10.1 (6.12) |
+|---|---|---|---|---|
+| `bdev_file_open_by_dev` | ~6.9 | ❌ | ✅ backported | ✅ |
+| `queue_limits_start_update` | ~6.10 | ❌ | ✅ backported | ✅ |
+| `struct queue_limits.features` | ~6.10 | ❌ | ✅ backported | ✅ |
+| `BLK_FEAT_ATOMIC_WRITES` | ~6.11 | ❌ | ✅ backported | ✅ |
+
+RHEL 9.7's "5.14" kernel is a marketing version. The kernel forked from
+upstream 5.14 in early 2021, but five years of continuous Red Hat
+backporting has pulled in features from upstream 6.10+. Red Hat does this
+so RHEL 9 customers get hardware enablement without major-version kernel
+upgrades that would break enterprise ABI guarantees.
+
+Ubuntu 24.04 GA's 6.8 is much closer to vanilla upstream 6.8. Ubuntu
+backports security and stability, but not wholesale feature work. The
+"6.8" label is roughly accurate.
+
+So the apparent paradox — older RHEL builds, newer Ubuntu doesn't —
+resolves: **API age, not nominal version, is what matters**, and RHEL 9.7's
+effective API age is ~6.10+, while Ubuntu 24.04 GA's is ~6.8.
+
+This is exactly the case the feature-flag detection system was designed
+for. `dkms/scripts/build-tarball.sh` audits the actual headers on each
+target and emits `HAVE_*` defines accordingly — `LINUX_VERSION_CODE`
+comparisons would have been wrong on RHEL 9.7 (under-detecting features
+the kernel really has).
+
 ## Ubuntu 24.04 LTS GA (kernel 6.8) — architectural gap
 
 Tested 2026-05-02. Initial build attempt: 33 errors. After adding trivial defines
