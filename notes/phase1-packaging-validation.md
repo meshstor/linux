@@ -140,15 +140,45 @@ The trick is making vng's host fs LOOK LIKE it has the target kernel's modules
 tree at the conventional path. Once that's set up, vng boots the alternate
 vmlinuz and finds the modules where it expects them.
 
-### Why RHEL 9.7's 5.14 kernel didn't print output via vng
+### RHEL 9.7's 5.14 kernel — vng quirk + runtime hang
 
-vng's serial-console wiring (used for capturing exec output back to the host
-shell) didn't surface any output when booting the RHEL 9.7 vmlinuz, even with
-`--debug`. The kernel almost certainly boots — the build is correct, the
-.ko files load on a real RHEL 9 system — but vng's specific virtio-serial
-config interacts oddly with whatever this RHEL-built kernel expects on its
-console. Workarounds: boot the kernel inside libvirt with a normal serial
-device, or run the test on a real RHEL 9 / Rocky 9 host. Not worth chasing
-through vng for a Phase 1 validation. The `.ko` files for 5.14 are produced
-correctly by `make`; on a real RHEL 9 system DKMS will install and load them
-the same way it did on RHEL 10.1.
+Two issues surfaced after deeper investigation on 2026-05-02:
+
+**Issue 1: vng requires the vmlinuz live at `/boot/vmlinuz-<KVER>`.** When the
+bzImage is at a custom path like `/tmp/kernels/.../vmlinuz`, vng boots the
+kernel but its serial-console wiring (used for capturing exec output back to
+the host shell) silently fails for RHEL/Rocky kernels. Same path with Ubuntu
+kernels works, so it's specific to how the RHEL kernel/vng interact. Fix:
+copy the vmlinuz to `/boot/vmlinuz-<KVER>` before invoking vng. With that,
+the kernel boots cleanly and exec output is captured normally.
+
+**Issue 2: `insmod ms_mod.ko` hangs the kernel on r9 in vng.** Module BUILDS
+correctly (right vermagic, correct symbol exports, modinfo shows
+`description: MD RAID framework, license: GPL, rhelversion: 9.7`). But
+loading hangs the entire kernel within vng — even a 5-second `timeout`
+around insmod doesn't return. Pre-insmod state is healthy (25 modules
+loaded, 1.6 GB free RAM, /proc/msstat absent as expected before our module
+loads). This is a runtime issue specific to RHEL 9.7 + vng + our module init,
+not a build problem.
+
+Likely runtime suspects (need a real Rocky 9 / RHEL 9 environment to bisect):
+- `register_blkdev` on r9 may behave differently from r10's backported version
+- Some queue_limits transactional-API call may deadlock
+- A subsystem-init hook may collide with r9-specific kernel state
+
+Also noticed a related bug while inspecting modinfo:
+`alias: block-major-ms_major-*`. The rename converted
+`MODULE_ALIAS_BLOCKDEV_MAJOR(MD_MAJOR)` to
+`MODULE_ALIAS_BLOCKDEV_MAJOR(ms_major)`. `MODULE_ALIAS_BLOCKDEV_MAJOR` does
+compile-time stringification, so `ms_major` (a runtime variable, not a
+constant) gets stringified literally as "ms_major" — producing a malformed
+alias. Doesn't affect functionality on r10/Ubuntu (the explicit `MODULE_ALIAS("ms")`
+covers udev autoload), but should be fixed: use the upstream `MD_MAJOR`
+literal numeric value (9) — except we're a different subsystem, so the right
+fix is `MODULE_ALIAS_BLOCKDEV_MAJOR(0)` (dynamic, no fixed major) or simply
+drop the alias since `MODULE_ALIAS("ms")` is sufficient for our case.
+
+**Conclusion**: live-test on r9 needs a real Rocky 9 / RHEL 9 host with kdump
+configured to capture the runtime hang's traceback. The .rpm/.ko produced
+for r9 is structurally correct; the runtime issue is small enough that it's
+likely a one- or two-symbol fix once we have a panic trace.
