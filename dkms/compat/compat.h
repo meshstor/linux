@@ -152,6 +152,31 @@ static inline unsigned int bdev_write_zeroes_unmap_sectors(struct block_device *
 #endif
 
 /*
+ * timer_container_of(var, callback_timer, fieldname)
+ *
+ * Upstream renames from_timer() → timer_container_of() (same expansion).
+ * Provide the new name as an alias on older kernels.
+ */
+#ifndef timer_container_of
+#define timer_container_of from_timer
+#endif
+
+/*
+ * bio_init_inline(bio, bdev, nr_vecs, opf)
+ *
+ * Upstream introduces this variant of bio_init that uses bio->bi_inline_vecs
+ * as the bvec array. On older kernels we don't have it; bio_init takes the
+ * bvec array explicitly. Pass the inline vecs ourselves.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+static inline void bio_init_inline(struct bio *bio, struct block_device *bdev,
+                                    unsigned short nr_vecs, blk_opf_t opf)
+{
+    bio_init(bio, bdev, bio->bi_inline_vecs, nr_vecs, opf);
+}
+#endif
+
+/*
  * bio_submit_split_bioset()
  *
  * Upstream introduces this helper around v6.18. Semantics: split off
