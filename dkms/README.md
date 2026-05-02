@@ -1,8 +1,9 @@
-# meshstor-md DKMS
+# meshstor-ms DKMS
 
-Out-of-tree DKMS package providing md_mod, md-llbitmap, raid0, raid1,
-raid10, and raid456 with selected upstream performance features.
-See `docs/superpowers/specs/2026-05-01-meshstor-md-dkms-design.md`
-for design rationale.
+Out-of-tree DKMS package providing a parallel `ms_*` MD subsystem
+(raid1, raid10, llbitmap) alongside the kernel's built-in `md`.
 
-Build a tarball:  `dkms/scripts/build-tarball.sh <version>`
+For installation, operation, architecture, and maintenance docs see
+[../docs/index.md](../docs/index.md).
+
+Build the tarball: `dkms/scripts/build-tarball.sh <version>`.
