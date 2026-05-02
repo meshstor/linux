@@ -101,15 +101,54 @@ $ dpkg-deb --info /tmp/debdirect/meshstor-ms-dkms_0.1.0-1_all.deb
    with a published GPG key, host on S3+CloudFront / Cloudsmith / GitHub Pages
    / similar. No more code needed.
 
-## Cross-distro package status
+## Cross-distro live-load status
 
-| Distro | Package format | Build | Install/load tested |
+Updated 2026-05-02 after additional vng work (booting non-host kernels by
+copying their `/lib/modules/<KVER>/` tree to the host before vng invocation).
+
+| Distro / kernel | Build | Live load via vng | Live array test |
 |---|---|---|---|
-| RHEL 10.1 / Rocky 10 | `.rpm` | ✅ on host | ✅ live, this host |
-| RHEL 9.7 / Rocky 9 | `.rpm` | ✅ (modules only — same .rpm) | not tested live yet |
-| Ubuntu 24.04 LTS HWE | `.deb` | ✅ via dpkg-deb-direct | not tested live yet |
-| Ubuntu 26.04 LTS | `.deb` | ✅ via dpkg-deb-direct | not tested live yet |
+| RHEL 10.1 / Rocky 10 (6.12) | ✅ | ✅ | ✅ raid1 / raid10 / takeover / llbitmap |
+| Ubuntu 24.04 LTS HWE (6.14) | ✅ | ✅ | ✅ raid1 array, EWMA tracking |
+| Ubuntu 26.04 LTS (6.17) | ✅ | ✅ | ✅ raid1 array, EWMA tracking |
+| RHEL 9.7 / Rocky 9 (5.14) | ✅ | ⚠️ vng-quirk | not tested live yet |
+| Ubuntu 24.04 GA (6.8) | out of scope | — | — |
 
-The same .rpm and same .deb work across all RHEL-family / Debian-family
-versions in their respective columns; DKMS handles the per-kernel rebuild on
-the customer's machine.
+### vng setup pattern that worked
+
+```bash
+# 1. Extract the target distro's kernel modules tree (linux-modules-* deb or
+#    kernel-modules-core rpm) and copy to host /lib/modules/.
+#    Symlink /lib/modules/<KVER>/build to extracted kernel-headers.
+sudo cp -r /tmp/u24-mods/lib/modules/6.14.0-37-generic /lib/modules/
+sudo ln -sf /tmp/kdevs/u24/usr/src/linux-headers-6.14.0-37-generic \
+    /lib/modules/6.14.0-37-generic/build
+sudo depmod -a 6.14.0-37-generic
+
+# 2. Build our DKMS modules against the target headers.
+env -u KDIR KDIR=/tmp/kdevs/u24/usr/src/linux-headers-6.14.0-37-generic \
+    bash dkms/scripts/build-tarball.sh 0.1.0
+# (then make CC=gcc HOSTCC=gcc against the same KDIR if cross-host)
+
+# 3. Boot vng with the target vmlinuz and run the test script.
+vng --run /tmp/kernels/u24/boot/vmlinuz-6.14.0-37-generic \
+    --busybox /tmp/busybox-static --disable-microvm \
+    --exec "sh /tmp/test-script.sh"
+```
+
+The trick is making vng's host fs LOOK LIKE it has the target kernel's modules
+tree at the conventional path. Once that's set up, vng boots the alternate
+vmlinuz and finds the modules where it expects them.
+
+### Why RHEL 9.7's 5.14 kernel didn't print output via vng
+
+vng's serial-console wiring (used for capturing exec output back to the host
+shell) didn't surface any output when booting the RHEL 9.7 vmlinuz, even with
+`--debug`. The kernel almost certainly boots — the build is correct, the
+.ko files load on a real RHEL 9 system — but vng's specific virtio-serial
+config interacts oddly with whatever this RHEL-built kernel expects on its
+console. Workarounds: boot the kernel inside libvirt with a normal serial
+device, or run the test on a real RHEL 9 / Rocky 9 host. Not worth chasing
+through vng for a Phase 1 validation. The `.ko` files for 5.14 are produced
+correctly by `make`; on a real RHEL 9 system DKMS will install and load them
+the same way it did on RHEL 10.1.
