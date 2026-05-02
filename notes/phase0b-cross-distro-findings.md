@@ -3,14 +3,14 @@
 Build attempts for the meshstor-ms DKMS tarball against the four target
 distros' kernel-devel/headers packages.
 
-## Final state — three of four distros build from one source tree
+## Final state — ALL FOUR distros build from one source tree
 
 | Distro | Kernel | Build result | Modules | Notes |
 |---|---|---|---|---|
 | **RHEL 10.1 / Rocky 10** (Phase 0 baseline) | 6.12.0-124.49.1.el10_1 | ✅ Clean | 3 .ko | Validated end-to-end with VM tests in Phase 0 |
 | **RHEL 9.7 / Rocky 9** | 5.14.0-611.49.1.el9_7 | ✅ Clean | 3 .ko | Required `badblocks_check` and `alloc_page_buffers` shims for the 5.14→6.12 API drift |
 | **Ubuntu 26.04 LTS** | 6.17.0-28-generic | ✅ Clean | 3 .ko | Native `bio_submit_split_bioset`, `bdev_count_inflight`, `timer_container_of`, etc. — feature flags correctly skip our shims |
-| **Ubuntu 24.04 LTS HWE** | 6.14.0-37-generic | ⚠️ Build-env block | — | Ubuntu kernel compiled with `gcc-13`; CONFIG_CC_VERSION_TEXT enforces match. Solvable by installing `gcc-13` on build host or building inside an Ubuntu container. On customer machines DKMS uses the running system's matching gcc, so this is a CI-only concern. |
+| **Ubuntu 24.04 LTS HWE** | 6.14.0-37-generic | ✅ Clean | 3 .ko | Ubuntu kernel hardcodes `CC = $(CROSS_COMPILE)gcc-13` in its Makefile. On a real Ubuntu 24.04 system DKMS finds gcc-13 natively (it's the default compiler). When cross-building from a RHEL/non-Ubuntu host, override at make time: `make CC=gcc HOSTCC=gcc -C $KDIR M=$PWD modules`. Customer-side DKMS deployment needs no override. |
 
 ## How the compat layer evolved during Phase 0b
 
