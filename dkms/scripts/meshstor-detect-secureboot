@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# meshstor-detect-secureboot — print one-word state of Secure Boot:
+#   BIOS            (legacy boot, not UEFI)
+#   SECUREBOOT_OFF  (UEFI but Secure Boot disabled)
+#   SECUREBOOT_ON   (UEFI with Secure Boot active)
+#   UNKNOWN         (mokutil missing, etc.)
+
+if [ ! -d /sys/firmware/efi ]; then
+    echo BIOS
+    exit 0
+fi
+
+if ! command -v mokutil >/dev/null 2>&1; then
+    echo UNKNOWN
+    exit 1
+fi
+
+if mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+    echo SECUREBOOT_ON
+else
+    echo SECUREBOOT_OFF
+fi

@@ -1,0 +1,16 @@
+PACKAGE_NAME="meshstor-ms"
+PACKAGE_VERSION="#MODULE_VERSION#"
+
+MAKE[0]="make -j$(nproc) KDIR=/lib/modules/${kernelver}/build"
+CLEAN="make clean"
+
+BUILT_MODULE_NAME[0]="ms_mod"
+BUILT_MODULE_NAME[1]="raid1_ms"
+BUILT_MODULE_NAME[2]="raid10_ms"
+
+DEST_MODULE_LOCATION[0]="/extra"
+DEST_MODULE_LOCATION[1]="/extra"
+DEST_MODULE_LOCATION[2]="/extra"
+
+AUTOINSTALL="yes"
+REMAKE_INITRD="no"

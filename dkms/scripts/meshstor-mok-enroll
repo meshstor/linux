@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# meshstor-mok-enroll — generate a local MOK signing key (if needed) and
+# enroll its public half so the kernel will accept locally-built modules
+# signed with it under Secure Boot.
+#
+# Two modes:
+#   1. Customer has no local MOK yet  → generate, enroll, print one-time
+#      password the user must enter at next boot in MokManager.
+#   2. Customer already has a local MOK (Ubuntu's /var/lib/shim-signed/mok/)
+#      → reuse it; configure DKMS to sign with it.
+#
+# This script does NOT enroll a vendor-published key. For pre-built modules
+# signed with a vendor key, the customer enrolls the vendor's published .der
+# directly via `mokutil --import vendor.der`.
+
+set -euo pipefail
+
+MESHSTOR_KEY_DIR="${MESHSTOR_KEY_DIR:-/var/lib/meshstor/mok}"
+KEY_PRIV="$MESHSTOR_KEY_DIR/MOK.priv"
+KEY_PEM="$MESHSTOR_KEY_DIR/MOK.pem"
+KEY_DER="$MESHSTOR_KEY_DIR/MOK.der"
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "ERROR: must run as root (need to write /var/lib/meshstor/mok/ and call mokutil)" >&2
+        exit 1
+    fi
+}
+
+detect_secureboot() {
+    if [ ! -d /sys/firmware/efi ]; then
+        echo "BIOS"
+    elif command -v mokutil >/dev/null 2>&1; then
+        if mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+            echo "SECUREBOOT_ON"
+        else
+            echo "SECUREBOOT_OFF"
+        fi
+    else
+        echo "UNKNOWN"
+    fi
+}
+
+reuse_ubuntu_mok() {
+    # Standard Ubuntu DKMS-signing key location.
+    if [ -f /var/lib/shim-signed/mok/MOK.priv ] && [ -f /var/lib/shim-signed/mok/MOK.der ]; then
+        echo "Reusing Ubuntu DKMS MOK at /var/lib/shim-signed/mok/"
+        echo "DKMS framework.conf already wired to it on Ubuntu by default."
+        return 0
+    fi
+    return 1
+}
+
+generate_local_mok() {
+    require_root
+    mkdir -p "$MESHSTOR_KEY_DIR"
+    chmod 700 "$MESHSTOR_KEY_DIR"
+    if [ -f "$KEY_PRIV" ]; then
+        echo "Local MOK already exists at $MESHSTOR_KEY_DIR — reusing"
+        return 0
+    fi
+    echo "Generating local MOK signing key in $MESHSTOR_KEY_DIR"
+    openssl req -new -x509 \
+        -newkey rsa:2048 -keyout "$KEY_PRIV" \
+        -outform PEM -out "$KEY_PEM" \
+        -days 36500 -nodes \
+        -subj "/CN=meshstor-ms local MOK/" >/dev/null 2>&1
+    openssl x509 -in "$KEY_PEM" -outform DER -out "$KEY_DER"
+    chmod 600 "$KEY_PRIV"
+}
+
+enroll_mok() {
+    require_root
+    echo "Enrolling MOK public key with mokutil. You will be prompted to set"
+    echo "a one-time password. On next reboot, MokManager will appear; enter"
+    echo "the same password to finalize enrollment."
+    echo
+    mokutil --import "$KEY_DER"
+    echo
+    echo "Now reboot the machine. At MokManager:"
+    echo "  1. Select 'Enroll MOK'"
+    echo "  2. Select 'Continue'"
+    echo "  3. Select 'Yes' to confirm"
+    echo "  4. Enter the password you set with mokutil --import"
+    echo "  5. Select 'Reboot'"
+    echo
+    echo "After reboot, verify enrollment with:"
+    echo "  mokutil --list-enrolled | grep meshstor-ms"
+}
+
+configure_dkms() {
+    require_root
+    cat > /etc/dkms/framework.conf.d/meshstor-ms.conf <<EOF
+# Configure DKMS to sign meshstor-ms modules with the meshstor-managed MOK key.
+# Distro-default DKMS framework.conf includes /etc/dkms/framework.conf.d/*.conf
+# automatically.
+mok_signing_key="$KEY_PRIV"
+mok_certificate="$KEY_PEM"
+sign_tool="/lib/modules/\$kernelver/build/scripts/sign-file"
+EOF
+    echo "DKMS framework.conf updated; future module rebuilds will sign with $KEY_PRIV"
+}
+
+main() {
+    state=$(detect_secureboot)
+    case "$state" in
+        BIOS)
+            echo "Legacy BIOS boot — Secure Boot not applicable. No key enrollment needed."
+            echo "DKMS modules will load unsigned."
+            exit 0
+            ;;
+        SECUREBOOT_OFF)
+            echo "UEFI present but Secure Boot is OFF. Module signing not enforced."
+            echo "Modules will load unsigned. To prepare for future Secure Boot enablement,"
+            echo "run with --force to generate and enroll a key anyway."
+            if [ "${1:-}" != "--force" ]; then exit 0; fi
+            ;;
+        SECUREBOOT_ON)
+            echo "Secure Boot is ENABLED. Proceeding with MOK setup."
+            ;;
+        UNKNOWN)
+            echo "Could not determine Secure Boot state (mokutil missing?). Aborting."
+            exit 2
+            ;;
+    esac
+
+    if reuse_ubuntu_mok; then exit 0; fi
+    generate_local_mok
+    configure_dkms
+    enroll_mok
+}
+
+main "$@"

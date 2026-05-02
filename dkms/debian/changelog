@@ -1,0 +1,7 @@
+meshstor-ms-dkms (#MODULE_VERSION#-1) unstable; urgency=medium
+
+  * Initial DKMS package release of the parallel ms_* subsystem.
+  * Modules: ms_mod, raid1_ms, raid10_ms (ms-llbitmap built into ms_mod).
+  * Targets: Ubuntu 24.04 LTS HWE (kernel 6.14+), Ubuntu 26.04 LTS (kernel 6.17+).
+
+ -- Meshstor <support@example.com>  Sat, 02 May 2026 12:00:00 +0000

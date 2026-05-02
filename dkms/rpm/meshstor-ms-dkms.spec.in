@@ -1,0 +1,77 @@
+# meshstor-ms-dkms.spec — DKMS package for the parallel ms_* subsystem
+#
+# Builds a noarch .rpm that drops the source tree into /usr/src/meshstor-ms-@VERSION@/
+# and registers it with DKMS. DKMS handles per-kernel compilation on install
+# and on every kernel update via its dkms_autoinstaller / kmods systemd
+# integration on RHEL/Rocky/Alma.
+
+%global pkgname    meshstor-ms
+%global modname    meshstor-ms
+
+Name:           %{pkgname}-dkms
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        meshstor parallel md-style raid subsystem (ms_mod, raid1_ms, raid10_ms)
+
+License:        GPL-2.0-or-later
+URL:            https://example.com/meshstor-ms
+Source0:        %{pkgname}-%{version}.dkms.tar.gz
+
+BuildArch:      noarch
+Requires:       dkms >= 2.8.0
+Requires:       kernel-devel
+Requires(post):   dkms
+Requires(preun):  dkms
+Requires(postun): dkms
+
+%description
+The meshstor-ms package provides a parallel md-style RAID subsystem that
+coexists with the kernel's built-in md driver under separate /dev names
+(/dev/ms*), /proc files (/proc/msstat), and sysfs paths
+(/sys/block/ms*/ms/). It carries selected upstream md performance work
+including the lockless bitmap (llbitmap), per-rdev latency-aware read
+balancing (EWMA), per-bucket barrier arrays for raid10, and zero-copy
+raid1->raid10 takeover.
+
+The on-disk superblock format is identical to the kernel md format —
+arrays can be moved between subsystems by re-attaching the disks under
+the alternate driver. Userspace tooling for ms is customer-supplied
+(ms-aware mdadm fork; not bundled).
+
+%prep
+%setup -q -n %{pkgname}-%{version}
+
+%build
+# DKMS handles compilation per-kernel; nothing to do at package-build time.
+
+%install
+mkdir -p %{buildroot}/usr/src/%{pkgname}-%{version}
+cp -a . %{buildroot}/usr/src/%{pkgname}-%{version}/
+# DKMS picks up the package via /usr/src/<name>-<version>/dkms.conf
+
+%post
+dkms add -m %{pkgname} -v %{version} || :
+dkms build -m %{pkgname} -v %{version} || :
+dkms install -m %{pkgname} -v %{version} || :
+
+%preun
+# Remove DKMS registration before package files are removed.
+if [ "$1" = "0" ]; then
+    dkms remove -m %{pkgname} -v %{version} --all || :
+fi
+
+%postun
+# DKMS rebuild on kernel updates is handled automatically; nothing to do here.
+
+%files
+%license COPYING
+/usr/src/%{pkgname}-%{version}/
+
+%changelog
+* @CHANGELOG_DATE@ Meshstor <support@example.com> - @VERSION@-1
+- Initial DKMS package release of the parallel ms_* subsystem.
+- Modules: ms_mod, raid1_ms, raid10_ms (ms-llbitmap built into ms_mod).
+- Targets: RHEL 9.x / Rocky 9 / Alma 9 (kernel 5.14-era backported),
+  RHEL 10.x / Rocky 10 / Alma 10 (kernel 6.12),
+  Ubuntu 24.04 LTS HWE (kernel 6.14+),
+  Ubuntu 26.04 LTS (kernel 6.17+).

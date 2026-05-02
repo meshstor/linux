@@ -1,0 +1,20 @@
+#!/bin/sh
+# postinst for meshstor-ms-dkms
+set -e
+
+NAME=meshstor-ms
+VERSION="#MODULE_VERSION#"
+
+case "$1" in
+    configure)
+        if command -v dkms >/dev/null 2>&1; then
+            dkms add -m "$NAME" -v "$VERSION" || :
+            dkms build -m "$NAME" -v "$VERSION" || :
+            dkms install -m "$NAME" -v "$VERSION" || :
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

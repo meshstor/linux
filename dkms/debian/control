@@ -1,0 +1,26 @@
+Source: meshstor-ms-dkms
+Section: kernel
+Priority: optional
+Maintainer: Meshstor <support@example.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://example.com/meshstor-ms
+
+Package: meshstor-ms-dkms
+Architecture: all
+Depends: dkms (>= 2.8.0),
+         linux-headers-generic | linux-headers-amd64 | linux-headers,
+         ${misc:Depends}
+Description: meshstor parallel md-style raid subsystem (DKMS)
+ The meshstor-ms package provides a parallel md-style RAID subsystem that
+ coexists with the kernel's built-in md driver under separate /dev names
+ (/dev/ms*), /proc files (/proc/msstat), and sysfs paths
+ (/sys/block/ms*/ms/). It carries selected upstream md performance work
+ including the lockless bitmap (llbitmap), per-rdev latency-aware read
+ balancing (EWMA), per-bucket barrier arrays for raid10, and zero-copy
+ raid1->raid10 takeover.
+ .
+ The on-disk superblock format is identical to the kernel md format —
+ arrays can be moved between subsystems by re-attaching the disks under
+ the alternate driver. Userspace tooling for ms is customer-supplied
+ (ms-aware mdadm fork; not bundled).

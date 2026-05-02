@@ -1,0 +1,12 @@
+#!/usr/bin/make -f
+# debian/rules for meshstor-ms-dkms
+# DKMS handles compilation per-kernel; the package itself is just a source drop.
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Nothing to build at package time; DKMS does it per-kernel.
+
+override_dh_auto_install:
+	# Source tree is installed via dkms.install file pattern.
