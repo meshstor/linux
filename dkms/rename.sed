@@ -89,6 +89,22 @@ s/"md: /"ms: /g
 s/"md\/%s/"ms\/%s/g
 s/"md\/%/"ms\/%/g
 
+# Disk-name format strings used by sprintf(disk->disk_name, ...).
+# These determine the /dev/<name> entries created when an array is allocated.
+s/"md%d"/"ms%d"/g
+s/"md_d%d"/"ms_d%d"/g
+
+# MODULE_ALIAS("md") — udev autoloads the module by this alias.
+s/MODULE_ALIAS("md")/MODULE_ALIAS("ms")/g
+
+# kobject_add(... "%s", "md") — sysfs kobject name "md" under the gendisk.
+# After our rename, /sys/block/ms*/ms/ should be the path.
+s/, "%s", "md")/, "%s", "ms")/g
+
+# strncmp(buf, "md", 2) — string-prefix matching when parsing user input
+# (e.g., from sysfs writes to set array names). Match the new prefix.
+s/strncmp(buf, "md", 2)/strncmp(buf, "ms", 2)/g
+
 # === Step 8: parallel-subsystem semantics (block-device registration) ===
 # Kernel md uses MD_MAJOR=9 for "md" and a dynamic major (mdp_major) for "mdp".
 # Our ms subsystem uses dynamic majors for both, with names "ms" and "msp".
