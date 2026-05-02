@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# build-deb-direct.sh — build .deb using dpkg-deb directly (no dpkg-buildpackage,
+# no debhelper). This works on any host that has dpkg-deb in PATH (Ubuntu native,
+# or RHEL with EPEL's `dpkg` package, or extracted dpkg rpms).
+#
+# Trade-off vs dpkg-buildpackage:
+#   - No debhelper magic (no automatic md5sums, no debian/changelog formatting)
+#   - We hand-write the control fields and scripts
+#   - But: portable across non-Debian build hosts
+#
+# Usage: dkms/scripts/build-deb-direct.sh <version> [<staging_dir>]
+set -euo pipefail
+
+VER="${1:?usage: $0 <version> [<staging_dir>]}"
+STAGE="${2:-/tmp/debdirect}"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "ERROR: dpkg-deb not found." >&2
+    echo "       Install dpkg (or extract from EPEL/Debian) and add to PATH." >&2
+    exit 1
+fi
+
+cd "$REPO_ROOT"
+
+# 1. Build the DKMS tarball.
+"$REPO_ROOT/dkms/scripts/build-tarball.sh" "$VER"
+
+# 2. Stage <pkgdir>/DEBIAN/ + content.
+PKG="meshstor-ms-dkms_${VER}-1_all"
+PKGDIR="$STAGE/$PKG"
+rm -rf "$PKGDIR"
+mkdir -p "$PKGDIR/DEBIAN" "$PKGDIR/usr/src/meshstor-ms-${VER}"
+
+# Copy source tree into /usr/src/meshstor-ms-VERSION/
+tar xzf "$REPO_ROOT/build/meshstor-ms-${VER}.dkms.tar.gz" \
+    --strip-components=1 -C "$PKGDIR/usr/src/meshstor-ms-${VER}/"
+
+# 3. DEBIAN/control — substitute version + compute installed size.
+INSTALLED_SIZE=$(du -sk "$PKGDIR/usr/src" | cut -f1)
+cat > "$PKGDIR/DEBIAN/control" <<EOF
+Package: meshstor-ms-dkms
+Version: ${VER}-1
+Section: kernel
+Priority: optional
+Architecture: all
+Depends: dkms (>= 2.8.0), linux-headers-generic | linux-headers-amd64 | linux-headers
+Maintainer: Meshstor <support@example.com>
+Installed-Size: ${INSTALLED_SIZE}
+Description: meshstor parallel md-style raid subsystem (DKMS)
+ The meshstor-ms package provides a parallel md-style RAID subsystem that
+ coexists with the kernel's built-in md driver under separate /dev names
+ (/dev/ms*), /proc files (/proc/msstat), and sysfs paths
+ (/sys/block/ms*/ms/). It carries selected upstream md performance work
+ including the lockless bitmap (llbitmap), per-rdev latency-aware read
+ balancing (EWMA), per-bucket barrier arrays for raid10, and zero-copy
+ raid1->raid10 takeover.
+ .
+ The on-disk superblock format is identical to the kernel md format —
+ arrays can be moved between subsystems by re-attaching the disks under
+ the alternate driver. Userspace tooling for ms is customer-supplied
+ (ms-aware mdadm fork; not bundled).
+EOF
+
+# 4. DEBIAN/postinst — register with DKMS.
+cat > "$PKGDIR/DEBIAN/postinst" <<EOF
+#!/bin/sh
+set -e
+NAME=meshstor-ms
+VERSION="${VER}"
+case "\$1" in
+    configure)
+        if command -v dkms >/dev/null 2>&1; then
+            dkms add -m "\$NAME" -v "\$VERSION" || :
+            dkms build -m "\$NAME" -v "\$VERSION" || :
+            dkms install -m "\$NAME" -v "\$VERSION" || :
+        fi
+        ;;
+esac
+exit 0
+EOF
+chmod 755 "$PKGDIR/DEBIAN/postinst"
+
+# 5. DEBIAN/prerm — deregister with DKMS.
+cat > "$PKGDIR/DEBIAN/prerm" <<EOF
+#!/bin/sh
+set -e
+NAME=meshstor-ms
+VERSION="${VER}"
+case "\$1" in
+    remove|upgrade|deconfigure)
+        if command -v dkms >/dev/null 2>&1; then
+            dkms remove -m "\$NAME" -v "\$VERSION" --all || :
+        fi
+        ;;
+esac
+exit 0
+EOF
+chmod 755 "$PKGDIR/DEBIAN/prerm"
+
+# 6. md5sums.
+( cd "$PKGDIR" && find usr -type f -exec md5sum {} \; ) > "$PKGDIR/DEBIAN/md5sums"
+
+# 7. Build.
+dpkg-deb --root-owner-group --build "$PKGDIR" "$STAGE/${PKG}.deb"
+
+echo
+echo "=== Output ==="
+ls -la "$STAGE/${PKG}.deb"
+echo
+echo "=== Verification ==="
+dpkg-deb --info "$STAGE/${PKG}.deb" 2>&1 | head -25
+echo
+dpkg-deb --contents "$STAGE/${PKG}.deb" 2>&1 | head -10
