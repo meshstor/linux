@@ -252,4 +252,40 @@ static inline struct bio *bio_submit_split_bioset(struct bio *bio,
 }
 #endif
 
+/*
+ * badblocks_check signature change (5.14 → 6.12)
+ *
+ * Old (RHEL 9 / 5.14): args 3 and 5 are `int sectors` and `int *bad_sectors`.
+ * New (6.12+):         args 3 and 5 are `sector_t sectors` and `sector_t *bad_sectors`.
+ * Our integrated source uses the new form. Wrap on older kernels.
+ */
+#ifndef HAVE_BADBLOCKS_CHECK_SECTOR_T_OUTPUTS
+#include <linux/badblocks.h>
+static inline int ms_badblocks_check_compat(struct badblocks *bb, sector_t s,
+                                              sector_t sectors,
+                                              sector_t *first_bad,
+                                              sector_t *bad_sectors)
+{
+    int ifirst = 0, isectors = 0;
+    int rc;
+    rc = badblocks_check(bb, s, (int)sectors, (sector_t *)&ifirst, &isectors);
+    if (first_bad) *first_bad = ifirst;
+    if (bad_sectors) *bad_sectors = isectors;
+    return rc;
+}
+#define badblocks_check ms_badblocks_check_compat
+#endif
+
+/*
+ * alloc_page_buffers argument count (5.14 → 6.12)
+ *
+ * Old: alloc_page_buffers(page, size, bool retry)
+ * New: alloc_page_buffers(page, size)
+ * Our integrated source calls the 2-arg form.
+ */
+#ifndef HAVE_ALLOC_PAGE_BUFFERS_2ARG
+#include <linux/buffer_head.h>
+#define alloc_page_buffers(page, size) alloc_page_buffers((page), (size), false)
+#endif
+
 #endif /* MESHSTOR_MD_COMPAT_H */
