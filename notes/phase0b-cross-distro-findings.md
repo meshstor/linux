@@ -3,14 +3,53 @@
 Build attempts for the meshstor-ms DKMS tarball against the four target
 distros' kernel-devel/headers packages.
 
-## Final state — ALL FOUR distros build from one source tree
+## Final state — five kernel images tested
 
-| Distro | Kernel | Build result | Modules | Notes |
+| Distro / kernel | Kernel | Build | Modules | Notes |
 |---|---|---|---|---|
 | **RHEL 10.1 / Rocky 10** (Phase 0 baseline) | 6.12.0-124.49.1.el10_1 | ✅ Clean | 3 .ko | Validated end-to-end with VM tests in Phase 0 |
-| **RHEL 9.7 / Rocky 9** | 5.14.0-611.49.1.el9_7 | ✅ Clean | 3 .ko | Required `badblocks_check` and `alloc_page_buffers` shims for the 5.14→6.12 API drift |
-| **Ubuntu 26.04 LTS** | 6.17.0-28-generic | ✅ Clean | 3 .ko | Native `bio_submit_split_bioset`, `bdev_count_inflight`, `timer_container_of`, etc. — feature flags correctly skip our shims |
-| **Ubuntu 24.04 LTS HWE** | 6.14.0-37-generic | ✅ Clean | 3 .ko | Ubuntu kernel hardcodes `CC = $(CROSS_COMPILE)gcc-13` in its Makefile. On a real Ubuntu 24.04 system DKMS finds gcc-13 natively (it's the default compiler). When cross-building from a RHEL/non-Ubuntu host, override at make time: `make CC=gcc HOSTCC=gcc -C $KDIR M=$PWD modules`. Customer-side DKMS deployment needs no override. |
+| **RHEL 9.7 / Rocky 9** | 5.14.0-611.49.1.el9_7 | ✅ Clean | 3 .ko | `badblocks_check`, `alloc_page_buffers` shims for 5.14→6.12 API drift |
+| **Ubuntu 24.04 LTS HWE** | 6.14.0-37-generic | ✅ Clean | 3 .ko | Same shims as RHEL 10. Ubuntu's kernel hardcodes `CC=gcc-13`; customer's Ubuntu 24.04 has gcc-13 by default, so DKMS works. Cross-build from RHEL needs `make CC=gcc HOSTCC=gcc`. |
+| **Ubuntu 26.04 LTS** | 6.17.0-28-generic | ✅ Clean | 3 .ko | 6 shims compiled out — kernel has them natively |
+| **Ubuntu 24.04 LTS GA** | 6.8.0-116-generic | ⚠️ Out of scope | — | See "GA 6.8 architectural gap" below |
+
+## Ubuntu 24.04 LTS GA (kernel 6.8) — architectural gap
+
+Tested 2026-05-02. Initial build attempt: 33 errors. After adding trivial defines
+(`LEVEL_LINEAR`, `REQ_ATOMIC`): 25 errors. The remaining 25 split into structural
+API gaps that require code-level patches, not header shims:
+
+| Issue | API window | What's needed |
+|---|---|---|
+| `bdev_file_open_by_dev`, `file_bdev` | Added ~6.9 | Wrapper: replace `bdev_open_by_dev` callers' return-handling |
+| `queue_limits_start_update`, `_commit_update`, `_cancel_update`, `_set`, `_stack_bdev`, `_stack_integrity_bdev` | Added ~6.10 (transactional queue_limits API) | Stubs that translate to direct `blk_queue_*()` calls — but lossy because the new API is transactional and pre-6.10 had no equivalent atomicity |
+| `struct queue_limits.features` + `BLK_FEAT_*` flags | Added ~6.10 | Cannot add a struct field via shim. Patches needed at every callsite that sets `lim.features = ...` to use pre-6.10 separate-field access |
+| `blk_alloc_disk` argument count change | Changed ~6.10 | Wrapper macro |
+| `BLK_FEAT_ATOMIC_WRITES`, `REQ_ATOMIC` | Atomic-writes infra ~6.11 | Define-as-zero stubs (atomic-write paths become no-ops on 6.8) |
+| `kstrtoint` arg-3 type drift | Minor, ~6.10 | Cast wrapper |
+
+The 6.8 kernel pre-dates the bulk of upstream's queue_limits redesign (April 2024
+release vs queue_limits transactional API landing in 6.10, August 2024).
+
+**Recommendation: declare Ubuntu 24.04 GA 6.8 out of scope**, with HWE 6.14 as the
+supported path for Ubuntu 24.04 LTS customers. Rationale:
+
+1. **Cost**: estimated 3–5 focused engineering days to write the queue_limits
+   compat layer plus 5+ source-level patches at call sites, plus regression-testing
+   that the lossy queue_limits stubs don't break correctness.
+
+2. **Customer base**: Ubuntu 24.04 LTS users with newer hardware typically install
+   the HWE meta-package (`linux-image-generic-hwe-24.04`), which currently points
+   at 6.14. Sticking on GA 6.8 long-term is unusual.
+
+3. **Maintenance treadmill**: 6.8 will fall further behind upstream md as we
+   rebase. Each rebase pulls in code that uses newer kernel APIs, requiring
+   yet more compat work just for 6.8.
+
+If 6.8 support becomes a hard customer requirement, plan a dedicated Phase 0c
+sprint. The feature-flag detection infrastructure already in place will handle
+the easy cases; the queue_limits transactional API needs a real source-level
+patch series.
 
 ## How the compat layer evolved during Phase 0b
 
