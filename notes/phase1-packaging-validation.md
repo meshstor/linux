@@ -3,6 +3,18 @@
 End-to-end DKMS install flow verified on the RHEL 10.1 host plus header-only
 build verification across all four target distros' kernel headers.
 
+## DKMS guard variable: KBUILD_EXTMOD not KERNELRELEASE
+
+Initial DKMS install attempts on RHEL 10.1 (192.168.200.32) failed with
+`make: *** No targets.  Stop.` despite the wrapper Makefile defining `all:`.
+Root cause: DKMS invokes the wrapper as `make KERNELRELEASE=<kver> KDIR=<path>`,
+setting `KERNELRELEASE` on the OUTER command line. The conventional
+`ifeq ($(KERNELRELEASE),)` guard for out-of-tree modules therefore hides our
+`all`/`feature_flags`/etc. targets during the initial DKMS invocation. Fixed
+by switching to `ifeq ($(KBUILD_EXTMOD),)` — `KBUILD_EXTMOD` is only set by
+kbuild during the `make -C $KDIR M=$M` recursion, so it correctly
+distinguishes "DKMS called us" from "kbuild recursed back into us".
+
 ## RHEL 10.1 — full install/load/uninstall round trip
 
 ```bash
