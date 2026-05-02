@@ -14,7 +14,22 @@
 #ifndef MESHSTOR_MD_COMPAT_H
 #define MESHSTOR_MD_COMPAT_H
 
+/*
+ * All kernel headers needed by any shim below are pulled in here at the top.
+ * compat.h is force-included via the Makefile's -include flag, so it is the
+ * first thing every translation unit sees. Shims that use kernel types
+ * (struct block_device, struct bio, etc.) need the relevant headers
+ * already in scope when the static inline is parsed; otherwise gcc emits
+ * "struct foo declared inside parameter list" warnings and the type ends up
+ * incompatible with the kernel's definition seen later.
+ */
 #include <linux/version.h>
+#include <linux/types.h>
+#include <linux/slab.h>
+#include <linux/bio.h>
+#include <linux/blkdev.h>
+#include <linux/blk_types.h>
+#include <linux/workqueue.h>
 
 /* RHEL release detection */
 #ifndef RHEL_RELEASE_CODE
@@ -41,7 +56,6 @@
  * Variadic macro overload-by-arg-count technique is the standard way
  * to provide multiple arities for the same name in C99+.
  */
-#include <linux/slab.h>
 
 #define _MD_COMPAT_GET_3RD(_1, _2, _3, NAME, ...) NAME
 #define _MD_COMPAT_GET_2ND(_1, _2, NAME, ...) NAME
@@ -129,12 +143,38 @@ static inline unsigned int bdev_count_inflight(struct block_device *bdev)
  * Safe fallback: return 0, which causes md-llbitmap to skip the
  * write-zeroes-unmap optimization and fall back to the standard sync path.
  */
-#include <linux/blkdev.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
 static inline unsigned int bdev_write_zeroes_unmap_sectors(struct block_device *bdev)
 {
     (void)bdev;
     return 0;
+}
+#endif
+
+/*
+ * bio_submit_split_bioset()
+ *
+ * Upstream introduces this helper around v6.18. Semantics: split off
+ * `sectors` from the front of `bio` using bioset `bs`, chain remainder,
+ * submit the split via submit_bio_noacct, and return the original bio
+ * (now representing the remainder) so the caller can continue.
+ *
+ * Backport via existing bio_split + bio_chain + submit_bio_noacct,
+ * all of which exist in 6.12.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+static inline struct bio *bio_submit_split_bioset(struct bio *bio,
+                                                   unsigned int sectors,
+                                                   struct bio_set *bs)
+{
+    struct bio *split;
+
+    split = bio_split(bio, sectors, GFP_NOIO, bs);
+    if (IS_ERR(split))
+        return NULL;
+    bio_chain(split, bio);
+    submit_bio_noacct(split);
+    return bio;
 }
 #endif
 
