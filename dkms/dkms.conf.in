@@ -1,22 +1,16 @@
-PACKAGE_NAME="meshstor-md"
+PACKAGE_NAME="meshstor-ms"
 PACKAGE_VERSION="@VERSION@"
 
 MAKE[0]="make -j$(nproc) KDIR=/lib/modules/${kernelver}/build"
 CLEAN="make clean"
 
-BUILT_MODULE_NAME[0]="md_mod"
-BUILT_MODULE_NAME[1]="md-llbitmap"
-BUILT_MODULE_NAME[2]="raid0"
-BUILT_MODULE_NAME[3]="raid1"
-BUILT_MODULE_NAME[4]="raid10"
-BUILT_MODULE_NAME[5]="raid456"
+BUILT_MODULE_NAME[0]="ms_mod"
+BUILT_MODULE_NAME[1]="raid1_ms"
+BUILT_MODULE_NAME[2]="raid10_ms"
 
 DEST_MODULE_LOCATION[0]="/extra"
 DEST_MODULE_LOCATION[1]="/extra"
 DEST_MODULE_LOCATION[2]="/extra"
-DEST_MODULE_LOCATION[3]="/extra"
-DEST_MODULE_LOCATION[4]="/extra"
-DEST_MODULE_LOCATION[5]="/extra"
 
 AUTOINSTALL="yes"
 REMAKE_INITRD="no"
