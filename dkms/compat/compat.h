@@ -288,4 +288,22 @@ static inline int ms_badblocks_check_compat(struct badblocks *bb, sector_t s,
 #define alloc_page_buffers(page, size) alloc_page_buffers((page), (size), false)
 #endif
 
+/*
+ * UAPI constants removed/added between Ubuntu 24.04 GA (6.8) and 6.12.
+ */
+#include <linux/raid/md_u.h>
+#ifndef LEVEL_LINEAR
+#define LEVEL_LINEAR (-1)
+#endif
+
+/*
+ * REQ_ATOMIC bio flag (atomic-writes infrastructure, ~6.10+).
+ * On older kernels atomic-write paths are not exercised; defining as 0
+ * makes the bit-OR / test_bit calls no-op without breaking the build.
+ */
+#include <linux/blk_types.h>
+#ifndef REQ_ATOMIC
+#define REQ_ATOMIC ((__force blk_opf_t)0)
+#endif
+
 #endif /* MESHSTOR_MD_COMPAT_H */
