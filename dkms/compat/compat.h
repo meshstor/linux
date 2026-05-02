@@ -90,6 +90,47 @@
     _MD_COMPAT_GET_3RD(__VA_ARGS__, _kmalloc_objs_3, _kmalloc_objs_2)(__VA_ARGS__)
 #endif
 
+/* kvzalloc_objs / kvmalloc_objs — vmalloc-fallback variants. */
+#ifndef kvzalloc_objs
+#define _kvzalloc_objs_2(type, n)      kvzalloc(array_size((n), sizeof(type)), GFP_KERNEL)
+#define _kvzalloc_objs_3(type, n, gfp) kvzalloc(array_size((n), sizeof(type)), (gfp))
+#define kvzalloc_objs(...) \
+    _MD_COMPAT_GET_3RD(__VA_ARGS__, _kvzalloc_objs_3, _kvzalloc_objs_2)(__VA_ARGS__)
+#endif
+
+#ifndef kvmalloc_objs
+#define _kvmalloc_objs_2(type, n)      kvmalloc(array_size((n), sizeof(type)), GFP_KERNEL)
+#define _kvmalloc_objs_3(type, n, gfp) kvmalloc(array_size((n), sizeof(type)), (gfp))
+#define kvmalloc_objs(...) \
+    _MD_COMPAT_GET_3RD(__VA_ARGS__, _kvmalloc_objs_3, _kvmalloc_objs_2)(__VA_ARGS__)
+#endif
+
+/*
+ * kmalloc_flex(*ptr, member, count, gfp)
+ *
+ * Allocates a struct with a trailing flexible-array member. First arg is the
+ * dereferenced pointer (so typeof(*ptr) yields the struct type), second is
+ * the flex-member name, third is the count, fourth is GFP.
+ *
+ * Backport via struct_size + kmalloc. struct_size handles the size math
+ * (including the flexible-array member) safely against multiplication overflow.
+ */
+#ifndef kmalloc_flex
+#define kmalloc_flex(deref_obj, member, count, gfp) \
+    ({ \
+        typeof(deref_obj) *_p = NULL; \
+        kmalloc(struct_size(_p, member, (count)), (gfp)); \
+    })
+#endif
+
+#ifndef kzalloc_flex
+#define kzalloc_flex(deref_obj, member, count, gfp) \
+    ({ \
+        typeof(deref_obj) *_p = NULL; \
+        kzalloc(struct_size(_p, member, (count)), (gfp)); \
+    })
+#endif
+
 /*
  * bdev_rot()
  *
