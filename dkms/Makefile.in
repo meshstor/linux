@@ -1,22 +1,25 @@
-# meshstor-md DKMS out-of-tree wrapper Makefile
-# Rendered from dkms/Makefile.in at tarball build time.
+# meshstor-ms DKMS out-of-tree wrapper Makefile (post-rename layout).
+# Source files are ms_*.c / raid*_ms.c after dkms/scripts/build-tarball.sh
+# ran the rename pass.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-obj-m := md_mod.o md-llbitmap.o raid0.o raid1.o raid10.o raid456.o
+obj-m := ms_mod.o raid1_ms.o raid10_ms.o
 
-md_mod-y     := md.o md-bitmap.o md-autodetect.o
-raid456-y    := raid5.o raid5-cache.o raid5-ppl.o
-# raid1.ko = raid1.o, raid10.ko = raid10.o, both single-object modules per upstream.
-# raid1-10.c is shipped (in manifest) and #included by raid1.c and raid10.c.
-# md-llbitmap and raid0 are also single-file modules, no -y override needed.
+# md-llbitmap.c is built into the ms_mod composite (matches the in-tree pattern
+# where llbitmap is part of md_mod, not a separate .ko). md-autodetect.c is
+# excluded — it uses kernel init-only symbols (early_lookup_bdev, init_stat)
+# that aren't exported to modules, and our parallel ms subsystem doesn't need
+# boot-time autodetect (arrays are created post-boot via userspace tooling).
+ms_mod-y     := ms.o ms-bitmap.o ms-llbitmap.o
+
+# raid1_ms.ko = raid1_ms.o (single-object), raid10_ms.ko = raid10_ms.o.
+# raid1-10_ms.c is shared source #included by raid1_ms.c and raid10_ms.c.
 
 ccflags-y += -I$(M)/compat
 ccflags-y += -include $(M)/compat/compat.h
-ccflags-y += -DCONFIG_MD_RAID0=1
 ccflags-y += -DCONFIG_MD_RAID1=1
 ccflags-y += -DCONFIG_MD_RAID10=1
-ccflags-y += -DCONFIG_MD_RAID456=1
 ccflags-y += -DCONFIG_MD_BITMAP=1
 ccflags-y += -DCONFIG_MD_LLBITMAP=1
 

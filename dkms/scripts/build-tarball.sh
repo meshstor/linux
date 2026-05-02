@@ -1,27 +1,35 @@
 #!/usr/bin/env bash
 # Assemble a DKMS tarball from drivers/md/ + dkms/
+# Pipeline:
+#   1. Copy manifest sources from drivers/md/ to a flat tarball directory
+#   2. Copy dkms/compat/ into the tarball
+#   3. Apply kernel-API compat patches (dkms/patches/*.patch) in glob-sorted order
+#   4. Run rename pass (dkms/rename.sed) to translate md_* -> ms_*
+#   5. Rename source filenames (md.c -> ms.c, raid1.c -> raid1_ms.c, etc.)
+#   6. Render templates with version substituted
+#   7. Tar the result
 # Usage: dkms/scripts/build-tarball.sh <version>
 set -euo pipefail
 
 VER="${1:?usage: $0 <version>}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-OUT="$REPO_ROOT/build/meshstor-md-$VER"
+OUT="$REPO_ROOT/build/meshstor-ms-$VER"
 
 cd "$REPO_ROOT"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-# Copy kernel sources per manifest (one file per line, supports globs)
+# 1. Copy kernel sources per manifest (one file per line, supports globs)
 while IFS= read -r entry; do
     [ -z "$entry" ] && continue
     [[ "$entry" =~ ^# ]] && continue
     cp drivers/md/$entry "$OUT/"
 done < dkms/manifest.txt
 
-# Copy compat layer
+# 2. Copy compat layer
 cp -r dkms/compat "$OUT/"
 
-# Apply compat patches in glob-sorted order. See dkms/patches/README.md.
+# 3. Apply pre-rename compat patches (kernel-API gaps). See dkms/patches/README.md.
 shopt -s nullglob
 for p in dkms/patches/*.patch; do
     echo "Applying $(basename "$p")"
@@ -29,15 +37,71 @@ for p in dkms/patches/*.patch; do
 done
 shopt -u nullglob
 
-# Render templates with version substituted
+# 4. Run the parallel-subsystem rename pass on every .c and .h.
+# Auto-generate keep-list rules for kernel UAPI MD_* / md_* identifiers
+# (extracted from <linux/raid/md_p.h>, <linux/raid/md_u.h>, <linux/major.h>)
+# and prepend them to dkms/rename.sed for this run.
+KDIR="${KDIR:-/lib/modules/$(uname -r)/build}"
+RENAME_SED=$(mktemp)
+{
+    echo "# === Auto-generated keep rules (kernel UAPI from $KDIR) ==="
+    grep -hoE "\bMD_[A-Z_][A-Z_0-9]*\b" \
+        "$KDIR/include/uapi/linux/raid/md_p.h" \
+        "$KDIR/include/uapi/linux/raid/md_u.h" \
+        "$KDIR/include/uapi/linux/major.h" 2>/dev/null \
+        | sort -u \
+        | awk '{ printf "s/\\b%s\\b/__KEEP_%s/g\n", $0, $0 }'
+    grep -hoE "\bmd_[a-z_][a-z_0-9]*\b" \
+        "$KDIR/include/uapi/linux/raid/md_p.h" \
+        "$KDIR/include/uapi/linux/raid/md_u.h" 2>/dev/null \
+        | sort -u \
+        | awk '{ printf "s/\\b%s\\b/__KEEP_%s/g\n", $0, $0 }'
+    cat dkms/rename.sed
+} > "$RENAME_SED"
+
+echo "Applying rename pass (md_* -> ms_*)"
+shopt -s nullglob
+for f in "$OUT"/*.c "$OUT"/*.h; do
+    sed -i -f "$RENAME_SED" "$f"
+done
+shopt -u nullglob
+rm -f "$RENAME_SED"
+
+# 5. Rename source filenames so the wrapper Makefile finds ms_*.c / raid*_ms.c.
+cd "$OUT"
+for f in md.c md.h md-bitmap.c md-bitmap.h md-cluster.h md-llbitmap.c md-autodetect.c; do
+    [ -e "$f" ] && mv "$f" "${f/md/ms}"
+done
+[ -e raid1.c ]    && mv raid1.c    raid1_ms.c
+[ -e raid1.h ]    && mv raid1.h    raid1_ms.h
+[ -e raid10.c ]   && mv raid10.c   raid10_ms.c
+[ -e raid10.h ]   && mv raid10.h   raid10_ms.h
+[ -e raid1-10.c ] && mv raid1-10.c raid1-10_ms.c
+
+# 5b. Inject the extern declaration for ms_major into ms.h so other TUs
+#     (ms-autodetect.c, raid1_ms.c, etc.) can reference the variable defined
+#     in ms.c. Insert after the include guard.
+if [ -e ms.h ] && ! grep -q "extern int ms_major" ms.h; then
+    sed -i '/^#ifndef _MD_MD_H\|^#ifndef _MS_MS_H\|^#ifndef.*MS_H/{
+        a\
+\
+/* meshstor-ms parallel subsystem: dynamic block-device major (set in ms_init) */\
+extern int ms_major;\
+extern int msp_major;
+        :a
+    }' ms.h
+fi
+cd "$REPO_ROOT"
+
+# 6. Render templates with version substituted
 sed "s/@VERSION@/$VER/g" dkms/dkms.conf.in > "$OUT/dkms.conf"
 sed "s/@VERSION@/$VER/g" dkms/Makefile.in  > "$OUT/Makefile"
 
 # License
 cp dkms/COPYING "$OUT/"
 
-# Tarball
+# 7. Tarball
 cd "$REPO_ROOT/build"
-tar czf "meshstor-md-$VER.dkms.tar.gz" "meshstor-md-$VER/"
+tar czf "meshstor-ms-$VER.dkms.tar.gz" "meshstor-ms-$VER/"
 
-echo "Built: $REPO_ROOT/build/meshstor-md-$VER.dkms.tar.gz"
+echo "Built: $REPO_ROOT/build/meshstor-ms-$VER.dkms.tar.gz"

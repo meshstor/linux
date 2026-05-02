@@ -4,16 +4,9 @@ md-bitmap.c
 md-bitmap.h
 md-cluster.h
 md-llbitmap.c
-md-autodetect.c
-raid0.c
 raid0.h
 raid1.c
 raid1.h
 raid10.c
 raid10.h
-raid5.c
-raid5.h
-raid5-cache.c
-raid5-log.h
-raid5-ppl.c
 raid1-10.c
