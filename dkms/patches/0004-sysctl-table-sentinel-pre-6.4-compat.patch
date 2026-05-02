@@ -1,0 +1,17 @@
+--- a/md.c
++++ b/md.c
+@@ -324,6 +324,14 @@
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
++#ifndef HAVE_SYSCTL_REGISTER_TABLE_NO_SENTINEL
++	/* Pre-6.4 kernels (incl. RHEL 9.x's 5.14) walk the sysctl table until
++	 * they hit an entry with NULL procname, then stop. Without this
++	 * sentinel, register_sysctl walks past the end into garbage memory and
++	 * sysctl_check_table panics. Newer kernels treat it as a benign empty
++	 * entry. */
++	{ }
++#endif
+ };
+ 
+ static int start_readonly;

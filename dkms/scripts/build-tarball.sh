@@ -91,6 +91,13 @@ KDIR_FOR_DETECT="${KDIR:-/lib/modules/$(uname -r)/build}"
        grep -qE "alloc_page_buffers\(struct page \*page, unsigned long size\)" "$KDIR_FOR_DETECT/include/linux/buffer_head.h"; then
         echo "#define HAVE_ALLOC_PAGE_BUFFERS_2ARG 1"
     fi
+    # sysctl table sentinel-less registration (~6.4+). Detected by
+    # presence of register_sysctl_sz (size-explicit API) introduced
+    # alongside the sentinel-free convention.
+    if [ -f "$KDIR_FOR_DETECT/include/linux/sysctl.h" ] && \
+       grep -qE "\bregister_sysctl_sz\b" "$KDIR_FOR_DETECT/include/linux/sysctl.h"; then
+        echo "#define HAVE_SYSCTL_REGISTER_TABLE_NO_SENTINEL 1"
+    fi
     echo ""
     echo "#endif /* MESHSTOR_MS_FEATURE_FLAGS_H */"
 } > "$OUT/compat/feature_flags.h"
