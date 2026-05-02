@@ -147,3 +147,4 @@ s/\brdev_clear_badblocks\b/ms_rdev_clear_badblocks/g
 s/\bsync_page_io\b/ms_sync_page_io/g
 s/\bregister_md_submodule\b/register_ms_submodule/g
 s/\bunregister_md_submodule\b/unregister_ms_submodule/g
+s/__md_wakeup_thread/__ms_wakeup_thread/g
