@@ -1,0 +1,48 @@
+--- a/raid0.c
++++ b/raid0.c
+@@ -386,7 +386,9 @@
+ 	md_init_stacking_limits(&lim);
+ 	lim.max_hw_sectors = mddev->chunk_sectors;
+ 	lim.max_write_zeroes_sectors = mddev->chunk_sectors;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ 	lim.max_hw_wzeroes_unmap_sectors = mddev->chunk_sectors;
++#endif
+ 	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.io_min = mddev->chunk_sectors << 9;
+ 	lim.io_opt = lim.io_min * mddev->raid_disks;
+--- a/raid1.c
++++ b/raid1.c
+@@ -3265,7 +3265,9 @@
+ 
+ 	md_init_stacking_limits(&lim);
+ 	lim.max_write_zeroes_sectors = 0;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
++#endif
+ 	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+--- a/raid10.c
++++ b/raid10.c
+@@ -4085,7 +4085,9 @@
+ 
+ 	md_init_stacking_limits(&lim);
+ 	lim.max_write_zeroes_sectors = 0;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
++#endif
+ 	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.io_min = mddev->chunk_sectors << 9;
+ 	lim.chunk_sectors = mddev->chunk_sectors;
+--- a/raid5.c
++++ b/raid5.c
+@@ -7790,7 +7790,9 @@
+ 	lim.features |= BLK_FEAT_RAID_PARTIAL_STRIPES_EXPENSIVE;
+ 	lim.discard_granularity = stripe;
+ 	lim.max_write_zeroes_sectors = 0;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
++#endif
+ 	mddev_stack_rdev_limits(mddev, &lim, 0);
+ 	rdev_for_each(rdev, mddev)
+ 		queue_limits_stack_bdev(&lim, rdev->bdev, rdev->new_data_offset,
