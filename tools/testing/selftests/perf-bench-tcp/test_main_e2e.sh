@@ -31,9 +31,9 @@ case "$1" in
         done
         echo "$nqn" > "$_NQN_CACHE"
         ;;
-    list)
+    list-subsys)
         nqn="$(cat "$_NQN_CACHE" 2>/dev/null || true)"
-        printf '{"Devices":[{"DevicePath":"/dev/nvme9n9","SubsystemNQN":"%s"}]}\n' "$nqn"
+        printf '[{"Subsystems":[{"NQN":"%s","Paths":[{"Name":"nvme9"}]}]}]\n' "$nqn"
         ;;
     --version)  echo "nvme version 2.4" ;;
     disconnect) ;;
@@ -61,6 +61,7 @@ chmod +x "$PBT_STUB_DIR/msadm"
 export PBT_SKIP_ROOT_CHECK=1
 export PBT_PRESUME_BLOCK=1
 export PBT_FAKE_DROP_CACHES=1
+export PBT_SKIP_SUITE_LINK=1
 
 # Use a tmp NVMET_ROOT
 export NVMET_ROOT="$PBT_TMPDIR/configfs"

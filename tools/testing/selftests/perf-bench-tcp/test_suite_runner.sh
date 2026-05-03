@@ -35,6 +35,8 @@ chmod +x "$SUITE"/*.sh
 
 # drop_caches needs root; the script honors PBT_FAKE_DROP_CACHES=1.
 export PBT_FAKE_DROP_CACHES=1
+# /suite symlink also needs root.
+export PBT_SKIP_SUITE_LINK=1
 
 run_suite "$SUITE"
 
