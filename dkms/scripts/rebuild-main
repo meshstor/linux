@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# rebuild-main — reconstruct a meshstor-main-equivalent tree from a fresh
+# torvalds/linux clone, slim it via git filter-repo, then apply the
+# meshstor-harness branch and zero or more feature branches as patches.
+#
+# See docs/superpowers/specs/2026-05-04-rebuild-main-script-design.md
+#
+# Usage: dkms/scripts/rebuild-main [options] [feature ...]
+set -euo pipefail
+
+UPSTREAM_URL="https://github.com/torvalds/linux.git"
+UPSTREAM_BRANCH="master"
+MESHSTOR_URL="git@github.com:meshstor/linux"
+HARNESS_BRANCH="meshstor-harness"
+FILTER_PATHS=(drivers/md tools/testing/selftests/md)
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/meshstor"
+
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+DEFAULT_OUTPUT="$(dirname "$REPO_ROOT")/linux-meshstor-rebuilt"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] [feature ...]
+
+Reconstruct a meshstor-main-equivalent tree from upstream + harness +
+the listed feature branches (applied as patches in the given order).
+
+Options:
+  -o, --output DIR     Output directory (default: $DEFAULT_OUTPUT)
+  --no-fetch           Skip refreshing the cached upstream mirror
+  --keep               Bail (instead of wiping) if OUTPUT_DIR already exists
+  -h, --help           Show this help
+
+Examples:
+  $(basename "$0")
+      -> harness only
+  $(basename "$0") md-latency-ewma
+      -> harness + latency-ewma
+  $(basename "$0") per-bucket-arrays md-latency-ewma \\
+                   wip/md-llbitmap-hot-write-fast-path
+      -> harness + three features in given order
+EOF
+}
+
+OUTPUT_DIR="$DEFAULT_OUTPUT"
+NO_FETCH=
+KEEP=
+FEATURES=()
+
+while (($#)); do
+    case "$1" in
+        -o|--output)   OUTPUT_DIR="$2"; shift 2 ;;
+        --no-fetch)    NO_FETCH=1; shift ;;
+        --keep)        KEEP=1; shift ;;
+        -h|--help)     usage; exit 0 ;;
+        --)            shift; FEATURES+=("$@"); break ;;
+        -*)            echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *)             FEATURES+=("$1"); shift ;;
+    esac
+done
+
+# Resolve OUTPUT_DIR to an absolute path (parent must exist).
+OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR")"
+
+require_git_version() {
+    local have major minor
+    have="$(git --version 2>/dev/null | awk '{print $3}')" \
+        || { echo "error: git is not installed" >&2; exit 1; }
+    IFS=. read -r major minor _ <<<"$have"
+    if (( major < 2 || (major == 2 && minor < 30) )); then
+        echo "error: git >= 2.30 required (found: $have)" >&2
+        exit 1
+    fi
+}
+
+require_filter_repo() {
+    if ! git filter-repo --version >/dev/null 2>&1; then
+        echo "error: git-filter-repo not installed; see https://github.com/newren/git-filter-repo" >&2
+        exit 1
+    fi
+}
+
+require_remote_reachable() {
+    if ! git ls-remote "$MESHSTOR_URL" >/dev/null 2>&1; then
+        echo "error: cannot reach $MESHSTOR_URL — check SSH key / network" >&2
+        exit 1
+    fi
+}
+
+require_branch_on_remote() {
+    local branch="$1" label="$2"
+    if ! git ls-remote --exit-code "$MESHSTOR_URL" "refs/heads/$branch" >/dev/null 2>&1; then
+        if [[ "$label" == harness ]]; then
+            echo "error: branch '$branch' not found on $MESHSTOR_URL — bootstrap it first" >&2
+            echo "       (see docs/superpowers/specs/2026-05-04-rebuild-main-script-design.md, Bootstrap section)" >&2
+        else
+            echo "error: feature branch '$branch' not found on $MESHSTOR_URL" >&2
+        fi
+        exit 1
+    fi
+}
+
+require_git_version
+require_filter_repo
+require_remote_reachable
+require_branch_on_remote "$HARNESS_BRANCH" harness
+for f in "${FEATURES[@]}"; do
+    require_branch_on_remote "$f" feature
+done
+
+echo "rebuild-main: output=$OUTPUT_DIR features=(${FEATURES[*]:-none})"
