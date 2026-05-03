@@ -158,4 +158,20 @@ stage1_refresh_upstream() {
 
 stage1_refresh_upstream
 
+stage2_filter_repo() {
+    local mirror="$CACHE_DIR/torvalds-linux.git"
+    echo "rebuild-main: local clone -> $OUTPUT_DIR"
+    git clone "$mirror" "$OUTPUT_DIR"
+    cd "$OUTPUT_DIR"
+    git checkout "$UPSTREAM_BRANCH"
+    echo "rebuild-main: filter-repo (paths: ${FILTER_PATHS[*]})"
+    local filter_args=()
+    for p in "${FILTER_PATHS[@]}"; do filter_args+=(--path "$p"); done
+    git filter-repo "${filter_args[@]}" --force
+    FILTERED_SHA="$(git rev-parse HEAD)"
+    echo "rebuild-main: filtered HEAD = $FILTERED_SHA"
+}
+
+stage2_filter_repo
+
 echo "rebuild-main: output=$OUTPUT_DIR features=(${FEATURES[*]:-none})"
