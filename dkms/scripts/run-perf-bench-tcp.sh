@@ -71,6 +71,65 @@ resolve_msadm() {
     return 1
 }
 
+die_setup() { echo "setup: $*" >&2; exit "$EXIT_SETUP"; }
+
+# ---- nvmet ----
+NVMET_ROOT="${NVMET_ROOT:-/sys/kernel/config/nvmet}"
+NQN=""
+PORT_ID=""
+NVMET_SETUP_DONE=0
+
+generate_nqn() {
+    local host
+    host="$(hostname -s)"
+    NQN="nqn.2026-05.local:msbench-${host}-$$-$RANDOM"
+}
+
+generate_port_id() {
+    PORT_ID="$(printf '%s:%s' "$ADDR" "$PORT" | cksum | awk '{print $1 % 65535 + 1}')"
+}
+
+setup_nvmet() {
+    [[ -d "$NVMET_ROOT" ]] || die_setup "configfs not mounted at $NVMET_ROOT"
+    generate_nqn
+    generate_port_id
+
+    local sub="$NVMET_ROOT/subsystems/$NQN"
+    local ns="$sub/namespaces/1"
+    local port="$NVMET_ROOT/ports/$PORT_ID"
+
+    log "nvmet: subsystem $NQN, port $PORT_ID -> $ADDR:$PORT"
+
+    run_log mkdir -p "$sub"
+    echo 1 > "$sub/attr_allow_any_host"
+    run_log mkdir -p "$ns"
+    echo "$PART_REMOTE" > "$ns/device_path"
+    echo 1 > "$ns/enable"
+
+    run_log mkdir -p "$port"
+    echo "$ADDR"  > "$port/addr_traddr"
+    echo "$PORT"  > "$port/addr_trsvcid"
+    echo tcp      > "$port/addr_trtype"
+    echo ipv4     > "$port/addr_adrfam"
+
+    run_log ln -s "$sub" "$port/subsystems/$NQN"
+    NVMET_SETUP_DONE=1
+}
+
+teardown_nvmet() {
+    [[ "$NVMET_SETUP_DONE" -eq 1 ]] || return 0
+    local sub="$NVMET_ROOT/subsystems/$NQN"
+    local ns="$sub/namespaces/1"
+    local port="$NVMET_ROOT/ports/$PORT_ID"
+    rm -f "$port/subsystems/$NQN" 2>/dev/null || true
+    rmdir "$port" 2>/dev/null || true
+    if [[ -d "$ns" ]]; then
+        echo 0 > "$ns/enable" 2>/dev/null || true
+        rmdir "$ns" 2>/dev/null || true
+    fi
+    rmdir "$sub" 2>/dev/null || true
+}
+
 preflight() {
     if [[ "${PBT_SKIP_ROOT_CHECK:-0}" != "1" ]] && [[ "$(id -u)" -ne 0 ]]; then
         die_pre "must run as root"
@@ -166,7 +225,7 @@ parse_args() {
     # doesn't flag them while later commits add the actual consumers
     # (setup_nvmet, run_suite, cleanup, ...). The final commit will
     # remove this line once every global has a real reader.
-    : "$BITMAP $OUT_DIR $FAIL_FAST $KEEP $EXIT_SETUP $EXIT_SUITE"
+    : "$BITMAP $OUT_DIR $FAIL_FAST $KEEP $EXIT_SUITE"
 }
 
 usage() {
