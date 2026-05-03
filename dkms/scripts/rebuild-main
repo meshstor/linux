@@ -144,8 +144,11 @@ done
 stage1_refresh_upstream() {
     local mirror="$CACHE_DIR/torvalds-linux.git"
     if [[ ! -d "$mirror" ]]; then
-        echo "rebuild-main: cloning $UPSTREAM_URL into $mirror (first run; partial clone)"
-        git clone --bare --filter=blob:none "$UPSTREAM_URL" "$mirror"
+        # Full bare clone (no --filter=blob:none): filter-repo needs every blob
+        # in the filtered paths and a partial clone fails it with
+        # "fatal: Blob not found". Cost: ~5GB on disk, one-time.
+        echo "rebuild-main: cloning $UPSTREAM_URL into $mirror (first run; ~5GB, one-time)"
+        git clone --bare "$UPSTREAM_URL" "$mirror"
     elif [[ -z "$NO_FETCH" ]]; then
         echo "rebuild-main: refreshing cached upstream mirror"
         git -C "$mirror" fetch origin "$UPSTREAM_BRANCH:$UPSTREAM_BRANCH"
