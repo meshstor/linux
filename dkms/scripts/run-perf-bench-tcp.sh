@@ -7,6 +7,20 @@
 # loopback leg (the second partition exported via nvmet-tcp on this host
 # and re-imported), then runs one or more csi-perf-test-style suites
 # against /dev/ms0. Idempotent trap-driven teardown.
+#
+# Smoke recipe (run once on each new host, as root):
+#
+#   1. Pick two unused partitions on the same NVMe, e.g. /dev/nvme0n1p4 p5.
+#   2. Pick a SNIA suite, e.g.
+#      /home/$USER/csi-perf-test/suites/snia-randread-iops.
+#   3. Run:
+#        sudo dkms/scripts/run-perf-bench-tcp.sh \
+#             /dev/nvme0n1p4 /dev/nvme0n1p5 \
+#             /home/$USER/csi-perf-test/suites/snia-randread-iops
+#   4. Inspect ./results/<UTC>-<host>-<kver>/{manifest.json,suiteX/run.log}.
+#   5. Confirm /sys/kernel/config/nvmet/subsystems/ has no leftover
+#      *msbench-* and `nvme list` shows no leftover loopback subsystem.
+#   6. Re-run with Ctrl-C mid-setup to verify trap-driven cleanup.
 
 set -euo pipefail
 
