@@ -149,6 +149,40 @@ disconnect_nvme_client() {
     udevadm settle >/dev/null 2>&1 || true
 }
 
+# ---- ms raid1 ----
+MS_DEV="${MS_DEV:-/dev/ms0}"
+MSRAID_ASSEMBLED=0
+
+msraid_assemble() {
+    log "msraid: assemble $MS_DEV from $PART_LOCAL + $IMPORTED (bitmap=$BITMAP)"
+    run_log "$MSADM" --create "$MS_DEV" \
+        --level=raid1 --raid-devices=2 \
+        --bitmap="$BITMAP" --metadata=1.2 \
+        --run --assume-clean \
+        "$PART_LOCAL" "$IMPORTED"
+    MSRAID_ASSEMBLED=1
+}
+
+msraid_verify() {
+    local detail state working failed
+    detail="$("$MSADM" --detail "$MS_DEV")" || die_setup "msadm --detail failed"
+    state="$(printf '%s\n'   "$detail" | awk -F': *' '/State *:/{print $2; exit}')"
+    working="$(printf '%s\n' "$detail" | awk -F': *' '/Working Devices/{print $2; exit}')"
+    failed="$(printf '%s\n'  "$detail" | awk -F': *' '/Failed Devices/{print $2; exit}')"
+    if [[ "$state" != "active" ]] || [[ "$working" != "2" ]] || [[ "$failed" != "0" ]]; then
+        die_setup "msraid not healthy: state=$state working=$working failed=$failed"
+    fi
+}
+
+msraid_teardown() {
+    [[ "$MSRAID_ASSEMBLED" -eq 1 ]] || return 0
+    "$MSADM" --stop "$MS_DEV" >/dev/null 2>&1 || true
+    "$MSADM" --zero-superblock "$PART_LOCAL" >/dev/null 2>&1 || true
+    if [[ -n "$IMPORTED" ]]; then
+        "$MSADM" --zero-superblock "$IMPORTED" >/dev/null 2>&1 || true
+    fi
+}
+
 teardown_nvmet() {
     [[ "$NVMET_SETUP_DONE" -eq 1 ]] || return 0
     local sub="$NVMET_ROOT/subsystems/$NQN"
@@ -258,7 +292,7 @@ parse_args() {
     # doesn't flag them while later commits add the actual consumers
     # (setup_nvmet, run_suite, cleanup, ...). The final commit will
     # remove this line once every global has a real reader.
-    : "$BITMAP $OUT_DIR $FAIL_FAST $KEEP $EXIT_SUITE"
+    : "$OUT_DIR $FAIL_FAST $KEEP $EXIT_SUITE"
 }
 
 usage() {
