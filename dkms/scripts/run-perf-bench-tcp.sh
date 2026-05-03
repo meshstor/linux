@@ -49,6 +49,77 @@ run_log() {
     "$@"
 }
 
+# ---- preflight ----
+REQUIRED_TOOLS=(mdadm nvme fio lsblk jq udevadm awk modprobe ss)
+REQUIRED_MODULES=(nvmet nvmet-tcp nvme-tcp ms-mod)
+
+die_pre() { echo "preflight: $*" >&2; exit "$EXIT_PREFLIGHT"; }
+
+resolve_msadm() {
+    if [[ -n "$MSADM" ]]; then
+        [[ -x "$MSADM" ]] || return 1
+        return 0
+    fi
+    if [[ -x /tmp/msadm ]]; then
+        MSADM=/tmp/msadm
+        return 0
+    fi
+    if command -v msadm >/dev/null 2>&1; then
+        MSADM="$(command -v msadm)"
+        return 0
+    fi
+    return 1
+}
+
+preflight() {
+    if [[ "${PBT_SKIP_ROOT_CHECK:-0}" != "1" ]] && [[ "$(id -u)" -ne 0 ]]; then
+        die_pre "must run as root"
+    fi
+
+    local t
+    for t in "${REQUIRED_TOOLS[@]}"; do
+        command -v "$t" >/dev/null 2>&1 || die_pre "missing tool: $t"
+    done
+
+    if ! resolve_msadm; then
+        die_pre "msadm not found (tried --msadm, /tmp/msadm, PATH)"
+    fi
+
+    local m
+    for m in "${REQUIRED_MODULES[@]}"; do
+        if ! modprobe -n "$m" >/dev/null 2>&1; then
+            die_pre "kernel module not loadable: $m"
+        fi
+    done
+
+    local p
+    for p in "$PART_LOCAL" "$PART_REMOTE"; do
+        if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && [[ ! -b "$p" ]]; then
+            die_pre "not a block device: $p"
+        fi
+        if grep -q "^$(basename "$p") " /proc/mdstat 2>/dev/null; then
+            die_pre "partition is in /proc/mdstat: $p"
+        fi
+        if awk '{print $10}' /proc/self/mountinfo 2>/dev/null | grep -qx "$p"; then
+            die_pre "partition is mounted: $p"
+        fi
+    done
+
+    local s f
+    for s in "${SUITES[@]}"; do
+        [[ -d "$s" ]] || die_pre "suite is not a directory: $s"
+        for f in prepare.sh run.sh cleanup.sh; do
+            [[ -x "$s/$f" ]] || die_pre "suite missing executable $f: $s"
+        done
+    done
+
+    if [[ "${PBT_SKIP_ROOT_CHECK:-0}" != "1" ]]; then
+        if ss -lnt "sport = :$PORT" 2>/dev/null | tail -n +2 | grep -q .; then
+            die_pre "port already bound: $ADDR:$PORT"
+        fi
+    fi
+}
+
 parse_args() {
     # Reset state so callers (and tests) can invoke parse_args repeatedly.
     PART_LOCAL=""
@@ -91,12 +162,11 @@ parse_args() {
         die "PART_LOCAL and PART_REMOTE must differ"
     fi
 
-    # Mark globals as "used" so shellcheck SC2034 doesn't flag them
-    # while later commits add the actual consumers (preflight,
-    # setup_nvmet, run_suite, cleanup, ...). The next-to-last commit
-    # will remove this line once every global has a real reader.
-    : "$BITMAP $PORT $ADDR $MSADM $OUT_DIR $FAIL_FAST $KEEP ${SUITES[*]}" \
-      "$PART_LOCAL $PART_REMOTE $EXIT_PREFLIGHT $EXIT_SETUP $EXIT_SUITE"
+    # Mark not-yet-consumed globals as "used" so shellcheck SC2034
+    # doesn't flag them while later commits add the actual consumers
+    # (setup_nvmet, run_suite, cleanup, ...). The final commit will
+    # remove this line once every global has a real reader.
+    : "$BITMAP $OUT_DIR $FAIL_FAST $KEEP $EXIT_SETUP $EXIT_SUITE"
 }
 
 usage() {
