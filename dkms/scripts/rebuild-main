@@ -102,6 +102,39 @@ require_branch_on_remote() {
 
 require_git_version
 require_filter_repo
+
+prepare_output_dir() {
+    # Refuse obviously dangerous paths
+    case "$OUTPUT_DIR" in
+        /|"$HOME"|"$REPO_ROOT")
+            echo "error: refusing to use OUTPUT_DIR=$OUTPUT_DIR" >&2
+            exit 1
+            ;;
+    esac
+
+    if [[ -e "$OUTPUT_DIR" ]]; then
+        if [[ -n "$KEEP" ]]; then
+            echo "error: $OUTPUT_DIR exists; remove it or run without --keep" >&2
+            exit 1
+        fi
+        # Only wipe if it's a previous rebuild-main output (sentinel present),
+        # OR not a git repo at all (we'd never put one there ourselves, refuse).
+        if [[ -d "$OUTPUT_DIR/.git" && -f "$OUTPUT_DIR/.meshstor-rebuilt" ]]; then
+            echo "rebuild-main: wiping previous output at $OUTPUT_DIR"
+            rm -rf "$OUTPUT_DIR"
+        else
+            echo "error: $OUTPUT_DIR exists but is not a previous rebuild-main output" >&2
+            echo "       (no .meshstor-rebuilt sentinel). Refusing to wipe; remove manually." >&2
+            exit 1
+        fi
+    fi
+
+    mkdir -p "$(dirname "$OUTPUT_DIR")"
+    mkdir -p "$CACHE_DIR"
+}
+
+prepare_output_dir
+
 require_remote_reachable
 require_branch_on_remote "$HARNESS_BRANCH" harness
 for f in "${FEATURES[@]}"; do
