@@ -174,4 +174,49 @@ stage2_filter_repo() {
 
 stage2_filter_repo
 
+# Apply <branch> from the meshstor remote onto the current HEAD as a patch
+# series. Returns the patch count via stdout (caller captures); all status
+# messages go to stderr to avoid polluting the captured value. Leaves
+# .git/rebase-apply/ if git am fails.
+# $1 = branch name, $2 = stage label (used in error messages).
+apply_branch_as_patches() {
+    local branch="$1" label="$2"
+    local safe_dir base count
+    safe_dir="$(echo "$branch" | tr / -)"
+    git fetch meshstor "$branch:refs/remotes/meshstor/$branch" >&2
+    base="$(git merge-base "meshstor/$branch" "meshstor/$UPSTREAM_BRANCH")"
+    mkdir -p ".rebuild-patches/$safe_dir"
+    git format-patch "$base..meshstor/$branch" -o ".rebuild-patches/$safe_dir/" >/dev/null
+    count="$(find ".rebuild-patches/$safe_dir" -name '*.patch' | wc -l | tr -d ' ')"
+    if (( count == 0 )); then
+        echo "rebuild-main: $label has no patches above $base — nothing to apply" >&2
+        rm -rf ".rebuild-patches/$safe_dir"
+        echo "0"
+        return 0
+    fi
+    echo "rebuild-main: applying $count patches from $branch ($label)" >&2
+    if ! git am ".rebuild-patches/$safe_dir/"*.patch >&2; then
+        echo "" >&2
+        echo "error: git am failed while applying $label ($branch)" >&2
+        echo "       output dir: $OUTPUT_DIR" >&2
+        echo "       resume with: cd $OUTPUT_DIR && git am --continue   (after resolving)" >&2
+        echo "       or abort:    cd $OUTPUT_DIR && git am --abort" >&2
+        exit 1
+    fi
+    rm -rf ".rebuild-patches/$safe_dir"
+    echo "$count"
+}
+
+stage3_apply_harness() {
+    git remote add meshstor "$MESHSTOR_URL"
+    # One-shot fetch of upstream master as the format-patch base for both
+    # harness and feature branches (all rebased on a torvalds master snapshot).
+    git fetch meshstor "$UPSTREAM_BRANCH:refs/remotes/meshstor/$UPSTREAM_BRANCH"
+    HARNESS_PATCH_COUNT="$(apply_branch_as_patches "$HARNESS_BRANCH" harness)"
+    HARNESS_SHA="$(git rev-parse HEAD)"
+    echo "rebuild-main: harness HEAD = $HARNESS_SHA"
+}
+
+stage3_apply_harness
+
 echo "rebuild-main: output=$OUTPUT_DIR features=(${FEATURES[*]:-none})"
