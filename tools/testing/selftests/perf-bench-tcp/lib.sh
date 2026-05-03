@@ -5,7 +5,7 @@
 
 set -u
 
-PBT_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+PBT_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 # Used by test_*.sh.
 # shellcheck disable=SC2034
 PBT_SCRIPT="$PBT_REPO_ROOT/dkms/scripts/run-perf-bench-tcp.sh"
