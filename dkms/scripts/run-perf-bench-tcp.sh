@@ -112,6 +112,10 @@ setup_nvmet() {
     echo tcp      > "$port/addr_trtype"
     echo ipv4     > "$port/addr_adrfam"
 
+    # On real configfs the kernel auto-creates ports/<id>/subsystems/.
+    # Idempotent mkdir is a no-op there and a necessary explicit step
+    # in the unit-test mock.
+    mkdir -p "$port/subsystems"
     run_log ln -s "$sub" "$port/subsystems/$NQN"
     NVMET_SETUP_DONE=1
 }
@@ -511,12 +515,6 @@ parse_args() {
     if [[ "$PART_LOCAL" == "$PART_REMOTE" ]]; then
         die "PART_LOCAL and PART_REMOTE must differ"
     fi
-
-    # Mark not-yet-consumed globals as "used" so shellcheck SC2034
-    # doesn't flag them while later commits add the actual consumers
-    # (setup_nvmet, run_suite, cleanup, ...). The final commit will
-    # remove this line once every global has a real reader.
-    : "$FAIL_FAST $EXIT_SUITE"
 }
 
 usage() {
@@ -552,8 +550,35 @@ main() {
         exit 0
     fi
     parse_args "$@"
-    echo "main: unimplemented (parse_args ok)" >&2
-    exit 1
+    preflight
+    resolve_out_dir
+    : > "$OUT_DIR/cleanup.log"
+
+    trap on_exit EXIT
+
+    setup_nvmet
+    connect_nvme_client
+    resolve_imported
+    msraid_assemble
+    msraid_verify
+    write_manifest
+
+    local suite
+    for suite in "${SUITES[@]}"; do
+        if ! run_suite "$suite"; then
+            if [[ "$FAIL_FAST" -eq 1 ]]; then
+                log "fail-fast: stopping after $suite"
+                break
+            fi
+        fi
+    done
+
+    if [[ "$SUITE_FAILURES" -gt 0 ]]; then
+        SCRIPT_RC=$EXIT_SUITE
+        exit "$SCRIPT_RC"
+    fi
+    SCRIPT_RC=0
+    exit 0
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
