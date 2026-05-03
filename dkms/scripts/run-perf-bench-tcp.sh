@@ -301,6 +301,79 @@ write_manifest() {
     } > "$OUT_DIR/start.txt"
 }
 
+# ---- suite runner ----
+SUITE_FAILURES=0
+
+drop_caches() {
+    if [[ "${PBT_FAKE_DROP_CACHES:-0}" == "1" ]]; then
+        return 0
+    fi
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+}
+
+run_suite() {
+    local suite="$1"
+    local name dir started_epoch ended_epoch duration started_iso
+    name="$(basename "$suite")"
+    dir="$OUT_DIR/$name"
+    mkdir -p "$dir"
+
+    log "suite: $name (path=$suite)"
+    drop_caches
+
+    local prepare_rc=0 run_rc=0 cleanup_rc=0
+    started_epoch="$(date -u +%s)"
+    started_iso="$(date -u +%FT%TZ)"
+
+    BLOCKDEV="$MS_DEV" VOLUME_MODE=block OUT_DIR="$OUT_DIR" \
+        bash "$suite/prepare.sh" >"$dir/prepare.log" 2>&1 \
+        || prepare_rc=$?
+
+    if [[ "$prepare_rc" -eq 0 ]]; then
+        BLOCKDEV="$MS_DEV" VOLUME_MODE=block OUT_DIR="$OUT_DIR" \
+            bash "$suite/run.sh" >"$dir/run.log" 2>&1 \
+            || run_rc=$?
+    else
+        run_rc=255
+        echo "skipped: prepare failed (rc=$prepare_rc)" > "$dir/run.log"
+    fi
+
+    BLOCKDEV="$MS_DEV" VOLUME_MODE=block OUT_DIR="$OUT_DIR" \
+        bash "$suite/cleanup.sh" >"$dir/cleanup.log" 2>&1 \
+        || cleanup_rc=$?
+
+    ended_epoch="$(date -u +%s)"
+    duration=$((ended_epoch - started_epoch))
+
+    jq -nc \
+        --arg suite      "$name" \
+        --arg path       "$suite" \
+        --arg started    "$started_iso" \
+        --argjson dur    "$duration" \
+        --argjson p_rc   "$prepare_rc" \
+        --argjson r_rc   "$run_rc" \
+        --argjson c_rc   "$cleanup_rc" \
+        '{
+          suite: $suite,
+          path: $path,
+          started_utc: $started,
+          duration_s: $dur,
+          prepare_rc: $p_rc,
+          run_rc:     $r_rc,
+          cleanup_rc: $c_rc
+        }' >> "$OUT_DIR/suite-results.jsonl"
+
+    if [[ "$run_rc" -ne 0 ]]; then
+        SUITE_FAILURES=$((SUITE_FAILURES + 1))
+        log "suite $name: FAIL (run_rc=$run_rc)"
+    else
+        log "suite $name: ok"
+    fi
+
+    return "$run_rc"
+}
+
 teardown_nvmet() {
     [[ "$NVMET_SETUP_DONE" -eq 1 ]] || return 0
     local sub="$NVMET_ROOT/subsystems/$NQN"
