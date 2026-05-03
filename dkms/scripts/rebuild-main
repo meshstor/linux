@@ -219,4 +219,22 @@ stage3_apply_harness() {
 
 stage3_apply_harness
 
+stage4_apply_features() {
+    APPLIED_FEATURES=()  # parallel arrays for the summary
+    APPLIED_TAGS=()
+    APPLIED_COUNTS=()
+    for feature in "${FEATURES[@]}"; do
+        local count tag
+        count="$(apply_branch_as_patches "$feature" "feature:$feature")"
+        tag="feat-$(echo "$feature" | tr / -)-applied"
+        git tag "$tag"
+        APPLIED_FEATURES+=("$feature")
+        APPLIED_TAGS+=("$tag")
+        APPLIED_COUNTS+=("$count")
+        echo "rebuild-main: tagged $tag at $(git rev-parse --short HEAD)"
+    done
+}
+
+stage4_apply_features
+
 echo "rebuild-main: output=$OUTPUT_DIR features=(${FEATURES[*]:-none})"
