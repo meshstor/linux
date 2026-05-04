@@ -35,6 +35,20 @@ KEEP=0
 
 die() { echo "error: $*" >&2; exit "$EXIT_USAGE"; }
 
+# ---- logging ----
+LOG_FD=2  # stderr by default; main() may redirect later
+
+log()  { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >&"$LOG_FD"; }
+warn() { printf '[%s] WARN: %s\n' "$(date -u +%FT%TZ)" "$*" >&"$LOG_FD"; }
+
+# run_log CMD ARGS...  — log the command, then run it; output goes
+# wherever the caller already routed stdout/stderr. Returns command's
+# exit code.
+run_log() {
+    log "+ $*"
+    "$@"
+}
+
 parse_args() {
     # Reset state so callers (and tests) can invoke parse_args repeatedly.
     PART_LOCAL=""
