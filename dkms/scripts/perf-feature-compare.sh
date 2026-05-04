@@ -67,6 +67,7 @@ Flags:
   --level=raid1|raid10  raid level (default: raid1)
   --local=PATH          local-leg partition (repeatable)
   --remote=PATH         tcp-leg partition (repeatable; same count as --local)
+  --port=N              nvmet-tcp listen port (default: bench script's 4420)
   --summary-only        regenerate SUMMARY.md from existing run.log files
                         and exit (no rebuild/bench)
 
@@ -87,6 +88,7 @@ REMOTES=()
 SELECTED_VARIANTS=()
 SYSTEM_DKMS_VER=""
 SUMMARY_ONLY=0
+PORT=""
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
@@ -100,6 +102,7 @@ while (($#)); do
         --level=*)      LEVEL="${1#--level=}"; shift ;;
         --local=*)      LOCALS+=("${1#--local=}"); shift ;;
         --remote=*)     REMOTES+=("${1#--remote=}"); shift ;;
+        --port=*)       PORT="${1#--port=}"; shift ;;
         --) shift; _pos+=("$@"); break ;;
         -*) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
         *)  _pos+=("$1"); shift ;;
@@ -409,6 +412,7 @@ run_variant() {
     local -a bench_args
     bench_args=(--bitmap=lockless --out-dir="$bench_dir" --msadm="$MSADM_WRAPPER" \
                 --level="$LEVEL")
+    [[ -n "$PORT" ]] && bench_args+=(--port="$PORT")
     for p in "${LOCALS[@]}";  do bench_args+=(--local="$p");  done
     for p in "${REMOTES[@]}"; do bench_args+=(--remote="$p"); done
     if ! "$RUN_PERF" "${bench_args[@]}" "${SUITES[@]}"; then
