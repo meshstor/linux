@@ -23,29 +23,34 @@ pbt_assert_contains "$log_out" "STUB nvme connect -t tcp -a 10.0.0.5 -s 4420 -n 
                     "nvme connect args"
 pbt_assert_contains "$log_out" "STUB udevadm settle" "udevadm settle called"
 
-# resolve_imported uses `nvme list -o json`; stub returns matching JSON
-nvme_list_json='{
-  "Devices": [
-    { "DevicePath": "/dev/nvme0n1", "SubsystemNQN": "nqn.other:x" },
-    { "DevicePath": "/dev/nvme9n1", "SubsystemNQN": "nqn.test:demo" }
-  ]
-}'
-pbt_stub nvme 0 "$nvme_list_json"
+# resolve_imported uses `nvme list-subsys -o json` and assembles
+# /dev/<ctl>n1; PBT_PRESUME_BLOCK skips the [-b] check on the resulting
+# path so /dev/nvme9n1 (a fictional path) is accepted in unit tests.
+export PBT_PRESUME_BLOCK=1
+
+list_subsys_json='[
+  {"Subsystems":[
+    {"Name":"nvme-subsys0","NQN":"nqn.other:x","Paths":[{"Name":"nvme0"}]},
+    {"Name":"nvme-subsys1","NQN":"nqn.test:demo","Paths":[{"Name":"nvme9"}]}
+  ]}
+]'
+pbt_stub nvme 0 "$list_subsys_json"
 resolve_imported
 pbt_assert_eq "$IMPORTED" "/dev/nvme9n1" "IMPORTED resolved by NQN"
 
 # Zero matches → fail
-nvme_list_json='{"Devices":[{"DevicePath":"/dev/nvme0n1","SubsystemNQN":"nqn.other:x"}]}'
-pbt_stub nvme 0 "$nvme_list_json"
+list_subsys_json='[{"Subsystems":[{"NQN":"nqn.other:x","Paths":[{"Name":"nvme0"}]}]}]'
+pbt_stub nvme 0 "$list_subsys_json"
 if (resolve_imported) 2>/dev/null; then
     echo "FAIL: should error on zero matches" >&2; exit 1
 fi
 
 # Two matches → fail
-nvme_list_json='{"Devices":[
-  {"DevicePath":"/dev/nvme9n1","SubsystemNQN":"nqn.test:demo"},
-  {"DevicePath":"/dev/nvme8n1","SubsystemNQN":"nqn.test:demo"}]}'
-pbt_stub nvme 0 "$nvme_list_json"
+list_subsys_json='[{"Subsystems":[
+  {"NQN":"nqn.test:demo","Paths":[{"Name":"nvme9"}]},
+  {"NQN":"nqn.test:demo","Paths":[{"Name":"nvme8"}]}
+]}]'
+pbt_stub nvme 0 "$list_subsys_json"
 if (resolve_imported) 2>/dev/null; then
     echo "FAIL: should error on multiple matches" >&2; exit 1
 fi
