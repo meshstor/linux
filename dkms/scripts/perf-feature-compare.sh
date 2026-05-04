@@ -15,6 +15,8 @@ RUN_PERF="$REPO_ROOT/dkms/scripts/run-perf-bench-tcp.sh"
 REBUILT_TREE="${REBUILT_TREE:-$(dirname "$REPO_ROOT")/linux-meshstor-rebuilt}"
 MDADM_BIN="${MDADM_BIN:-/home/mykola/mdadm/mdadm}"
 MSADM_WRAPPER="/tmp/msadm"
+# Use HTTPS for meshstor remote so SSH agent state inside sudo doesn't matter.
+MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshstor/linux.git}"
 
 DATE_TAG="$(date -u +%F)"
 OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
@@ -239,13 +241,15 @@ run_variant() {
     # 1. rebuild-main
     log "rebuild-main $args -> $REBUILT_TREE"
     if [[ -n "${SUDO_USER:-}" ]]; then
-        if ! sudo -u "$SUDO_USER" "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
+        if ! sudo -u "$SUDO_USER" \
+                MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD" \
+                "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
             warn "rebuild-main failed for $label (see $rebuild_log)"
             echo "REBUILD_FAILED" > "$out_dir/status"
             return 0
         fi
     else
-        if ! "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
+        if ! MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD" "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
             warn "rebuild-main failed for $label (see $rebuild_log)"
             echo "REBUILD_FAILED" > "$out_dir/status"
             return 0

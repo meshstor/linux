@@ -10,7 +10,9 @@ set -euo pipefail
 
 UPSTREAM_URL="https://github.com/torvalds/linux.git"
 UPSTREAM_BRANCH="master"
-MESHSTOR_URL="git@github.com:meshstor/linux"
+# MESHSTOR_URL can be overridden via env for read-only/CI use
+# (e.g., MESHSTOR_URL=https://github.com/meshstor/linux.git when no SSH agent).
+MESHSTOR_URL="${MESHSTOR_URL:-git@github.com:meshstor/linux}"
 HARNESS_BRANCH="meshstor-harness"
 FILTER_PATHS=(drivers/md tools/testing/selftests/md)
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/meshstor"
