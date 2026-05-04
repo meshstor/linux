@@ -116,6 +116,39 @@ setup_nvmet() {
     NVMET_SETUP_DONE=1
 }
 
+# ---- nvme client ----
+IMPORTED=""
+NVME_CONNECTED=0
+
+connect_nvme_client() {
+    log "nvme connect: $ADDR:$PORT $NQN"
+    run_log udevadm settle
+    run_log nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN"
+    NVME_CONNECTED=1
+    run_log udevadm settle
+}
+
+resolve_imported() {
+    local json
+    json="$(nvme list -o json)" || die_setup "nvme list failed"
+    local matches
+    matches="$(printf '%s\n' "$json" | jq -r --arg nqn "$NQN" \
+        '[.Devices[]? | select(.SubsystemNQN == $nqn) | .DevicePath] | .[]')"
+    local count
+    count="$(printf '%s\n' "$matches" | grep -c . || true)"
+    if [[ "$count" -ne 1 ]]; then
+        die_setup "expected 1 nvme device matching NQN $NQN; got $count"
+    fi
+    IMPORTED="$matches"
+    log "imported device: $IMPORTED"
+}
+
+disconnect_nvme_client() {
+    [[ "$NVME_CONNECTED" -eq 1 ]] || return 0
+    nvme disconnect -n "$NQN" >/dev/null 2>&1 || true
+    udevadm settle >/dev/null 2>&1 || true
+}
+
 teardown_nvmet() {
     [[ "$NVMET_SETUP_DONE" -eq 1 ]] || return 0
     local sub="$NVMET_ROOT/subsystems/$NQN"
