@@ -183,6 +183,124 @@ msraid_teardown() {
     fi
 }
 
+# ---- manifest ----
+default_out_dir() {
+    local stamp host kver
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    host="$(hostname -s)"
+    kver="$(uname -r)"
+    printf '%s' "./results/${stamp}-${host}-${kver}"
+}
+
+resolve_out_dir() {
+    [[ -z "$OUT_DIR" ]] && OUT_DIR="$(default_out_dir)"
+    mkdir -p "$OUT_DIR"
+}
+
+# Best-effort property fetcher; returns "" on any failure.
+safe() { "$@" 2>/dev/null || true; }
+
+write_manifest() {
+    resolve_out_dir
+    local f="$OUT_DIR/manifest.json"
+    local started host kver
+    started="$(date -u +%FT%TZ)"
+    host="$(hostname -s)"
+    kver="$(uname -r)"
+
+    local ms_version ms_srcversion msadm_v nvme_v mdadm_v
+    ms_version="$(   safe modinfo ms-mod | awk -F': *' '/^version:/    {print $2; exit}')"
+    ms_srcversion="$(safe modinfo ms-mod | awk -F': *' '/^srcversion:/ {print $2; exit}')"
+    msadm_v="$(      safe "$MSADM" --version | head -1)"
+    nvme_v="$(       safe nvme --version    | head -1)"
+    mdadm_v="$(      safe mdadm --version 2>&1 | head -1)"
+
+    local pl_size pr_size pl_model pr_model pl_serial pr_serial
+    pl_size="$(  safe blockdev --getsize64 "$PART_LOCAL")"
+    pr_size="$(  safe blockdev --getsize64 "$PART_REMOTE")"
+    pl_model="$( safe lsblk -ndo MODEL  "$PART_LOCAL"  | tr -d '\n' | xargs)"
+    pr_model="$( safe lsblk -ndo MODEL  "$PART_REMOTE" | tr -d '\n' | xargs)"
+    pl_serial="$(safe lsblk -ndo SERIAL "$PART_LOCAL"  | tr -d '\n' | xargs)"
+    pr_serial="$(safe lsblk -ndo SERIAL "$PART_REMOTE" | tr -d '\n' | xargs)"
+
+    local cmdline ms_params
+    cmdline="$(safe cat /proc/cmdline | tr -d '\n')"
+    ms_params="$(
+        for p in /sys/module/ms_mod/parameters/*; do
+            [ -e "$p" ] || continue
+            printf '%s=%s\n' "$(basename "$p")" "$(safe cat "$p")"
+        done 2>/dev/null
+    )"
+
+    jq -n \
+        --arg started        "$started" \
+        --arg host           "$host" \
+        --arg kver           "$kver" \
+        --arg ms_version     "$ms_version" \
+        --arg ms_srcversion  "$ms_srcversion" \
+        --arg msadm_v        "$msadm_v" \
+        --arg nvme_v         "$nvme_v" \
+        --arg mdadm_v        "$mdadm_v" \
+        --arg part_local     "$PART_LOCAL" \
+        --arg part_remote    "$PART_REMOTE" \
+        --arg imported       "$IMPORTED" \
+        --arg nqn            "$NQN" \
+        --arg addr           "$ADDR" \
+        --arg port           "$PORT" \
+        --arg bitmap         "$BITMAP" \
+        --arg ms_dev         "$MS_DEV" \
+        --arg cmdline        "$cmdline" \
+        --arg ms_params      "$ms_params" \
+        --argjson pl_size    "${pl_size:-0}" \
+        --argjson pr_size    "${pr_size:-0}" \
+        --arg pl_model       "$pl_model" \
+        --arg pr_model       "$pr_model" \
+        --arg pl_serial      "$pl_serial" \
+        --arg pr_serial      "$pr_serial" \
+        --argjson suites     "$(printf '%s\n' "${SUITES[@]}" | jq -R . | jq -s .)" \
+        '{
+          schema: 1,
+          started_utc: $started,
+          host: $host,
+          uname_r: $kver,
+          ms_module: { version: $ms_version, srcversion: $ms_srcversion },
+          msadm_version: $msadm_v,
+          nvme_cli_version: $nvme_v,
+          mdadm_version: $mdadm_v,
+          part_local:  { path: $part_local,  size_bytes: $pl_size, model: $pl_model, serial: $pl_serial },
+          part_remote: { path: $part_remote, size_bytes: $pr_size, model: $pr_model, serial: $pr_serial },
+          imported_path: $imported,
+          nvmet: { nqn: $nqn, addr: $addr, port: ($port|tonumber? // $port) },
+          ms_array: { device: $ms_dev, bitmap: $bitmap, level: "raid1" },
+          kernel_cmdline: $cmdline,
+          ms_module_params: $ms_params,
+          suites: $suites
+        }' > "$f"
+
+    {
+        echo "started_utc: $started"
+        echo "host:        $host"
+        echo "kernel:      $kver"
+        echo "ms-mod:      $ms_version ($ms_srcversion)"
+        echo "msadm:       $msadm_v"
+        echo "nvme:        $nvme_v"
+        echo "mdadm:       $mdadm_v"
+        echo "PART_LOCAL:  $PART_LOCAL"
+        echo "PART_REMOTE: $PART_REMOTE  -> imported $IMPORTED"
+        echo "nvmet:       $NQN @ $ADDR:$PORT"
+        echo "ms array:    $MS_DEV bitmap=$BITMAP"
+        echo
+        echo "--- msadm --detail $MS_DEV ---"
+        safe "$MSADM" --detail "$MS_DEV"
+        echo
+        echo "--- lsblk ---"
+        safe lsblk
+        echo
+        echo "--- /proc/mdstat ---"
+        safe cat /proc/mdstat
+    } > "$OUT_DIR/start.txt"
+}
+
 teardown_nvmet() {
     [[ "$NVMET_SETUP_DONE" -eq 1 ]] || return 0
     local sub="$NVMET_ROOT/subsystems/$NQN"
@@ -292,7 +410,7 @@ parse_args() {
     # doesn't flag them while later commits add the actual consumers
     # (setup_nvmet, run_suite, cleanup, ...). The final commit will
     # remove this line once every global has a real reader.
-    : "$OUT_DIR $FAIL_FAST $KEEP $EXIT_SUITE"
+    : "$FAIL_FAST $KEEP $EXIT_SUITE"
 }
 
 usage() {
