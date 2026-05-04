@@ -147,18 +147,24 @@ connect_nvme_client() {
 }
 
 resolve_imported() {
-    local json
-    json="$(nvme list -o json)" || die_setup "nvme list failed"
-    local matches
-    matches="$(printf '%s\n' "$json" | jq -r --arg nqn "$NQN" \
-        '[.Devices[]? | select(.SubsystemNQN == $nqn) | .DevicePath] | .[]')"
+    # `nvme list -o json` does NOT include SubsystemNQN. The canonical
+    # NQN→controller mapping is `nvme list-subsys -o json`. We always
+    # create namespace 1 in setup_nvmet, so the block device is
+    # /dev/<ctl>n1.
+    local json ctl
+    json="$(nvme list-subsys -o json)" || die_setup "nvme list-subsys failed"
+    ctl="$(printf '%s\n' "$json" | jq -r --arg nqn "$NQN" \
+        '[.[]?.Subsystems[]? | select(.NQN == $nqn) | .Paths[0].Name] | .[]')"
     local count
-    count="$(printf '%s\n' "$matches" | grep -c . || true)"
+    count="$(printf '%s\n' "$ctl" | grep -c . || true)"
     if [[ "$count" -ne 1 ]]; then
-        die_setup "expected 1 nvme device matching NQN $NQN; got $count"
+        die_setup "expected 1 nvme controller for NQN $NQN; got $count"
     fi
-    IMPORTED="$matches"
-    log "imported device: $IMPORTED"
+    IMPORTED="/dev/${ctl}n1"
+    if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && [[ ! -b "$IMPORTED" ]]; then
+        die_setup "expected block device $IMPORTED but not found"
+    fi
+    log "imported device: $IMPORTED (ctl=$ctl)"
 }
 
 disconnect_nvme_client() {
@@ -184,11 +190,18 @@ msraid_assemble() {
 msraid_verify() {
     local detail state working failed
     detail="$("$MSADM" --detail "$MS_DEV")" || die_setup "msadm --detail failed"
-    state="$(printf '%s\n'   "$detail" | awk -F': *' '/State *:/{print $2; exit}')"
-    working="$(printf '%s\n' "$detail" | awk -F': *' '/Working Devices/{print $2; exit}')"
-    failed="$(printf '%s\n'  "$detail" | awk -F': *' '/Failed Devices/{print $2; exit}')"
-    if [[ "$state" != "active" ]] || [[ "$working" != "2" ]] || [[ "$failed" != "0" ]]; then
-        die_setup "msraid not healthy: state=$state working=$working failed=$failed"
+    state="$(  printf '%s\n' "$detail" | awk -F': *' '/State *:/{print $2; exit}'        | xargs)"
+    working="$(printf '%s\n' "$detail" | awk -F': *' '/Working Devices/{print $2; exit}' | xargs)"
+    failed="$( printf '%s\n' "$detail" | awk -F': *' '/Failed Devices/{print $2; exit}'  | xargs)"
+    # active and clean are both healthy. --assume-clean produces "clean".
+    # Reject states that imply trouble: degraded, FAILED, resyncing,
+    # recovering, etc.
+    case "$state" in
+        active|clean) ;;
+        *) die_setup "msraid not healthy: state='$state' working=$working failed=$failed" ;;
+    esac
+    if [[ "$working" != "2" ]] || [[ "$failed" != "0" ]]; then
+        die_setup "msraid not healthy: state='$state' working=$working failed=$failed"
     fi
 }
 
@@ -340,6 +353,21 @@ run_suite() {
     log "suite: $name (path=$suite)"
     drop_caches
 
+    # csi-perf-test suites hardcode /suite/ as the suite root (the
+    # container runner bind-mounts each suite there). Out of the
+    # container we provide it as a symlink. Refuse to clobber a
+    # non-symlink at /suite so we don't damage anything else. Unit
+    # tests set PBT_SKIP_SUITE_LINK=1 because they run as non-root.
+    local linked_suite=0
+    if [[ "${PBT_SKIP_SUITE_LINK:-0}" != "1" ]]; then
+        if [[ -L /suite ]] || [[ ! -e /suite ]]; then
+            ln -sfn "$suite" /suite
+            linked_suite=1
+        elif [[ ! "$(readlink -f /suite)" -ef "$(readlink -f "$suite")" ]]; then
+            die_setup "/suite already exists and points elsewhere; refusing to overwrite"
+        fi
+    fi
+
     local prepare_rc=0 run_rc=0 cleanup_rc=0
     started_epoch="$(date -u +%s)"
     started_iso="$(date -u +%FT%TZ)"
@@ -381,6 +409,10 @@ run_suite() {
           run_rc:     $r_rc,
           cleanup_rc: $c_rc
         }' >> "$OUT_DIR/suite-results.jsonl"
+
+    if [[ "$linked_suite" -eq 1 ]] && [[ -L /suite ]]; then
+        rm -f /suite
+    fi
 
     if [[ "$run_rc" -ne 0 ]]; then
         SUITE_FAILURES=$((SUITE_FAILURES + 1))
