@@ -240,16 +240,24 @@ run_variant() {
 
     # 1. rebuild-main
     log "rebuild-main $args -> $REBUILT_TREE"
+    # Disable git commit signing inside the rebuild-main subprocess: SSH_AUTH_SOCK
+    # is stripped by sudo, so any 'commit.gpgsign=true' ssh-signing config would
+    # fail at git am time with "Couldn't get agent socket?".
+    local rebuild_env=(
+        MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD"
+        GIT_CONFIG_COUNT=1
+        GIT_CONFIG_KEY_0=commit.gpgsign
+        GIT_CONFIG_VALUE_0=false
+    )
     if [[ -n "${SUDO_USER:-}" ]]; then
-        if ! sudo -u "$SUDO_USER" \
-                MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD" \
+        if ! sudo -u "$SUDO_USER" env "${rebuild_env[@]}" \
                 "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
             warn "rebuild-main failed for $label (see $rebuild_log)"
             echo "REBUILD_FAILED" > "$out_dir/status"
             return 0
         fi
     else
-        if ! MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD" "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
+        if ! env "${rebuild_env[@]}" "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
             warn "rebuild-main failed for $label (see $rebuild_log)"
             echo "REBUILD_FAILED" > "$out_dir/status"
             return 0
