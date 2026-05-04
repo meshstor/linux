@@ -1,7 +1,6 @@
 --- a/md.c
 +++ b/md.c
-@@ -324,6 +324,14 @@
- 		.mode		= 0644,
+@@ -1,5 +1,13 @@
  		.proc_handler	= proc_dointvec,
  	},
 +#ifndef HAVE_SYSCTL_REGISTER_TABLE_NO_SENTINEL
@@ -13,5 +12,5 @@
 +	{ }
 +#endif
  };
- 
+
  static int start_readonly;
