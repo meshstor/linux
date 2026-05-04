@@ -237,4 +237,33 @@ stage4_apply_features() {
 
 stage4_apply_features
 
-echo "rebuild-main: output=$OUTPUT_DIR features=(${FEATURES[*]:-none})"
+stage5_finalize() {
+    git branch -m "$UPSTREAM_BRANCH" meshstor-main-rebuilt
+    touch "$OUTPUT_DIR/.meshstor-rebuilt"
+    local final_sha
+    final_sha="$(git rev-parse HEAD)"
+    cat <<EOF
+
+==============================================================
+rebuild-main: success
+==============================================================
+Output:        $OUTPUT_DIR
+Branch:        meshstor-main-rebuilt
+Upstream:      $UPSTREAM_SHA
+Filtered:      $FILTERED_SHA
+Harness:       $HARNESS_SHA ($HARNESS_PATCH_COUNT patches from $HARNESS_BRANCH)
+EOF
+    if (( ${#APPLIED_FEATURES[@]} == 0 )); then
+        echo "Features:      (none)"
+    else
+        echo "Features (in applied order):"
+        for i in "${!APPLIED_FEATURES[@]}"; do
+            printf "  %-50s -> %-50s (%s patches)\n" \
+                "${APPLIED_FEATURES[$i]}" "${APPLIED_TAGS[$i]}" "${APPLIED_COUNTS[$i]}"
+        done
+    fi
+    echo "Final HEAD:    $final_sha"
+    echo "=============================================================="
+}
+
+stage5_finalize
