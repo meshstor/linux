@@ -71,13 +71,24 @@ PART_LOCAL=""
 PART_REMOTE=""
 SELECTED_VARIANTS=()
 SYSTEM_DKMS_VER=""
+SUMMARY_ONLY=0
 
-if (($# < 2)) || [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 2
 fi
-PART_LOCAL="$1"; shift
-PART_REMOTE="$1"; shift
+if [[ "${1:-}" == "--summary-only" ]]; then
+    SUMMARY_ONLY=1
+    shift
+fi
+if [[ $SUMMARY_ONLY -eq 0 && $# -lt 2 ]]; then
+    usage
+    exit 2
+fi
+if [[ $SUMMARY_ONLY -eq 0 ]]; then
+    PART_LOCAL="$1"; shift
+    PART_REMOTE="$1"; shift
+fi
 if (($# > 0)); then
     SELECTED_VARIANTS=("$@")
 else
@@ -177,20 +188,31 @@ load_ms_modules() {
     modprobe raid10_ms || return 1
 }
 
-# ----- summary parsers -----
+# ----- summary parsers (fio JSON output) -----
 
-extract_iops() {
-    grep -oE 'IOPS=[0-9.]+[kMG]?' "$1" 2>/dev/null | head -1 | sed 's/IOPS=//'
+# Returns total IOPS (read+write — only one is non-zero per suite).
+extract_iops_json() {
+    jq -r '[.jobs[0].read.iops, .jobs[0].write.iops] | add | floor' "$1" 2>/dev/null || echo "-"
 }
-extract_lat_p99_us() {
-    awk '/clat percentiles \(usec\)/,/^$/' "$1" 2>/dev/null \
-        | grep -oE '99\.00th=\[[ ]*[0-9]+\]' \
-        | head -1 \
-        | sed -E 's/.*=\[ *([0-9]+)\]/\1/'
+
+# Returns p99 clat in microseconds (read+write — only one is non-zero per suite).
+extract_lat_p99_us_json() {
+    local p99_ns
+    p99_ns="$(jq -r '[.jobs[0].read.clat_ns.percentile."99.000000" // 0,
+                     .jobs[0].write.clat_ns.percentile."99.000000" // 0] | add' \
+                "$1" 2>/dev/null)" || { echo "-"; return; }
+    if [[ -z "$p99_ns" || "$p99_ns" == "0" || "$p99_ns" == "null" ]]; then
+        echo "-"
+        return
+    fi
+    awk -v n="$p99_ns" 'BEGIN{printf "%.0f", n/1000}'
 }
 
 write_summary() {
     local f="$OUT_BASE/SUMMARY.md"
+    local tmp="$f.tmp.$$"
+    # Build into a temp file, then mv. If we crash midway, SUMMARY.md is left
+    # at its prior state and the trap won't pollute it via leaked redirects.
     {
         echo "# Per-Feature Perf Comparison — $DATE_TAG"
         echo ""
@@ -198,29 +220,30 @@ write_summary() {
         echo "RAID1 legs: $PART_LOCAL (local) + $PART_REMOTE (nvme-tcp loopback)"
         echo "Bench: dkms/scripts/run-perf-bench-tcp.sh --bitmap=lockless"
         echo ""
+        local suite_dir suite_name label out status run_log iops lat
         for suite_dir in "${SUITES[@]}"; do
-            local suite_name; suite_name="$(basename "$suite_dir")"
+            suite_name="$(basename "$suite_dir")"
             echo "## $suite_name"
             echo ""
             echo "| Variant | Status | IOPS | p99 lat (us) |"
             echo "|---|---|---|---|"
             for label in "${SELECTED_VARIANTS[@]}"; do
-                local out="$OUT_BASE/$label"
-                local status; status="$(cat "$out/status" 2>/dev/null || echo MISSING)"
-                local run_log iops lat
-                run_log="$(find "$out/results" -path "*/$suite_name/run.log" 2>/dev/null | head -1)"
-                if [[ -f "$run_log" ]]; then
-                    iops="$(extract_iops "$run_log")"
-                    lat="$(extract_lat_p99_us "$run_log")"
+                out="$OUT_BASE/$label"
+                status="$(cat "$out/status" 2>/dev/null || echo MISSING)"
+                run_log="$(find "$out/results" -path "*/$suite_name/run.log" 2>/dev/null | head -1 || true)"
+                if [[ -n "$run_log" && -f "$run_log" ]]; then
+                    iops="$(extract_iops_json "$run_log" 2>/dev/null || echo "-")"
+                    lat="$(extract_lat_p99_us_json "$run_log" 2>/dev/null || echo "-")"
                 else
                     iops="-"
                     lat="-"
                 fi
-                echo "| $label | $status | ${iops:-?} | ${lat:-?} |"
+                echo "| $label | $status | ${iops:--} | ${lat:--} |"
             done
             echo ""
         done
-    } > "$f"
+    } > "$tmp"
+    mv "$tmp" "$f"
     log "summary: $f"
 }
 
@@ -338,6 +361,13 @@ restore_system() {
 }
 
 # ----- main -----
+
+if [[ $SUMMARY_ONLY -eq 1 ]]; then
+    log "summary-only: regenerating $OUT_BASE/SUMMARY.md from existing results"
+    write_summary
+    log "all done"
+    exit 0
+fi
 
 require_root
 require_tools
