@@ -374,17 +374,50 @@ run_suite() {
     return "$run_rc"
 }
 
+# ---- cleanup + trap ----
+SCRIPT_RC=0  # set by on_exit from $? before cleanup runs
+
+cleanup() {
+    local keep_active=0
+    if [[ "$KEEP" -eq 1 ]] && [[ "$SCRIPT_RC" -eq 0 ]] && [[ "$SUITE_FAILURES" -eq 0 ]]; then
+        keep_active=1
+    fi
+
+    if [[ "$keep_active" -eq 1 ]]; then
+        log "cleanup: --keep set and run is clean; preserving topology"
+        return 0
+    fi
+
+    log "cleanup: tearing down"
+    msraid_teardown        || true
+    disconnect_nvme_client || true
+    teardown_nvmet         || true
+}
+
+on_exit() {
+    SCRIPT_RC=$?
+    cleanup >>"$OUT_DIR/cleanup.log" 2>&1 || true
+    exit "$SCRIPT_RC"
+}
+
 teardown_nvmet() {
     [[ "$NVMET_SETUP_DONE" -eq 1 ]] || return 0
     local sub="$NVMET_ROOT/subsystems/$NQN"
     local ns="$sub/namespaces/1"
     local port="$NVMET_ROOT/ports/$PORT_ID"
     rm -f "$port/subsystems/$NQN" 2>/dev/null || true
+    # On real configfs, ports/<id>/subsystems/ is auto-managed by the
+    # kernel and disappears with rmdir of the port. Our tmpdir mock
+    # leaves it around, so rm it explicitly.
+    rmdir "$port/subsystems" 2>/dev/null || true
     rmdir "$port" 2>/dev/null || true
     if [[ -d "$ns" ]]; then
-        echo 0 > "$ns/enable" 2>/dev/null || true
+        # configfs creates `enable` when the namespace is created; in
+        # the unit-test mock it doesn't exist, so guard the write.
+        [[ -e "$ns/enable" ]] && { echo 0 > "$ns/enable" 2>/dev/null || true; }
         rmdir "$ns" 2>/dev/null || true
     fi
+    rmdir "$sub/namespaces" 2>/dev/null || true
     rmdir "$sub" 2>/dev/null || true
 }
 
@@ -483,7 +516,7 @@ parse_args() {
     # doesn't flag them while later commits add the actual consumers
     # (setup_nvmet, run_suite, cleanup, ...). The final commit will
     # remove this line once every global has a real reader.
-    : "$FAIL_FAST $KEEP $EXIT_SUITE"
+    : "$FAIL_FAST $EXIT_SUITE"
 }
 
 usage() {
