@@ -28,6 +28,7 @@ pbt_assert_contains "$log_out" "STUB udevadm settle" "udevadm settle called"
 # path so /dev/nvme9n1 (a fictional path) is accepted in unit tests.
 export PBT_PRESUME_BLOCK=1
 
+REMOTES=(/dev/p1)
 list_subsys_json='[
   {"Subsystems":[
     {"Name":"nvme-subsys0","NQN":"nqn.other:x","Paths":[{"Name":"nvme0"}]},
@@ -36,7 +37,19 @@ list_subsys_json='[
 ]'
 pbt_stub nvme 0 "$list_subsys_json"
 resolve_imported
-pbt_assert_eq "$IMPORTED" "/dev/nvme9n1" "IMPORTED resolved by NQN"
+pbt_assert_eq "${IMPORTEDS[0]}" "/dev/nvme9n1" "IMPORTEDS[0] resolved by NQN"
+pbt_assert_eq "${#IMPORTEDS[@]}" "1" "1 import for raid1"
+
+# Multi-namespace (raid10): 2 remotes → 2 imports under same controller
+REMOTES=(/dev/p1 /dev/p2)
+pbt_stub nvme 0 "$list_subsys_json"
+resolve_imported
+pbt_assert_eq "${#IMPORTEDS[@]}" "2" "raid10 2 imports"
+pbt_assert_eq "${IMPORTEDS[0]}" "/dev/nvme9n1" "raid10 IMPORTEDS[0]"
+pbt_assert_eq "${IMPORTEDS[1]}" "/dev/nvme9n2" "raid10 IMPORTEDS[1]"
+
+# Reset
+REMOTES=(/dev/p1)
 
 # Zero matches → fail
 list_subsys_json='[{"Subsystems":[{"NQN":"nqn.other:x","Paths":[{"Name":"nvme0"}]}]}]'

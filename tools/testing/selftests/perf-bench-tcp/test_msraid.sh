@@ -11,8 +11,11 @@ pbt_run_test "msraid"
 . "$PBT_SCRIPT"
 
 MSADM="$PBT_STUB_DIR/msadm"
-PART_LOCAL=/dev/p0
-IMPORTED=/dev/p1
+LOCALS=(/dev/p0)
+REMOTES=(/dev/p1)
+IMPORTEDS=(/dev/p1-imp)
+LEVEL=raid1
+RAID_DEVICES=2
 BITMAP=lockless
 MS_DEV=/dev/ms0
 
@@ -21,8 +24,29 @@ pbt_stub msadm 0 ""
 msraid_assemble
 log_out="$(pbt_stub_log)"
 pbt_assert_contains "$log_out" \
-    "STUB msadm --create /dev/ms0 --level=raid1 --raid-devices=2 --bitmap=lockless --metadata=1.2 --run --assume-clean /dev/p0 /dev/p1" \
-    "msadm --create args"
+    "STUB msadm --create /dev/ms0 --level=raid1 --raid-devices=2 --bitmap=lockless --metadata=1.2 --run --assume-clean /dev/p0 /dev/p1-imp" \
+    "msadm --create args (raid1)"
+
+# raid10 with 4 devices interleaved
+LOCALS=(/dev/a /dev/b)
+REMOTES=(/dev/c /dev/d)
+IMPORTEDS=(/dev/c-imp /dev/d-imp)
+LEVEL=raid10
+RAID_DEVICES=4
+MSRAID_ASSEMBLED=0
+pbt_stub msadm 0 ""
+msraid_assemble
+log_out="$(pbt_stub_log)"
+pbt_assert_contains "$log_out" \
+    "STUB msadm --create /dev/ms0 --level=raid10 --raid-devices=4 --bitmap=lockless --metadata=1.2 --run --assume-clean /dev/a /dev/c-imp /dev/b /dev/d-imp" \
+    "msadm --create args (raid10 interleaved)"
+
+# Reset for verify tests
+LOCALS=(/dev/p0)
+REMOTES=(/dev/p1)
+IMPORTEDS=(/dev/p1-imp)
+LEVEL=raid1
+RAID_DEVICES=2
 
 # Verify happy: state=active, working=2
 detail_ok="State : active
@@ -51,7 +75,18 @@ pbt_stub msadm 0 ""
 msraid_teardown
 log_out2="$(pbt_stub_log)"
 pbt_assert_contains "$log_out2" "STUB msadm --stop /dev/ms0" "msadm --stop"
-pbt_assert_contains "$log_out2" "STUB msadm --zero-superblock /dev/p0" "zero local"
-pbt_assert_contains "$log_out2" "STUB msadm --zero-superblock /dev/p1" "zero imported"
+pbt_assert_contains "$log_out2" "STUB msadm --zero-superblock /dev/p0"     "zero local"
+pbt_assert_contains "$log_out2" "STUB msadm --zero-superblock /dev/p1-imp" "zero imported"
+
+# raid10 teardown zeroes all 4 members
+LOCALS=(/dev/a /dev/b)
+IMPORTEDS=(/dev/c-imp /dev/d-imp)
+MSRAID_ASSEMBLED=1
+pbt_stub msadm 0 ""
+msraid_teardown
+log_out3="$(pbt_stub_log)"
+for m in /dev/a /dev/b /dev/c-imp /dev/d-imp; do
+    pbt_assert_contains "$log_out3" "STUB msadm --zero-superblock $m" "raid10 zero $m"
+done
 
 echo "ok"

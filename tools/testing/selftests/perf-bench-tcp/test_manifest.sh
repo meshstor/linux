@@ -45,13 +45,16 @@ chmod +x "$PBT_STUB_DIR/msadm"
 
 OUT_DIR="$PBT_TMPDIR/results"
 mkdir -p "$OUT_DIR"
-PART_LOCAL=/tmp/p0
-PART_REMOTE=/tmp/p1
-IMPORTED=/tmp/p1-imported
+LOCALS=(/tmp/p0 /tmp/p1)
+REMOTES=(/tmp/p2 /tmp/p3)
+IMPORTEDS=(/tmp/p2-imp /tmp/p3-imp)
+MSRAID_MEMBERS=(/tmp/p0 /tmp/p2-imp /tmp/p1 /tmp/p3-imp)
 NQN=nqn.test:demo
 ADDR=127.0.0.1
 PORT=4420
 BITMAP=lockless
+LEVEL=raid10
+RAID_DEVICES=4
 MS_DEV=/dev/ms0
 MSADM="$PBT_STUB_DIR/msadm"
 SUITES=(/tmp/s1 /tmp/s2)
@@ -64,10 +67,15 @@ if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT_DIR/manifest.json"
 fi
 
-pbt_assert_file_contains "$OUT_DIR/manifest.json" '"schema": 1'                "schema=1"
+pbt_assert_file_contains "$OUT_DIR/manifest.json" '"schema": 2'                "schema=2"
 pbt_assert_file_contains "$OUT_DIR/manifest.json" '"bitmap": "lockless"'       "bitmap"
+pbt_assert_file_contains "$OUT_DIR/manifest.json" '"level": "raid10"'          "level=raid10"
+pbt_assert_file_contains "$OUT_DIR/manifest.json" '"raid_devices": 4'          "raid_devices=4"
 pbt_assert_file_contains "$OUT_DIR/manifest.json" '"nqn": "nqn.test:demo"'     "nqn"
-pbt_assert_file_contains "$OUT_DIR/manifest.json" '/tmp/p0'                    "PART_LOCAL"
+pbt_assert_file_contains "$OUT_DIR/manifest.json" '/tmp/p0'                    "LOCALS[0]"
+pbt_assert_file_contains "$OUT_DIR/manifest.json" '/tmp/p1'                    "LOCALS[1]"
+pbt_assert_file_contains "$OUT_DIR/manifest.json" '/tmp/p2'                    "REMOTES[0]"
+pbt_assert_file_contains "$OUT_DIR/manifest.json" '/tmp/p2-imp'                "IMPORTEDS[0]"
 pbt_assert_file_contains "$OUT_DIR/manifest.json" '/tmp/s1'                    "suite 1"
 pbt_assert_file_contains "$OUT_DIR/manifest.json" '/tmp/s2'                    "suite 2"
 

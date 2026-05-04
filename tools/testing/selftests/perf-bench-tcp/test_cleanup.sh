@@ -12,8 +12,8 @@ pbt_run_test "cleanup"
 
 OUT_DIR="$PBT_TMPDIR/results"; mkdir -p "$OUT_DIR"
 MSADM="$PBT_STUB_DIR/msadm"
-PART_LOCAL=/tmp/p0
-IMPORTED=/tmp/p1-imp
+LOCALS=(/tmp/p0)
+IMPORTEDS=(/tmp/p1-imp)
 NQN=nqn.test:demo
 NVMET_ROOT="$PBT_TMPDIR/configfs"
 PORT_ID=12345
