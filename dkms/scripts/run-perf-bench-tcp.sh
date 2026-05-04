@@ -36,8 +36,10 @@ EXIT_SETUP=4
 EXIT_SUITE=5
 
 # ---- globals populated by parse_args ----
-PART_LOCAL=""
-PART_REMOTE=""
+LOCALS=()
+REMOTES=()
+LEVEL="raid1"
+RAID_DEVICES=0
 SUITES=()
 BITMAP="$DEFAULT_BITMAP"
 PORT="$DEFAULT_PORT"
@@ -109,16 +111,21 @@ setup_nvmet() {
     generate_port_id
 
     local sub="$NVMET_ROOT/subsystems/$NQN"
-    local ns="$sub/namespaces/1"
     local port="$NVMET_ROOT/ports/$PORT_ID"
 
-    log "nvmet: subsystem $NQN, port $PORT_ID -> $ADDR:$PORT"
+    log "nvmet: subsystem $NQN, port $PORT_ID -> $ADDR:$PORT (${#REMOTES[@]} namespace(s))"
 
     run_log mkdir -p "$sub"
     echo 1 > "$sub/attr_allow_any_host"
-    run_log mkdir -p "$ns"
-    echo "$PART_REMOTE" > "$ns/device_path"
-    echo 1 > "$ns/enable"
+
+    local i nsid ns
+    for i in "${!REMOTES[@]}"; do
+        nsid=$(( i + 1 ))
+        ns="$sub/namespaces/$nsid"
+        run_log mkdir -p "$ns"
+        echo "${REMOTES[$i]}" > "$ns/device_path"
+        echo 1 > "$ns/enable"
+    done
 
     run_log mkdir -p "$port"
     echo "$ADDR"  > "$port/addr_traddr"
@@ -135,7 +142,7 @@ setup_nvmet() {
 }
 
 # ---- nvme client ----
-IMPORTED=""
+IMPORTEDS=()
 NVME_CONNECTED=0
 
 connect_nvme_client() {
@@ -148,9 +155,9 @@ connect_nvme_client() {
 
 resolve_imported() {
     # `nvme list -o json` does NOT include SubsystemNQN. The canonical
-    # NQN→controller mapping is `nvme list-subsys -o json`. We always
-    # create namespace 1 in setup_nvmet, so the block device is
-    # /dev/<ctl>n1.
+    # NQN→controller mapping is `nvme list-subsys -o json`. setup_nvmet
+    # creates namespaces 1..N (N = ${#REMOTES[@]}) under one subsystem,
+    # so each block device is /dev/<ctl>n<i> for i = 1..N.
     local json ctl
     json="$(nvme list-subsys -o json)" || die_setup "nvme list-subsys failed"
     ctl="$(printf '%s\n' "$json" | jq -r --arg nqn "$NQN" \
@@ -160,11 +167,18 @@ resolve_imported() {
     if [[ "$count" -ne 1 ]]; then
         die_setup "expected 1 nvme controller for NQN $NQN; got $count"
     fi
-    IMPORTED="/dev/${ctl}n1"
-    if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && [[ ! -b "$IMPORTED" ]]; then
-        die_setup "expected block device $IMPORTED but not found"
-    fi
-    log "imported device: $IMPORTED (ctl=$ctl)"
+
+    IMPORTEDS=()
+    local i nsid dev
+    for i in "${!REMOTES[@]}"; do
+        nsid=$(( i + 1 ))
+        dev="/dev/${ctl}n${nsid}"
+        if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && [[ ! -b "$dev" ]]; then
+            die_setup "expected block device $dev but not found"
+        fi
+        IMPORTEDS+=("$dev")
+    done
+    log "imported devices: ${IMPORTEDS[*]} (ctl=$ctl, ${#IMPORTEDS[@]} ns)"
 }
 
 disconnect_nvme_client() {
@@ -173,17 +187,30 @@ disconnect_nvme_client() {
     udevadm settle >/dev/null 2>&1 || true
 }
 
-# ---- ms raid1 ----
+# ---- ms raid (raid1 / raid10) ----
 MS_DEV="${MS_DEV:-/dev/ms0}"
 MSRAID_ASSEMBLED=0
+MSRAID_MEMBERS=()
+
+# Build the interleaved member list: LOCAL[0] IMPORTED[0] LOCAL[1] IMPORTED[1] ...
+# For raid10 near-2 layout this puts each mirror pair as one local +
+# one TCP-loopback leg. For raid1 (N=1) it's just LOCAL IMPORTED.
+msraid_member_list() {
+    MSRAID_MEMBERS=()
+    local i
+    for i in "${!LOCALS[@]}"; do
+        MSRAID_MEMBERS+=("${LOCALS[$i]}" "${IMPORTEDS[$i]}")
+    done
+}
 
 msraid_assemble() {
-    log "msraid: assemble $MS_DEV from $PART_LOCAL + $IMPORTED (bitmap=$BITMAP)"
+    msraid_member_list
+    log "msraid: assemble $MS_DEV level=$LEVEL devices=$RAID_DEVICES bitmap=$BITMAP members=${MSRAID_MEMBERS[*]}"
     run_log "$MSADM" --create "$MS_DEV" \
-        --level=raid1 --raid-devices=2 \
+        --level="$LEVEL" --raid-devices="$RAID_DEVICES" \
         --bitmap="$BITMAP" --metadata=1.2 \
         --run --assume-clean \
-        "$PART_LOCAL" "$IMPORTED"
+        "${MSRAID_MEMBERS[@]}"
     MSRAID_ASSEMBLED=1
 }
 
@@ -200,18 +227,19 @@ msraid_verify() {
         active|clean) ;;
         *) die_setup "msraid not healthy: state='$state' working=$working failed=$failed" ;;
     esac
-    if [[ "$working" != "2" ]] || [[ "$failed" != "0" ]]; then
-        die_setup "msraid not healthy: state='$state' working=$working failed=$failed"
+    if [[ "$working" != "$RAID_DEVICES" ]] || [[ "$failed" != "0" ]]; then
+        die_setup "msraid not healthy: state='$state' working=$working failed=$failed (expected working=$RAID_DEVICES)"
     fi
 }
 
 msraid_teardown() {
     [[ "$MSRAID_ASSEMBLED" -eq 1 ]] || return 0
     "$MSADM" --stop "$MS_DEV" >/dev/null 2>&1 || true
-    "$MSADM" --zero-superblock "$PART_LOCAL" >/dev/null 2>&1 || true
-    if [[ -n "$IMPORTED" ]]; then
-        "$MSADM" --zero-superblock "$IMPORTED" >/dev/null 2>&1 || true
-    fi
+    local m
+    for m in "${LOCALS[@]}" "${IMPORTEDS[@]}"; do
+        [[ -n "$m" ]] || continue
+        "$MSADM" --zero-superblock "$m" >/dev/null 2>&1 || true
+    done
 }
 
 # ---- manifest ----
@@ -246,13 +274,36 @@ write_manifest() {
     nvme_v="$(       safe nvme --version    | head -1)"
     mdadm_v="$(      safe mdadm --version 2>&1 | head -1)"
 
-    local pl_size pr_size pl_model pr_model pl_serial pr_serial
-    pl_size="$(  safe blockdev --getsize64 "$PART_LOCAL")"
-    pr_size="$(  safe blockdev --getsize64 "$PART_REMOTE")"
-    pl_model="$( safe lsblk -ndo MODEL  "$PART_LOCAL"  | tr -d '\n' | xargs)"
-    pr_model="$( safe lsblk -ndo MODEL  "$PART_REMOTE" | tr -d '\n' | xargs)"
-    pl_serial="$(safe lsblk -ndo SERIAL "$PART_LOCAL"  | tr -d '\n' | xargs)"
-    pr_serial="$(safe lsblk -ndo SERIAL "$PART_REMOTE" | tr -d '\n' | xargs)"
+    # Build per-leg JSON arrays for partitions and imported devices.
+    local part_obj_json p
+    part_obj_json='[]'
+    for p in "${LOCALS[@]}"; do
+        local sz mod ser
+        sz="$( safe blockdev --getsize64 "$p")"
+        mod="$(safe lsblk -ndo MODEL  "$p" | tr -d '\n' | xargs)"
+        ser="$(safe lsblk -ndo SERIAL "$p" | tr -d '\n' | xargs)"
+        part_obj_json="$(jq --arg path "$p" --argjson sz "${sz:-0}" \
+            --arg mod "$mod" --arg ser "$ser" \
+            '. += [{path: $path, size_bytes: $sz, model: $mod, serial: $ser}]' \
+            <<<"$part_obj_json")"
+    done
+    local locals_json="$part_obj_json"
+    part_obj_json='[]'
+    for p in "${REMOTES[@]}"; do
+        local sz mod ser
+        sz="$( safe blockdev --getsize64 "$p")"
+        mod="$(safe lsblk -ndo MODEL  "$p" | tr -d '\n' | xargs)"
+        ser="$(safe lsblk -ndo SERIAL "$p" | tr -d '\n' | xargs)"
+        part_obj_json="$(jq --arg path "$p" --argjson sz "${sz:-0}" \
+            --arg mod "$mod" --arg ser "$ser" \
+            '. += [{path: $path, size_bytes: $sz, model: $mod, serial: $ser}]' \
+            <<<"$part_obj_json")"
+    done
+    local remotes_json="$part_obj_json"
+    local imports_json
+    imports_json="$(printf '%s\n' "${IMPORTEDS[@]}" | jq -R . | jq -s .)"
+    local members_json
+    members_json="$(printf '%s\n' "${MSRAID_MEMBERS[@]}" | jq -R . | jq -s .)"
 
     local cmdline ms_params
     cmdline="$(safe cat /proc/cmdline | tr -d '\n')"
@@ -272,25 +323,22 @@ write_manifest() {
         --arg msadm_v        "$msadm_v" \
         --arg nvme_v         "$nvme_v" \
         --arg mdadm_v        "$mdadm_v" \
-        --arg part_local     "$PART_LOCAL" \
-        --arg part_remote    "$PART_REMOTE" \
-        --arg imported       "$IMPORTED" \
+        --argjson locals     "$locals_json" \
+        --argjson remotes    "$remotes_json" \
+        --argjson imports    "$imports_json" \
+        --argjson members    "$members_json" \
         --arg nqn            "$NQN" \
         --arg addr           "$ADDR" \
         --arg port           "$PORT" \
         --arg bitmap         "$BITMAP" \
         --arg ms_dev         "$MS_DEV" \
+        --arg level          "$LEVEL" \
+        --argjson raid_devs  "$RAID_DEVICES" \
         --arg cmdline        "$cmdline" \
         --arg ms_params      "$ms_params" \
-        --argjson pl_size    "${pl_size:-0}" \
-        --argjson pr_size    "${pr_size:-0}" \
-        --arg pl_model       "$pl_model" \
-        --arg pr_model       "$pr_model" \
-        --arg pl_serial      "$pl_serial" \
-        --arg pr_serial      "$pr_serial" \
         --argjson suites     "$(printf '%s\n' "${SUITES[@]}" | jq -R . | jq -s .)" \
         '{
-          schema: 1,
+          schema: 2,
           started_utc: $started,
           host: $host,
           uname_r: $kver,
@@ -298,11 +346,12 @@ write_manifest() {
           msadm_version: $msadm_v,
           nvme_cli_version: $nvme_v,
           mdadm_version: $mdadm_v,
-          part_local:  { path: $part_local,  size_bytes: $pl_size, model: $pl_model, serial: $pl_serial },
-          part_remote: { path: $part_remote, size_bytes: $pr_size, model: $pr_model, serial: $pr_serial },
-          imported_path: $imported,
+          local_partitions:  $locals,
+          remote_partitions: $remotes,
+          imported_paths:    $imports,
+          member_order:      $members,
           nvmet: { nqn: $nqn, addr: $addr, port: ($port|tonumber? // $port) },
-          ms_array: { device: $ms_dev, bitmap: $bitmap, level: "raid1" },
+          ms_array: { device: $ms_dev, bitmap: $bitmap, level: $level, raid_devices: $raid_devs },
           kernel_cmdline: $cmdline,
           ms_module_params: $ms_params,
           suites: $suites
@@ -316,10 +365,14 @@ write_manifest() {
         echo "msadm:       $msadm_v"
         echo "nvme:        $nvme_v"
         echo "mdadm:       $mdadm_v"
-        echo "PART_LOCAL:  $PART_LOCAL"
-        echo "PART_REMOTE: $PART_REMOTE  -> imported $IMPORTED"
+        local i
+        for i in "${!LOCALS[@]}"; do
+            printf 'leg %d:       LOCAL=%s  REMOTE=%s -> imported %s\n' \
+                "$i" "${LOCALS[$i]}" "${REMOTES[$i]}" "${IMPORTEDS[$i]}"
+        done
         echo "nvmet:       $NQN @ $ADDR:$PORT"
-        echo "ms array:    $MS_DEV bitmap=$BITMAP"
+        echo "ms array:    $MS_DEV level=$LEVEL devices=$RAID_DEVICES bitmap=$BITMAP"
+        echo "members:     ${MSRAID_MEMBERS[*]}"
         echo
         echo "--- msadm --detail $MS_DEV ---"
         safe "$MSADM" --detail "$MS_DEV"
@@ -453,7 +506,6 @@ on_exit() {
 teardown_nvmet() {
     [[ "$NVMET_SETUP_DONE" -eq 1 ]] || return 0
     local sub="$NVMET_ROOT/subsystems/$NQN"
-    local ns="$sub/namespaces/1"
     local port="$NVMET_ROOT/ports/$PORT_ID"
     rm -f "$port/subsystems/$NQN" 2>/dev/null || true
     # On real configfs, ports/<id>/subsystems/ is auto-managed by the
@@ -461,12 +513,14 @@ teardown_nvmet() {
     # leaves it around, so rm it explicitly.
     rmdir "$port/subsystems" 2>/dev/null || true
     rmdir "$port" 2>/dev/null || true
-    if [[ -d "$ns" ]]; then
+    local ns
+    for ns in "$sub"/namespaces/*; do
+        [[ -d "$ns" ]] || continue
         # configfs creates `enable` when the namespace is created; in
         # the unit-test mock it doesn't exist, so guard the write.
         [[ -e "$ns/enable" ]] && { echo 0 > "$ns/enable" 2>/dev/null || true; }
         rmdir "$ns" 2>/dev/null || true
-    fi
+    done
     rmdir "$sub/namespaces" 2>/dev/null || true
     rmdir "$sub" 2>/dev/null || true
 }
@@ -493,7 +547,7 @@ preflight() {
     done
 
     local p
-    for p in "$PART_LOCAL" "$PART_REMOTE"; do
+    for p in "${LOCALS[@]}" "${REMOTES[@]}"; do
         if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && [[ ! -b "$p" ]]; then
             die_pre "not a block device: $p"
         fi
@@ -522,8 +576,10 @@ preflight() {
 
 parse_args() {
     # Reset state so callers (and tests) can invoke parse_args repeatedly.
-    PART_LOCAL=""
-    PART_REMOTE=""
+    LOCALS=()
+    REMOTES=()
+    LEVEL="raid1"
+    RAID_DEVICES=0
     SUITES=()
     BITMAP="$DEFAULT_BITMAP"
     PORT="$DEFAULT_PORT"
@@ -536,6 +592,9 @@ parse_args() {
     local pos=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --level=*)    LEVEL="${1#--level=}" ;;
+            --local=*)    LOCALS+=("${1#--local=}") ;;
+            --remote=*)   REMOTES+=("${1#--remote=}") ;;
             --bitmap=*)   BITMAP="${1#--bitmap=}" ;;
             --port=*)     PORT="${1#--port=}" ;;
             --addr=*)     ADDR="${1#--addr=}" ;;
@@ -551,35 +610,85 @@ parse_args() {
         shift
     done
 
-    if [[ ${#pos[@]} -lt 3 ]]; then
-        die "need PART_LOCAL PART_REMOTE SUITE [SUITE...]; got ${#pos[@]} positional args"
+    if [[ ${#LOCALS[@]} -gt 0 ]] || [[ ${#REMOTES[@]} -gt 0 ]]; then
+        # Flag-driven form: positionals are SUITES only.
+        if [[ ${#pos[@]} -lt 1 ]]; then
+            die "need at least one SUITE; got ${#pos[@]} positional args"
+        fi
+        SUITES=("${pos[@]}")
+    else
+        # Backward-compat positional form: 2 partitions + suites.
+        if [[ ${#pos[@]} -lt 3 ]]; then
+            die "need PART_LOCAL PART_REMOTE SUITE [SUITE...]; got ${#pos[@]} positional args"
+        fi
+        LOCALS=("${pos[0]}")
+        REMOTES=("${pos[1]}")
+        SUITES=("${pos[@]:2}")
     fi
-    PART_LOCAL="${pos[0]}"
-    PART_REMOTE="${pos[1]}"
-    SUITES=("${pos[@]:2}")
 
-    if [[ "$PART_LOCAL" == "$PART_REMOTE" ]]; then
-        die "PART_LOCAL and PART_REMOTE must differ"
+    if [[ ${#LOCALS[@]} -ne ${#REMOTES[@]} ]]; then
+        die "--local count (${#LOCALS[@]}) must equal --remote count (${#REMOTES[@]})"
     fi
+    RAID_DEVICES=$(( ${#LOCALS[@]} + ${#REMOTES[@]} ))
+
+    case "$LEVEL" in
+        raid1)
+            [[ "$RAID_DEVICES" -eq 2 ]] || die "raid1 needs exactly 2 devices; got $RAID_DEVICES"
+            ;;
+        raid10)
+            [[ "$RAID_DEVICES" -ge 4 ]] || die "raid10 needs at least 4 devices; got $RAID_DEVICES"
+            (( RAID_DEVICES % 2 == 0 )) || die "raid10 needs even device count; got $RAID_DEVICES"
+            ;;
+        *)  die "unsupported --level: $LEVEL (raid1, raid10)" ;;
+    esac
+
+    # Reject duplicates anywhere in the merged member list.
+    local p seen=()
+    for p in "${LOCALS[@]}" "${REMOTES[@]}"; do
+        local s
+        for s in "${seen[@]}"; do
+            [[ "$p" == "$s" ]] && die "partition listed twice: $p"
+        done
+        seen+=("$p")
+    done
 }
 
 usage() {
     cat <<'EOF'
-Usage: run-perf-bench-tcp.sh [flags] PART_LOCAL PART_REMOTE SUITE [SUITE...]
+Usage:
+  run-perf-bench-tcp.sh [flags] PART_LOCAL PART_REMOTE SUITE [SUITE...]
+  run-perf-bench-tcp.sh --level=raid10 --local=A --local=B \
+                        --remote=C --remote=D SUITE [SUITE...]
 
-Builds an ms raid1 with PART_LOCAL as leg 0 and PART_REMOTE (exported via
-nvmet-tcp on this host and re-imported) as leg 1, then runs each SUITE
-(prepare.sh, run.sh, cleanup.sh) against /dev/ms0 in block mode.
+Builds an ms raid array (raid1 by default; raid10 with --level=raid10)
+where each --local partition stays on this host and each --remote
+partition is exported via nvmet-tcp loopback and re-imported. Members
+are interleaved local/remote so each raid10 mirror pair has one of
+each. Then runs each SUITE (prepare.sh, run.sh, cleanup.sh) against
+/dev/ms0 in block mode.
+
+Backward-compat positional form (no --local / --remote): two
+positional args become a single (local, remote) pair for raid1.
 
 Flags:
-  --bitmap=VAL        passed verbatim to msadm --bitmap (default: lockless)
-  --out-dir=PATH      results root (default: ./results/<UTC>-<host>-<kver>)
-  --port=N            nvmet tcp port (default: 4420)
-  --addr=IP           nvmet tcp listen addr (default: 127.0.0.1)
-  --msadm=PATH        msadm binary (default: /tmp/msadm if exists, else PATH)
-  --fail-fast         stop after first failing suite (default: continue)
-  --keep              skip teardown on success (debugging only)
-  -h, --help          this message
+  --level=raid1|raid10  raid level (default: raid1)
+  --local=PATH          local-leg partition (repeatable; for raid10 use
+                        2 or more)
+  --remote=PATH         tcp-leg partition (repeatable; same count as
+                        --local)
+  --bitmap=VAL          passed verbatim to msadm --bitmap (default: lockless)
+  --out-dir=PATH        results root (default: ./results/<UTC>-<host>-<kver>)
+  --port=N              nvmet tcp port (default: 4420)
+  --addr=IP             nvmet tcp listen addr (default: 127.0.0.1)
+  --msadm=PATH          msadm binary (default: /tmp/msadm if exists, else PATH)
+  --fail-fast           stop after first failing suite (default: continue)
+  --keep                skip teardown on success (debugging only)
+  -h, --help            this message
+
+Constraints:
+  - --local and --remote counts must match.
+  - raid1 needs exactly 1 local + 1 remote.
+  - raid10 needs at least 2 local + 2 remote (4 devices total).
 
 Exit codes:
   0   all suites passed
