@@ -146,9 +146,19 @@ IMPORTEDS=()
 NVME_CONNECTED=0
 
 connect_nvme_client() {
-    log "nvme connect: $ADDR:$PORT $NQN"
+    # Use a per-bench-invocation unique hostnqn + hostid so this loopback
+    # connect doesn't collide with any existing nvme-fabrics state on the
+    # host (e.g., production cluster connections that have already
+    # established their own hostnqn under the kernel's default hostid).
+    # Without this, nvme connect fails with "found same hostid but different
+    # hostnqn" and the bench cannot proceed.
+    local bench_hostnqn="nqn.2026-05.local:msbench-host-$$-$RANDOM"
+    local bench_hostid
+    bench_hostid="$(cat /proc/sys/kernel/random/uuid)"
+    log "nvme connect: $ADDR:$PORT $NQN (hostnqn=$bench_hostnqn)"
     run_log udevadm settle
-    run_log nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN"
+    run_log nvme connect -t tcp -a "$ADDR" -s "$PORT" -n "$NQN" \
+        --hostnqn="$bench_hostnqn" --hostid="$bench_hostid"
     NVME_CONNECTED=1
     run_log udevadm settle
 }
