@@ -33,23 +33,29 @@ test -f /lib/modules/$(uname -r)/build/include/uapi/linux/raid/md_p.h \
     && echo OK || echo MISSING_KERNEL_DEVEL
 ```
 
-### 1.3 Get the meshstor repo + the mdadm-fork binary + csi-perf-test suites
+### 1.3 Get the three meshstor repos
 
 ```bash
-# meshstor repo — clone (or rsync from another host)
-[ -d ~/sync/linux-meshstor ] || git clone git@github.com:meshstor/linux ~/sync/linux-meshstor
+# meshstor kernel fork (this repo)
+[ -d ~/linux-meshstor ] || git clone git@github.com:meshstor/linux ~/linux-meshstor
 ```
 
 ```bash
-# mdadm-fork (with --subsys=ms support) — easiest to rsync the prebuilt
-# binary from a host that has it; otherwise build from source.
-mkdir -p ~/mdadm
-[ -x ~/mdadm/mdadm ] || rsync -a mykola@<host>:/home/mykola/mdadm/mdadm ~/mdadm/
+# csi-perf-test (the SNIA + workload suites the bench runs)
+[ -d ~/csi-perf-test ] || git clone git@github.com:meshstor/csi-perf-test.git ~/csi-perf-test
 ```
 
 ```bash
-# csi-perf-test suites
-[ -d ~/csi-perf-test/suites ] || rsync -a mykola@<host>:/home/mykola/csi-perf-test/ ~/csi-perf-test/
+# mdadm fork (the --subsys=ms aware mdadm; perf-feature-compare wraps
+# it as /tmp/msadm at run-time)
+[ -d ~/mdadm ] || git clone git@github.com:meshstor/mdadm ~/mdadm
+```
+
+```bash
+# Build mdadm (one-time per host). Needs make + a C toolchain.
+sudo dnf install -y make gcc
+( cd ~/mdadm && make -j$(nproc) mdadm )
+test -x ~/mdadm/mdadm && echo OK || echo "BUILD FAILED"
 ```
 
 ### 1.4 Confirm SSD thermal thresholds (only first time, or after hw change)
@@ -104,38 +110,28 @@ Pick the topology block matching your hardware.
 
 ```bash
 # Backward-compat positional form. Replace pX with your free partitions.
-sudo COOL_THRESH_K=348 ~/sync/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     /dev/nvme0n1p4 /dev/nvme0n1p5 \
     | tee /tmp/perf-run.log
 ```
 
-### 3.B — raid10 same-disk (4 partitions, one disk)
+### 3.B — raid10 cross-disk (4 partitions, two disks; each disk has 1 local + 1 tcp)
 
 ```bash
-sudo COOL_THRESH_K=348 ~/sync/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
-    --level=raid10 \
-    --local=/dev/nvme0n1p4 --local=/dev/nvme0n1p6 \
-    --remote=/dev/nvme0n1p5 --remote=/dev/nvme0n1p7 \
-    | tee /tmp/perf-run.log
-```
-
-### 3.C — raid10 cross-disk (4 partitions, two disks; each disk has 1 local + 1 tcp)
-
-```bash
-sudo COOL_THRESH_K=348 ~/sync/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
     | tee /tmp/perf-run.log
 ```
 
-### 3.D — Run only a subset of variants
+### 3.C — Run only a subset of variants
 
 Append the variant names (any of `baseline per-bucket-arrays takeover
 latency-ewma llbitmap-fastpath`) at the end of any of the above:
 
 ```bash
-sudo COOL_THRESH_K=348 ~/sync/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
@@ -181,8 +177,8 @@ watch -n 10 'sudo nvme smart-log /dev/nvme0n1 -o json | jq -r "[.temperature, .t
 ```bash
 # OUT_BASE is the directory perf-feature-compare wrote to. With the
 # default DATE_TAG it's notes/perf-rebuild-<UTC date>/.
-OUT_BASE="$HOME/sync/linux-meshstor/notes/perf-rebuild-$(date -u +%F)"
-~/sync/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE"
+OUT_BASE="$HOME/linux-meshstor/notes/perf-rebuild-$(date -u +%F)"
+~/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE"
 ```
 
 The helper auto-discovers variants and suites and emits a markdown table
@@ -194,7 +190,7 @@ where the bench's `drop_caches` plumbing emits warnings into `run.log`).
 To redirect to a file:
 
 ```bash
-~/sync/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE" \
+~/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE" \
     > "$OUT_BASE/TABLE.md"
 ```
 
@@ -241,8 +237,8 @@ some future upstream:
 
 ```bash
 # See what the patch expects vs what's in the rebuilt tree
-diff -u ~/sync/linux-meshstor/dkms/patches/0004-*.patch <(echo)
-sed -n '316,340p' ~/sync/linux-meshstor-rebuilt/drivers/md/md.c
+diff -u ~/linux-meshstor/dkms/patches/0004-*.patch <(echo)
+sed -n '316,340p' ~/linux-meshstor-rebuilt/drivers/md/md.c
 ```
 
 ### `nvme connect: invalid arguments/configuration`
@@ -252,7 +248,7 @@ script generates a unique hostnqn + hostid per run since 2026-05-05;
 verify with:
 
 ```bash
-grep hostnqn ~/sync/linux-meshstor/dkms/scripts/run-perf-bench-tcp.sh
+grep hostnqn ~/linux-meshstor/dkms/scripts/run-perf-bench-tcp.sh
 # Should show "msbench-host-..." string
 ```
 
@@ -271,7 +267,7 @@ A prior rebuild-main died mid-cycle and didn't write its sentinel.
 Clean it manually:
 
 ```bash
-sudo rm -rf ~/sync/linux-meshstor-rebuilt
+sudo rm -rf ~/linux-meshstor-rebuilt
 ```
 
 ### Suite output shows `iops=- p99_us=-` in SUMMARY.md but raw run.log has data
@@ -301,19 +297,21 @@ sudo /tmp/msadm --stop /dev/ms0
 
 ```bash
 # One-time setup (Phase 1):
-sudo dnf install -y fio fio-engine-libaio libaio dkms git-filter-repo "kernel-devel-$(uname -r)"
-[ -d ~/sync/linux-meshstor ] || git clone git@github.com:meshstor/linux ~/sync/linux-meshstor
-[ -x ~/mdadm/mdadm ] || rsync -a mykola@<source-host>:/home/mykola/mdadm/mdadm ~/mdadm/
-[ -d ~/csi-perf-test/suites ] || rsync -a mykola@<source-host>:/home/mykola/csi-perf-test/ ~/csi-perf-test/
+sudo dnf install -y fio fio-engine-libaio libaio dkms git-filter-repo \
+    "kernel-devel-$(uname -r)" make gcc
+[ -d ~/linux-meshstor ] || git clone git@github.com:meshstor/linux ~/linux-meshstor
+[ -d ~/csi-perf-test ]  || git clone git@github.com:meshstor/csi-perf-test.git ~/csi-perf-test
+[ -d ~/mdadm ]          || git clone git@github.com:meshstor/mdadm ~/mdadm
+[ -x ~/mdadm/mdadm ]    || ( cd ~/mdadm && make -j$(nproc) mdadm )
 
 # Per-run (Phase 3, raid10 cross-disk example):
-sudo COOL_THRESH_K=348 ~/sync/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
     | tee /tmp/perf-run.log
 
 # Results table (Phase 5):
-OUT_BASE="$HOME/sync/linux-meshstor/notes/perf-rebuild-$(date -u +%F)"
-~/sync/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE"
+OUT_BASE="$HOME/linux-meshstor/notes/perf-rebuild-$(date -u +%F)"
+~/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE"
 ```
