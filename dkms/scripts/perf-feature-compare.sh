@@ -8,12 +8,14 @@
 # Usage: sudo dkms/scripts/perf-feature-compare.sh PART_LOCAL PART_REMOTE [VARIANT ...]
 set -euo pipefail
 
+die() { echo "$*" 1>&2; exit 1; }
+
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 REBUILD_MAIN="$REPO_ROOT/dkms/scripts/rebuild-main"
 BUILD_TARBALL="$REPO_ROOT/dkms/scripts/build-tarball.sh"
 RUN_PERF="$REPO_ROOT/dkms/scripts/run-perf-bench-tcp.sh"
 REBUILT_TREE="${REBUILT_TREE:-$(dirname "$REPO_ROOT")/linux-meshstor-rebuilt}"
-MDADM_BIN="${MDADM_BIN:-/home/mykola/mdadm/mdadm}"
+MDADM_BIN="${MDADM_BIN:-/home/$SUDO_USER/mdadm/mdadm}"
 MSADM_WRAPPER="/tmp/msadm"
 # Use HTTPS for meshstor remote so SSH agent state inside sudo doesn't matter.
 MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshstor/linux.git}"
@@ -21,7 +23,7 @@ MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshsto
 DATE_TAG="$(date -u +%F)"
 OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
 
-SUITES_BASE="${SUITES_BASE:-/home/mykola/csi-perf-test/suites}"
+SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
 # Default suite set. ewma-asymmetric-read is the right test for the
 # latency-ewma branch — qd=8 single-thread random read so the read-balance
 # choice between legs determines per-IO latency. The four SNIA suites at
@@ -87,8 +89,8 @@ Flags:
 
 Environment overrides:
   REBUILT_TREE   Path for rebuild-main output (default: ../linux-meshstor-rebuilt)
-  MDADM_BIN      Path to mdadm-fork binary (default: /home/mykola/mdadm/mdadm)
-  SUITES_BASE    csi-perf-test suites directory (default: /home/mykola/csi-perf-test/suites)
+  MDADM_BIN      Path to mdadm-fork binary (default: /home/$SUDO_USER/mdadm/mdadm)
+  SUITES_BASE    csi-perf-test suites directory (default: /home/$SUDO_USER/csi-perf-test/suites)
   SUITES         space-separated suite names override (default: 4 SNIA suites)
 
 Output: $OUT_BASE/<variant>/results/...
