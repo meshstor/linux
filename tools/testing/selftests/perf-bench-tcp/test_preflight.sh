@@ -22,8 +22,8 @@ export PBT_PRESUME_BLOCK=1
 export PBT_SKIP_ROOT_CHECK=1
 
 # Set required globals as parse_args would
-PART_LOCAL=/tmp/p0
-PART_REMOTE=/tmp/p1
+LOCALS=(/tmp/p0)
+REMOTES=(/tmp/p1)
 SUITES=("$PBT_TMPDIR/suiteA")
 mkdir -p "${SUITES[0]}"
 for f in prepare.sh run.sh cleanup.sh; do
