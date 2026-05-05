@@ -78,6 +78,10 @@ Flags:
   --local=PATH          local-leg partition (repeatable)
   --remote=PATH         tcp-leg partition (repeatable; same count as --local)
   --port=N              nvmet-tcp listen port (default: bench script's 4420)
+  --cool-thresh-k=N     wait between variants until max sensor temp on every
+                        leg's parent NVMe drops below N Kelvin (default:
+                        348 = 75 °C; 0 disables). Devices to monitor are
+                        derived from --local + --remote (their parent disks).
   --summary-only        regenerate SUMMARY.md from existing run.log files
                         and exit (no rebuild/bench)
 
@@ -113,6 +117,7 @@ while (($#)); do
         --local=*)      LOCALS+=("${1#--local=}"); shift ;;
         --remote=*)     REMOTES+=("${1#--remote=}"); shift ;;
         --port=*)       PORT="${1#--port=}"; shift ;;
+        --cool-thresh-k=*) COOL_THRESH_K="${1#--cool-thresh-k=}"; shift ;;
         --) shift; _pos+=("$@"); break ;;
         -*) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
         *)  _pos+=("$1"); shift ;;
@@ -201,31 +206,62 @@ EOF
     log "msadm wrapper: $MSADM_WRAPPER -> $MDADM_BIN --subsys=ms"
 }
 
-# Wait for the SSD to cool back below COOL_THRESH_K (default 75 °C). Polls the
-# composite + all four temperature sensors and uses the max — different SSDs
-# label the controller chip differently, and the controller often runs hotter
-# than the composite without that being visible in id-ctrl thresholds.
-# Set COOL_THRESH_K=0 (or unset COOL_DEV) to disable.
-COOL_DEV="${COOL_DEV:-/dev/nvme0n1}"
+# Wait until every parent NVMe of a leg partition cools below COOL_THRESH_K
+# (default 75 °C). Monitors the composite + all sensors on each device, takes
+# the max — different SSDs label the controller chip differently, and the
+# controller often runs hotter than the composite without that being visible
+# in id-ctrl thresholds. Set COOL_THRESH_K=0 to disable.
 COOL_THRESH_K="${COOL_THRESH_K:-348}"
+
+# Derive the unique set of parent NVMe devices from LOCALS + REMOTES
+# (e.g., /dev/nvme0n1p4 + /dev/nvme1n1p2 -> /dev/nvme0n1 /dev/nvme1n1).
+cool_devs() {
+    local p parent dev
+    declare -A seen
+    for p in "${LOCALS[@]}" "${REMOTES[@]}"; do
+        parent="$(lsblk -no PKNAME "$p" 2>/dev/null | head -1)"
+        [[ -n "$parent" ]] || continue
+        dev="/dev/$parent"
+        if [[ -z "${seen[$dev]:-}" ]]; then
+            seen[$dev]=1
+            echo "$dev"
+        fi
+    done
+}
+
+# Read max(composite, sensor_1..4) from one device, in Kelvin. Empty on miss.
+nvme_max_temp_k() {
+    nvme smart-log "$1" -o json 2>/dev/null \
+        | jq -r '[.temperature, .temperature_sensor_1, .temperature_sensor_2,
+                  (.temperature_sensor_3 // 0), (.temperature_sensor_4 // 0)] | max' \
+          2>/dev/null
+}
+
 wait_cool() {
     [[ "$COOL_THRESH_K" -gt 0 ]] || return 0
-    [[ -e "$COOL_DEV" ]] || { warn "wait_cool: $COOL_DEV missing, skipping"; return 0; }
-    local cur waits=0
+    local devs
+    mapfile -t devs < <(cool_devs)
+    if (( ${#devs[@]} == 0 )); then
+        warn "wait_cool: no parent NVMe devices derivable from legs; skipping"
+        return 0
+    fi
+    local cur waits=0 d hot
     while :; do
-        cur=$(nvme smart-log "$COOL_DEV" -o json 2>/dev/null \
-              | jq -r '[.temperature, .temperature_sensor_1, .temperature_sensor_2,
-                        (.temperature_sensor_3 // 0), (.temperature_sensor_4 // 0)] | max' \
-              2>/dev/null)
-        if [[ -z "$cur" || "$cur" == "null" ]]; then
-            warn "wait_cool: could not read temp; skipping"
+        hot=0
+        for d in "${devs[@]}"; do
+            cur="$(nvme_max_temp_k "$d")"
+            [[ -z "$cur" || "$cur" == "null" ]] && continue
+            (( cur > hot )) && hot=$cur
+        done
+        if (( hot == 0 )); then
+            warn "wait_cool: could not read any temp; skipping"
             return 0
         fi
-        if (( cur <= COOL_THRESH_K )); then
-            (( waits > 0 )) && log "wait_cool: cooled to ${cur} K (target ${COOL_THRESH_K})"
+        if (( hot <= COOL_THRESH_K )); then
+            (( waits > 0 )) && log "wait_cool: cooled to ${hot} K (target ${COOL_THRESH_K})"
             return 0
         fi
-        log "wait_cool: max sensor = ${cur} K (target ${COOL_THRESH_K}); sleep 60"
+        log "wait_cool: max across ${devs[*]} = ${hot} K (target ${COOL_THRESH_K}); sleep 60"
         sleep 60
         waits=$((waits + 1))
     done

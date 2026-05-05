@@ -111,7 +111,7 @@ Pick the topology block matching your hardware.
 
 ```bash
 # Backward-compat positional form. Replace pX with your free partitions.
-sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     /dev/nvme0n1p4 /dev/nvme0n1p5 \
     | tee /tmp/perf-run.log
 ```
@@ -119,7 +119,7 @@ sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
 ### 3.B — raid10 cross-disk (4 partitions, two disks; each disk has 1 local + 1 tcp)
 
 ```bash
-sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
@@ -132,7 +132,7 @@ Append the variant names (any of `baseline per-bucket-arrays takeover
 latency-ewma llbitmap-fastpath`) at the end of any of the above:
 
 ```bash
-sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
@@ -147,6 +147,19 @@ Wall-clock estimate per full run:
 | 5 | 5 (default: 4 SNIA + ewma-asymmetric-read) | ~80–95 min (cool-down may add more) |
 | 1 | 5 | ~16–22 min |
 | 5 | 1 (single suite via `SUITES=name`) | ~30 min |
+
+Tuning the thermal gate (default: wait between variants until max sensor
+on every leg's parent NVMe drops to ≤ 348 K = 75 °C; devices to monitor
+are derived automatically from --local + --remote):
+
+```bash
+# Looser gate (e.g., 80 °C — closer to wctemp; faster but may throttle).
+sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+    --cool-thresh-k=353 ...
+# Disable cooldown entirely (back-to-back, watch your wctemp):
+sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+    --cool-thresh-k=0 ...
+```
 
 ---
 
@@ -306,7 +319,7 @@ sudo dnf install -y fio fio-engine-libaio libaio dkms git-filter-repo \
 [ -x ~/mdadm/mdadm ]    || ( cd ~/mdadm && make -j$(nproc) mdadm )
 
 # Per-run (Phase 3, raid10 cross-disk example):
-sudo COOL_THRESH_K=348 ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
