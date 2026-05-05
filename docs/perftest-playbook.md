@@ -144,9 +144,9 @@ Wall-clock estimate per full run:
 
 | Variants | Suites | Estimate |
 |---|---|---|
-| 5 | 4 (default) | ~75–90 min (cool-down may add more) |
-| 1 | 4 | ~15–20 min |
-| 5 | 1 (single suite) | ~30 min |
+| 5 | 5 (default: 4 SNIA + ewma-asymmetric-read) | ~80–95 min (cool-down may add more) |
+| 1 | 5 | ~16–22 min |
+| 5 | 1 (single suite via `SUITES=name`) | ~30 min |
 
 ---
 

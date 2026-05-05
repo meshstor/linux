@@ -22,12 +22,22 @@ DATE_TAG="$(date -u +%F)"
 OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
 
 SUITES_BASE="${SUITES_BASE:-/home/mykola/csi-perf-test/suites}"
-SUITES=(
-    "$SUITES_BASE/snia-randread-iops"
-    "$SUITES_BASE/snia-randwrite-iops"
-    "$SUITES_BASE/snia-randread-lat"
-    "$SUITES_BASE/snia-randwrite-lat"
+# Default suite set. ewma-asymmetric-read is the right test for the
+# latency-ewma branch — qd=8 single-thread random read so the read-balance
+# choice between legs determines per-IO latency. The four SNIA suites at
+# qd=64 saturate both legs and would hide EWMA's signal on their own.
+# Override the list with the SUITES env var (space-separated suite names).
+DEFAULT_SUITES=(
+    snia-randread-iops
+    snia-randwrite-iops
+    snia-randread-lat
+    snia-randwrite-lat
+    ewma-asymmetric-read
 )
+read -r -a _suite_names <<< "${SUITES:-${DEFAULT_SUITES[*]}}"
+SUITES=()
+for _s in "${_suite_names[@]}"; do SUITES+=("$SUITES_BASE/$_s"); done
+unset _s _suite_names
 
 declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma llbitmap-fastpath)
 declare -A VARIANT_ARGS=(
@@ -88,7 +98,7 @@ REMOTES=()
 SELECTED_VARIANTS=()
 SYSTEM_DKMS_VER=""
 SUMMARY_ONLY=0
-PORT=""
+PORT="7720"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
