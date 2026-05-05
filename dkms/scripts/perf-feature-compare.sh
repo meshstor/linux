@@ -188,6 +188,36 @@ EOF
     log "msadm wrapper: $MSADM_WRAPPER -> $MDADM_BIN --subsys=ms"
 }
 
+# Wait for the SSD to cool back below COOL_THRESH_K (default 75 °C). Polls the
+# composite + all four temperature sensors and uses the max — different SSDs
+# label the controller chip differently, and the controller often runs hotter
+# than the composite without that being visible in id-ctrl thresholds.
+# Set COOL_THRESH_K=0 (or unset COOL_DEV) to disable.
+COOL_DEV="${COOL_DEV:-/dev/nvme0n1}"
+COOL_THRESH_K="${COOL_THRESH_K:-348}"
+wait_cool() {
+    [[ "$COOL_THRESH_K" -gt 0 ]] || return 0
+    [[ -e "$COOL_DEV" ]] || { warn "wait_cool: $COOL_DEV missing, skipping"; return 0; }
+    local cur waits=0
+    while :; do
+        cur=$(nvme smart-log "$COOL_DEV" -o json 2>/dev/null \
+              | jq -r '[.temperature, .temperature_sensor_1, .temperature_sensor_2,
+                        (.temperature_sensor_3 // 0), (.temperature_sensor_4 // 0)] | max' \
+              2>/dev/null)
+        if [[ -z "$cur" || "$cur" == "null" ]]; then
+            warn "wait_cool: could not read temp; skipping"
+            return 0
+        fi
+        if (( cur <= COOL_THRESH_K )); then
+            (( waits > 0 )) && log "wait_cool: cooled to ${cur} K (target ${COOL_THRESH_K})"
+            return 0
+        fi
+        log "wait_cool: max sensor = ${cur} K (target ${COOL_THRESH_K}); sleep 60"
+        sleep 60
+        waits=$((waits + 1))
+    done
+}
+
 unload_ms_modules() {
     if [[ -e /proc/msstat ]]; then
         for dev in /dev/ms*; do
@@ -438,6 +468,7 @@ for label in "${SELECTED_VARIANTS[@]}"; do
     if [[ -z "${VARIANT_ARGS[$label]+x}" ]]; then
         die "unknown variant: $label (choices: ${VARIANT_LABELS[*]})"
     fi
+    wait_cool
     run_variant "$label"
 done
 
