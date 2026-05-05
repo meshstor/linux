@@ -47,28 +47,43 @@ declare -A VARIANT_VER=(
 
 usage() {
     cat <<EOF
-Usage: sudo $(basename "$0") PART_LOCAL PART_REMOTE [VARIANT ...]
+Usage:
+  sudo $(basename "$0") PART_LOCAL PART_REMOTE [VARIANT ...]
+  sudo $(basename "$0") --level=raid10 --local=A --local=B \\
+                        --remote=C --remote=D [VARIANT ...]
 
-Orchestrate raid1 perf comparison across meshstor-ms variants.
+Orchestrate raid1 or raid10 perf comparison across meshstor-ms variants.
 
-Arguments:
-  PART_LOCAL    First raid1 leg (e.g. /dev/nvme0n1p4)
-  PART_REMOTE   Second raid1 leg, exported via nvmet-tcp (e.g. /dev/nvme0n1p5)
-  VARIANT...    Subset of variants to run (default: all)
-                Choices: baseline per-bucket-arrays takeover latency-ewma llbitmap-fastpath
+Positional form (raid1, default): two partitions = one local + one remote
+(nvme-tcp loopback). Backward-compatible.
+
+Flag form (raid10): N --local + N --remote (>=2 each), interleaved into
+N mirror pairs. Each mirror pair has one local + one nvme-tcp leg.
+
+Variants: baseline per-bucket-arrays takeover latency-ewma llbitmap-fastpath
+          (default: all 5)
+
+Flags:
+  --level=raid1|raid10  raid level (default: raid1)
+  --local=PATH          local-leg partition (repeatable)
+  --remote=PATH         tcp-leg partition (repeatable; same count as --local)
+  --summary-only        regenerate SUMMARY.md from existing run.log files
+                        and exit (no rebuild/bench)
 
 Environment overrides:
   REBUILT_TREE   Path for rebuild-main output (default: ../linux-meshstor-rebuilt)
   MDADM_BIN      Path to mdadm-fork binary (default: /home/mykola/mdadm/mdadm)
   SUITES_BASE    csi-perf-test suites directory (default: /home/mykola/csi-perf-test/suites)
+  SUITES         space-separated suite names override (default: 4 SNIA suites)
 
 Output: $OUT_BASE/<variant>/results/...
         $OUT_BASE/SUMMARY.md
 EOF
 }
 
-PART_LOCAL=""
-PART_REMOTE=""
+LEVEL="raid1"
+LOCALS=()
+REMOTES=()
 SELECTED_VARIANTS=()
 SYSTEM_DKMS_VER=""
 SUMMARY_ONLY=0
@@ -77,23 +92,54 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 2
 fi
-if [[ "${1:-}" == "--summary-only" ]]; then
-    SUMMARY_ONLY=1
-    shift
-fi
-if [[ $SUMMARY_ONLY -eq 0 && $# -lt 2 ]]; then
-    usage
-    exit 2
-fi
-if [[ $SUMMARY_ONLY -eq 0 ]]; then
-    PART_LOCAL="$1"; shift
-    PART_REMOTE="$1"; shift
-fi
-if (($# > 0)); then
-    SELECTED_VARIANTS=("$@")
+
+_pos=()
+while (($#)); do
+    case "$1" in
+        --summary-only) SUMMARY_ONLY=1; shift ;;
+        --level=*)      LEVEL="${1#--level=}"; shift ;;
+        --local=*)      LOCALS+=("${1#--local=}"); shift ;;
+        --remote=*)     REMOTES+=("${1#--remote=}"); shift ;;
+        --) shift; _pos+=("$@"); break ;;
+        -*) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+        *)  _pos+=("$1"); shift ;;
+    esac
+done
+
+if [[ $SUMMARY_ONLY -eq 1 ]]; then
+    # In summary-only mode, positionals are variant names.
+    if (( ${#_pos[@]} > 0 )); then SELECTED_VARIANTS=("${_pos[@]}"); fi
+elif (( ${#LOCALS[@]} > 0 )) || (( ${#REMOTES[@]} > 0 )); then
+    # Flag form: positionals are variants only; legs come from --local/--remote.
+    if (( ${#_pos[@]} > 0 )); then SELECTED_VARIANTS=("${_pos[@]}"); fi
 else
+    # Positional form (backward-compat raid1): pos[0] pos[1] are legs, rest are variants.
+    if (( ${#_pos[@]} < 2 )); then usage >&2; exit 2; fi
+    LOCALS=("${_pos[0]}")
+    REMOTES=("${_pos[1]}")
+    if (( ${#_pos[@]} > 2 )); then SELECTED_VARIANTS=("${_pos[@]:2}"); fi
+fi
+unset _pos
+
+if (( ${#SELECTED_VARIANTS[@]} == 0 )); then
     SELECTED_VARIANTS=("${VARIANT_LABELS[@]}")
 fi
+
+if [[ $SUMMARY_ONLY -eq 0 ]]; then
+    if (( ${#LOCALS[@]} != ${#REMOTES[@]} )); then
+        die "--local count (${#LOCALS[@]}) must equal --remote count (${#REMOTES[@]})"
+    fi
+    case "$LEVEL" in
+        raid1)
+            (( ${#LOCALS[@]} == 1 )) || die "raid1 needs exactly 1 local + 1 remote (got ${#LOCALS[@]} + ${#REMOTES[@]})" ;;
+        raid10)
+            (( ${#LOCALS[@]} >= 2 )) || die "raid10 needs at least 2 local + 2 remote (got ${#LOCALS[@]} + ${#REMOTES[@]})" ;;
+        *)  die "unsupported --level: $LEVEL (choices: raid1 raid10)" ;;
+    esac
+fi
+# Convenience for older code paths in this script (single-leg display only):
+PART_LOCAL="${LOCALS[0]:-}"
+PART_REMOTE="${REMOTES[0]:-}"
 
 # ----- helpers -----
 
@@ -120,8 +166,10 @@ require_tools() {
 }
 
 require_partitions() {
-    [[ -b "$PART_LOCAL" ]]  || die "$PART_LOCAL is not a block device"
-    [[ -b "$PART_REMOTE" ]] || die "$PART_REMOTE is not a block device"
+    local p
+    for p in "${LOCALS[@]}" "${REMOTES[@]}"; do
+        [[ -b "$p" ]] || die "$p is not a block device"
+    done
 }
 
 require_suites() {
@@ -217,8 +265,8 @@ write_summary() {
         echo "# Per-Feature Perf Comparison — $DATE_TAG"
         echo ""
         echo "Host: $(hostname)  Kernel: $(uname -r)"
-        echo "RAID1 legs: $PART_LOCAL (local) + $PART_REMOTE (nvme-tcp loopback)"
-        echo "Bench: dkms/scripts/run-perf-bench-tcp.sh --bitmap=lockless"
+        echo "Level: $LEVEL  Local legs: ${LOCALS[*]:-(none)}  TCP legs: ${REMOTES[*]:-(none)}"
+        echo "Bench: dkms/scripts/run-perf-bench-tcp.sh --bitmap=lockless --level=$LEVEL"
         echo ""
         local suite_dir suite_name label out status run_log iops lat
         for suite_dir in "${SUITES[@]}"; do
@@ -327,9 +375,13 @@ run_variant() {
     fi
 
     # 5. bench
-    log "run-perf-bench-tcp -> $bench_dir"
-    if ! "$RUN_PERF" --bitmap=lockless --out-dir="$bench_dir" --msadm="$MSADM_WRAPPER" \
-           "$PART_LOCAL" "$PART_REMOTE" "${SUITES[@]}"; then
+    log "run-perf-bench-tcp ($LEVEL, ${#LOCALS[@]}+${#REMOTES[@]} legs) -> $bench_dir"
+    local -a bench_args
+    bench_args=(--bitmap=lockless --out-dir="$bench_dir" --msadm="$MSADM_WRAPPER" \
+                --level="$LEVEL")
+    for p in "${LOCALS[@]}";  do bench_args+=(--local="$p");  done
+    for p in "${REMOTES[@]}"; do bench_args+=(--remote="$p"); done
+    if ! "$RUN_PERF" "${bench_args[@]}" "${SUITES[@]}"; then
         warn "bench failed for $label"
         echo "BENCH_FAILED" > "$out_dir/status"
     else
