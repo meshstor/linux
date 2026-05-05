@@ -52,8 +52,9 @@ test -f /lib/modules/$(uname -r)/build/include/uapi/linux/raid/md_p.h \
 ```
 
 ```bash
-# Build mdadm (one-time per host). Needs make + a C toolchain.
-sudo dnf install -y make gcc
+# Build mdadm (one-time per host). Needs make + a C toolchain + libudev
+# headers (provided by systemd-devel on RHEL/Rocky 10).
+sudo dnf install -y make gcc systemd-devel
 ( cd ~/mdadm && make -j$(nproc) mdadm )
 test -x ~/mdadm/mdadm && echo OK || echo "BUILD FAILED"
 ```
@@ -298,7 +299,7 @@ sudo /tmp/msadm --stop /dev/ms0
 ```bash
 # One-time setup (Phase 1):
 sudo dnf install -y fio fio-engine-libaio libaio dkms git-filter-repo \
-    "kernel-devel-$(uname -r)" make gcc
+    "kernel-devel-$(uname -r)" make gcc systemd-devel
 [ -d ~/linux-meshstor ] || git clone git@github.com:meshstor/linux ~/linux-meshstor
 [ -d ~/csi-perf-test ]  || git clone git@github.com:meshstor/csi-perf-test.git ~/csi-perf-test
 [ -d ~/mdadm ]          || git clone git@github.com:meshstor/mdadm ~/mdadm
