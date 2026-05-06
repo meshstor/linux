@@ -18,10 +18,15 @@ same-disk, raid10 cross-disk). Pick one based on your hardware.
 ```bash
 # Kernel-API helpers + DKMS + the bench tool. kernel-devel must match
 # the running kernel (uname -r) — the rename pass needs its UAPI headers.
+dnf config-manager --set-enabled crb
+dnf install epel-release
+dnf clean all
+
 sudo dnf install -y \
     fio fio-engine-libaio libaio \
     dkms git-filter-repo \
-    "kernel-devel-$(uname -r)"
+    kernel-devel vim tmux
+sudo apt install -y fio dkms git-filter-repo nvme-cli jq linux-headers-generic vim tmux
 ```
 
 ### 1.2 Confirm tools
@@ -55,6 +60,7 @@ test -f /lib/modules/$(uname -r)/build/include/uapi/linux/raid/md_p.h \
 # Build mdadm (one-time per host). Needs make + a C toolchain + libudev
 # headers (provided by systemd-devel on RHEL/Rocky 10).
 sudo dnf install -y make gcc systemd-devel
+sudo apt install -y make gcc libc6-dev build-essential libudev-dev
 ( cd ~/mdadm && make -j$(nproc) mdadm )
 test -x ~/mdadm/mdadm && echo OK || echo "BUILD FAILED"
 ```
