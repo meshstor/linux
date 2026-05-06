@@ -1,0 +1,52 @@
+Gate `lim->features` / `lim.features |=` assignments on the queue_limits.features
+field (introduced in kernel 6.11). On older kernels the field doesn't exist at all,
+so the assignment can't be papered over by a header shim — it has to be excluded
+at source level. The equivalent flags (WRITE_CACHE | FUA | IO_STAT | NOWAIT) are
+applied via blk_queue_*-style calls inside the queue_limits_set compat shim
+(dkms/compat/compat.h), so 6.8 still gets correct cache-flush semantics.
+
+ATOMIC_WRITES has no equivalent on pre-6.11 — the atomic-write infrastructure
+itself is absent (REQ_ATOMIC is shimmed to 0 in compat.h), so dropping the
+feature flag is consistent.
+
+HAVE_QUEUE_LIMITS_FEATURES is set by dkms/Makefile.in's feature_flags target
+when the running kernel's <linux/blkdev.h> defines `features` inside
+`struct queue_limits`.
+
+--- a/md.c
++++ b/md.c
+@@ -6274,8 +6274,10 @@ EXPORT_SYMBOL_GPL(mddev_update_io_opt);
+ void md_init_stacking_limits(struct queue_limits *lim)
+ {
+ 	blk_set_stacking_limits(lim);
++#ifdef HAVE_QUEUE_LIMITS_FEATURES
+ 	lim->features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA |
+ 			BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT;
++#endif
+ }
+ EXPORT_SYMBOL_GPL(md_init_stacking_limits);
+
+--- a/raid1.c
++++ b/raid1.c
+@@ -3207,7 +3207,9 @@ static int raid1_set_limits(struct mddev *mddev)
+ 	lim.max_write_zeroes_sectors = 0;
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
+ 	lim.logical_block_size = mddev->logical_block_size;
++#ifdef HAVE_QUEUE_LIMITS_FEATURES
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
++#endif
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+ 	if (err)
+ 		return err;
+--- a/raid10.c
++++ b/raid10.c
+@@ -3940,7 +3940,9 @@ static int raid10_set_queue_limits(struct mddev *mddev)
+ 	lim.io_min = mddev->chunk_sectors << 9;
+ 	lim.chunk_sectors = mddev->chunk_sectors;
+ 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
++#ifdef HAVE_QUEUE_LIMITS_FEATURES
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
++#endif
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+ 	if (err)
+ 		return err;

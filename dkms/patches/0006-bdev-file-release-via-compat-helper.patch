@@ -1,0 +1,30 @@
+Replace `fput(rdev->bdev_file)` with the `ms_bdev_file_release()` helper
+defined in dkms/compat/compat.h. On 6.9+ the helper is a thin wrapper around
+fput(); on 6.8 it calls bdev_release() because rdev->bdev_file is actually a
+struct bdev_handle * reinterpreted as struct file * (see compat.h's
+bdev_file_open_by_dev shim).
+
+We can't shim fput() globally because md.c also fput()s real bitmap files in
+the same translation unit. Routing only the bdev_file path through a separate
+helper keeps the bitmap-file path unchanged.
+
+--- a/md.c
++++ b/md.c
+@@ -2645,7 +2645,7 @@ static void export_rdev(struct md_rdev *rdev)
+ 	if (test_bit(AutoDetected, &rdev->flags))
+ 		md_autodetect_dev(rdev->bdev->bd_dev);
+ #endif
+-	fput(rdev->bdev_file);
++	ms_bdev_file_release(rdev->bdev_file);
+ 	rdev->bdev = NULL;
+ 	kobject_put(&rdev->kobj);
+ }
+@@ -3875,7 +3875,7 @@ static struct md_rdev *md_import_device(dev_t newdev, int super_format, int supe
+ 	return rdev;
+
+ out_blkdev_put:
+-	fput(rdev->bdev_file);
++	ms_bdev_file_release(rdev->bdev_file);
+ out_clear_rdev:
+ 	md_rdev_clear(rdev);
+ out_free_rdev:
