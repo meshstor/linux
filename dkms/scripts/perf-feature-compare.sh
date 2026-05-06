@@ -306,6 +306,124 @@ wait_cool() {
     done
 }
 
+# ----- cache helpers -----
+#
+# The cache stores per-variant DKMS source tarballs keyed by the inputs that
+# determine the tarball's content. See spec:
+#   docs/superpowers/specs/2026-05-07-perf-feature-compare-tarball-cache-design.md
+
+# shellcheck disable=SC2034  # populated by resolve_shas, read by cache_key_for
+declare -gA _SHA_CACHE
+_UPSTREAM_MASTER_SHA=""
+_HARNESS_SHA=""
+_CACHE_SHAS_RESOLVED=0
+
+# Resolve and memoize upstream master + meshstor branch SHAs needed for cache
+# keys across all SELECTED_VARIANTS. Idempotent. Fails the run if any required
+# remote ref cannot be resolved (the same network would fail rebuild-main).
+resolve_shas() {
+    (( _CACHE_SHAS_RESOLVED == 1 )) && return 0
+    local mirror="${XDG_CACHE_HOME:-$HOME/.cache}/meshstor/torvalds-linux.git"
+    [[ -d "$mirror" ]] \
+        || die "upstream bare mirror missing: $mirror (run rebuild-main once to bootstrap)"
+    _UPSTREAM_MASTER_SHA="$(git -C "$mirror" rev-parse master 2>/dev/null)" \
+        || die "cannot read master from $mirror"
+
+    _HARNESS_SHA="$(git ls-remote "$MESHSTOR_URL_FOR_REBUILD" refs/heads/meshstor-harness 2>/dev/null \
+                      | awk 'NR==1{print $1}')"
+    [[ -n "$_HARNESS_SHA" ]] \
+        || die "git ls-remote $MESHSTOR_URL_FOR_REBUILD refs/heads/meshstor-harness failed"
+
+    local label feature sha
+    for label in "${SELECTED_VARIANTS[@]}"; do
+        feature="${VARIANT_ARGS[$label]}"
+        [[ -z "$feature" ]] && continue
+        [[ -n "${_SHA_CACHE[$feature]:-}" ]] && continue
+        sha="$(git ls-remote "$MESHSTOR_URL_FOR_REBUILD" "refs/heads/$feature" 2>/dev/null \
+                  | awk 'NR==1{print $1}')"
+        [[ -n "$sha" ]] \
+            || die "git ls-remote $MESHSTOR_URL_FOR_REBUILD refs/heads/$feature failed"
+        _SHA_CACHE[$feature]="$sha"
+    done
+
+    _CACHE_SHAS_RESOLVED=1
+    log "cache: kernel=$(uname -r) upstream=${_UPSTREAM_MASTER_SHA:0:12} harness=${_HARNESS_SHA:0:12}"
+    for label in "${SELECTED_VARIANTS[@]}"; do
+        feature="${VARIANT_ARGS[$label]}"
+        [[ -z "$feature" ]] && continue
+        log "cache: $label feature=$feature sha=${_SHA_CACHE[$feature]:0:12}"
+    done
+}
+
+# Compute the sha256 cache key for a variant label.
+# Stdout: 64-hex-char sha256. Caller takes ${result:0:12} for the dir name.
+cache_key_for() {
+    local label="$1"
+    resolve_shas
+    local feature="${VARIANT_ARGS[$label]}"
+    local feature_sha="${_SHA_CACHE[$feature]:-}"
+    local ver="${VARIANT_VER[$label]}"
+    local bt_sh_sha rm_sha
+    bt_sh_sha="$(sha256sum "$BUILD_TARBALL" | awk '{print $1}')"
+    rm_sha="$(sha256sum "$REBUILD_MAIN"     | awk '{print $1}')"
+    # Newline-joined; no trailing newline (printf, not echo). Field order
+    # MUST match cache_write_key_txt for human/machine consistency.
+    printf '%s' "kernel=$(uname -r)
+upstream_sha=$_UPSTREAM_MASTER_SHA
+harness_sha=$_HARNESS_SHA
+feature=$feature
+feature_sha=$feature_sha
+ver=$ver
+build_tarball_sh=$bt_sh_sha
+rebuild_main=$rm_sha" | sha256sum | awk '{print $1}'
+}
+
+# Write a human-readable record of the inputs that produced the cache entry.
+# Field set MUST match cache_key_for, plus a created= timestamp.
+cache_write_key_txt() {
+    local cache_dir="$1" label="$2" ver="$3"
+    local feature="${VARIANT_ARGS[$label]}"
+    local feature_sha="${_SHA_CACHE[$feature]:-}"
+    local bt_sh_sha rm_sha
+    bt_sh_sha="$(sha256sum "$BUILD_TARBALL" | awk '{print $1}')"
+    rm_sha="$(sha256sum "$REBUILD_MAIN"     | awk '{print $1}')"
+    {
+        echo "kernel=$(uname -r)"
+        echo "upstream_sha=$_UPSTREAM_MASTER_SHA"
+        echo "harness_sha=$_HARNESS_SHA"
+        echo "feature=$feature"
+        echo "feature_sha=$feature_sha"
+        echo "ver=$ver"
+        echo "build_tarball_sh=sha256:$bt_sh_sha"
+        echo "rebuild_main=sha256:$rm_sha"
+        echo "created=$(date -u +%FT%TZ)"
+    } > "$cache_dir/key.txt"
+}
+
+# Atomically copy a freshly built tarball into the cache directory.
+# Args: $1=cache_dir  $2=cache_tar (final path)  $3=fresh_tarball
+#       $4=label  $5=ver  $6=key (full sha256)
+# Returns non-zero on failure; caller should fall back to the fresh path.
+cache_store() {
+    local cache_dir="$1" cache_tar="$2" fresh_tarball="$3"
+    local label="$4" ver="$5" key="$6"
+    mkdir -p "$cache_dir" || return 1
+    local tmp="$cache_dir/.tmp.$$.tar.gz"
+    cp "$fresh_tarball" "$tmp" || { rm -f "$tmp"; return 1; }
+    cache_write_key_txt "$cache_dir" "$label" "$ver" || true
+    mv "$tmp" "$cache_tar" || { rm -f "$tmp"; return 1; }
+    log "cache: stored $cache_tar (key=${key:0:12})"
+    return 0
+}
+
+# Best-effort cleanup of partial cache writes orphaned by a killed prior run.
+# Bounded: only removes .tmp.* files older than 1 day under build/cache/.
+cache_sweep_tmp() {
+    local root="$REPO_ROOT/build/cache"
+    [[ -d "$root" ]] || return 0
+    find "$root" -name '.tmp.*' -mtime +1 -delete 2>/dev/null || true
+}
+
 unload_ms_modules() {
     if [[ -e /proc/msstat ]]; then
         for dev in /dev/ms*; do
