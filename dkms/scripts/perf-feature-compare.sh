@@ -106,6 +106,8 @@ Flags:
                         derived from --local + --remote (their parent disks).
   --summary-only        regenerate SUMMARY.md from existing run.log files
                         and exit (no rebuild/bench)
+  --no-cache            do not read from or write to build/cache/ for this run
+                        (forces a fresh rebuild-main + build-tarball per variant)
 
 Environment overrides:
   REBUILT_TREE   Path for rebuild-main output (default: ../linux-meshstor-rebuilt)
@@ -115,6 +117,8 @@ Environment overrides:
 
 Output: $OUT_BASE/<variant>/results/...
         $OUT_BASE/SUMMARY.md
+Cache:  $REPO_ROOT/build/cache/<key>/  (per-variant DKMS tarballs;
+        rm -rf to reset; bypass with --no-cache)
 EOF
 }
 
@@ -125,6 +129,7 @@ SELECTED_VARIANTS=()
 SYSTEM_DKMS_VER=""
 SUMMARY_ONLY=0
 PORT="7720"
+NO_CACHE=0
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
@@ -135,6 +140,7 @@ _pos=()
 while (($#)); do
     case "$1" in
         --summary-only) SUMMARY_ONLY=1; shift ;;
+        --no-cache)     NO_CACHE=1; shift ;;
         --level=*)      LEVEL="${1#--level=}"; shift ;;
         --local=*)      LOCALS+=("${1#--local=}"); shift ;;
         --remote=*)     REMOTES+=("${1#--remote=}"); shift ;;
