@@ -306,4 +306,182 @@ static inline int ms_badblocks_check_compat(struct badblocks *bb, sector_t s,
 #define REQ_ATOMIC ((__force blk_opf_t)0)
 #endif
 
+/*
+ * BLK_STS_INVAL (added in 6.10, commit 7ba150834b04).
+ *
+ * Used by raid1_should_handle_error to skip retry/badblocks when the bio
+ * was rejected for being invalid for the underlying device. On older
+ * kernels this status is never emitted, so any unused sentinel value
+ * works — pick one well above the highest defined BLK_STS_* in 6.8.
+ */
+#ifndef BLK_STS_INVAL
+#define BLK_STS_INVAL  ((__force blk_status_t)0xFE)
+#endif
+
+/*
+ * queue_limits transactional update API (added in 6.9, commits c490f226a0eaf
+ * and 631d4efb80fb).
+ *
+ * Newer kernels mutate queue limits via a copy-edit-commit cycle:
+ *   lim = queue_limits_start_update(q);
+ *   ...mutate lim...
+ *   queue_limits_commit_update(q, &lim);   (or _cancel_update on abort)
+ * Older kernels just assign q->limits directly.
+ *
+ * The shims below implement the same contract on 6.8 by copying limits
+ * into and out of the queue. There is no transactional rollback, so
+ * _cancel_update is a no-op — callers using cancel_update accept that
+ * partial mutations to the local `lim` are simply discarded by going
+ * out of scope.
+ */
+#ifndef HAVE_QUEUE_LIMITS_START_UPDATE
+static inline struct queue_limits queue_limits_start_update(struct request_queue *q)
+{
+    return q->limits;
+}
+#endif
+
+#ifndef HAVE_QUEUE_LIMITS_COMMIT_UPDATE
+static inline int queue_limits_commit_update(struct request_queue *q,
+                                              struct queue_limits *lim)
+{
+    q->limits = *lim;
+    return 0;
+}
+#endif
+
+#ifndef HAVE_QUEUE_LIMITS_CANCEL_UPDATE
+static inline void queue_limits_cancel_update(struct request_queue *q)
+{
+    (void)q;
+}
+#endif
+
+/*
+ * queue_limits_set (added in 6.9). One-shot apply of a queue_limits to a
+ * queue. On 6.8, also set the queue flags that 6.11+ encodes in
+ * lim->features (WRITE_CACHE | FUA | IO_STAT | NOWAIT) — patch 0005
+ * elides those bitmap assignments on pre-6.11 kernels, so this shim is
+ * the single place where the "features" of an md stacking device get
+ * applied to the queue.
+ */
+#ifndef HAVE_QUEUE_LIMITS_SET
+static inline int queue_limits_set(struct request_queue *q,
+                                    struct queue_limits *lim)
+{
+    q->limits = *lim;
+    blk_queue_write_cache(q, true, true);
+    blk_queue_flag_set(QUEUE_FLAG_IO_STAT, q);
+    blk_queue_flag_set(QUEUE_FLAG_NOWAIT, q);
+    return 0;
+}
+#endif
+
+/*
+ * queue_limits_stack_bdev (added in 6.9). Stack a block_device's limits
+ * onto a queue_limits target. 6.8 has the equivalent at the queue_limits
+ * level via blk_stack_limits — same semantics, just no disk-name in
+ * mismatch warnings.
+ */
+#ifndef HAVE_QUEUE_LIMITS_STACK_BDEV
+static inline void queue_limits_stack_bdev(struct queue_limits *t,
+                                            struct block_device *bdev,
+                                            sector_t offset,
+                                            const char *name)
+{
+    blk_stack_limits(t, &bdev_get_queue(bdev)->limits, offset);
+    (void)name;
+}
+#endif
+
+/*
+ * queue_limits_stack_integrity_bdev (added in 6.10). Validates and stacks
+ * a bdev's blk_integrity profile onto a queue_limits target. Returns true
+ * if profiles are compatible, false otherwise.
+ *
+ * 6.8 has no queue_limits-level integrity stacking — integrity is set up
+ * via blk_integrity_register on the gendisk after creation. Returning
+ * true here means the caller's "incompatible integrity" rejection path
+ * is never taken on 6.8; runtime mismatches still surface elsewhere.
+ * This is a deliberate compat trade-off: degraded validation, never a
+ * hard build break.
+ */
+#ifndef HAVE_QUEUE_LIMITS_STACK_INTEGRITY_BDEV
+static inline bool queue_limits_stack_integrity_bdev(struct queue_limits *t,
+                                                      struct block_device *bdev)
+{
+    (void)t; (void)bdev;
+    return true;
+}
+#endif
+
+/*
+ * bdev_file_open_by_dev / file_bdev (added in 6.9, commit 8acbac46d27dd).
+ *
+ * The transition replaced struct bdev_handle * with struct file * as the
+ * holder type. On 6.8 we reinterpret-cast bdev_handle as struct file *:
+ * the pointer is opaque to md.c (only file_bdev() extracts the bdev,
+ * and release goes through ms_bdev_file_release() — see below). It is
+ * never dereferenced as a real struct file.
+ *
+ * This works because struct file is forward-declared but its layout is
+ * never used on the bdev_file path. Keep this contract intact: any new
+ * use of rdev->bdev_file must go through these shims.
+ */
+#ifndef HAVE_BDEV_FILE_OPEN_BY_DEV
+static inline struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode,
+                                                   void *holder,
+                                                   const struct blk_holder_ops *hops)
+{
+    return (struct file *)bdev_open_by_dev(dev, mode, holder, hops);
+}
+
+static inline struct block_device *file_bdev(struct file *bdev_file)
+{
+    return ((struct bdev_handle *)bdev_file)->bdev;
+}
+#endif
+
+/*
+ * ms_bdev_file_release(bdev_file)
+ *
+ * fput() can't be retargeted because md.c also fputs real bitmap files
+ * in the same translation unit. Patch 0006 rewrites the two
+ * fput(rdev->bdev_file) call sites to use this helper, which dispatches
+ * to fput() on 6.9+ and bdev_release() on 6.8.
+ */
+#ifdef HAVE_BDEV_FILE_OPEN_BY_DEV
+static inline void ms_bdev_file_release(struct file *bdev_file)
+{
+    fput(bdev_file);
+}
+#else
+static inline void ms_bdev_file_release(struct file *bdev_file)
+{
+    bdev_release((struct bdev_handle *)bdev_file);
+}
+#endif
+
+/*
+ * blk_alloc_disk(lim, node) — 2-arg form added in 6.9 (commit 74fa8f9c5530).
+ * On 6.8 the macro is `blk_alloc_disk(node)`. Redefine to accept the
+ * (lim, node) signature, dropping `lim` — the limits get applied by a
+ * subsequent queue_limits_set() (real on 6.9+ or shim on 6.8).
+ *
+ * Must come AFTER <linux/blkdev.h> so the original macro is in scope to
+ * be #undef'd. The expansion mirrors the 6.8 blkdev.h definition (uses
+ * __blk_alloc_disk + a static lock_class_key).
+ */
+#ifndef HAVE_BLK_ALLOC_DISK_LIM
+#ifdef blk_alloc_disk
+#undef blk_alloc_disk
+#endif
+#define blk_alloc_disk(lim, node_id)                                    \
+({                                                                       \
+    static struct lock_class_key __key;                                  \
+    (void)(lim);                                                         \
+    __blk_alloc_disk(node_id, &__key);                                   \
+})
+#endif
+
 #endif /* MESHSTOR_MD_COMPAT_H */
