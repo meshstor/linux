@@ -1,0 +1,27 @@
+Use register_sysctl_sz directly with an explicit cast for the table pointer.
+
+The original `register_sysctl(path, raid_table)` macro expands to
+`register_sysctl_sz(path, raid_table, ARRAY_SIZE(raid_table))`. On pre-6.6
+kernels register_sysctl_sz takes `struct ctl_table *` (non-const), and
+raid_table is `static const struct ctl_table[]`, so the implicit conversion
+drops const and triggers -Werror=discarded-qualifiers.
+
+A direct cast inside the macro doesn't help because ARRAY_SIZE then sees a
+pointer instead of an array. So we expand the macro by hand: cast only the
+table argument, while keeping `raid_table` (still in scope as an array) for
+ARRAY_SIZE. The cast is a benign const-drop on newer kernels where the
+parameter is already const.
+
+--- a/md.c
++++ b/md.c
+@@ -10665,7 +10665,9 @@ static int __init md_init(void)
+ 	mdp_major = ret;
+
+ 	register_reboot_notifier(&md_notifier);
+-	raid_table_header = register_sysctl("dev/raid", raid_table);
++	raid_table_header = register_sysctl_sz("dev/raid",
++					       (struct ctl_table *)raid_table,
++					       ARRAY_SIZE(raid_table));
+
+ 	md_geninit();
+ 	return 0;
