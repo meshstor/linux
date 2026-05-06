@@ -653,60 +653,35 @@ run_variant() {
 
     log "=== variant: $label (args='$args' ver=$ver) ==="
 
-    # 1. rebuild-main
-    log "rebuild-main $args -> $REBUILT_TREE"
-    # Disable git commit signing inside the rebuild-main subprocess: SSH_AUTH_SOCK
-    # is stripped by sudo, so any 'commit.gpgsign=true' ssh-signing config would
-    # fail at git am time with "Couldn't get agent socket?".
-    local rebuild_env=(
-        MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD"
-        GIT_CONFIG_COUNT=1
-        GIT_CONFIG_KEY_0=commit.gpgsign
-        GIT_CONFIG_VALUE_0=false
-    )
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        if ! sudo -u "$SUDO_USER" env "${rebuild_env[@]}" \
-                "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
-            warn "rebuild-main failed for $label (see $rebuild_log)"
-            echo "REBUILD_FAILED" > "$out_dir/status"
-            return 0
-        fi
-    else
-        if ! env "${rebuild_env[@]}" "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
-            warn "rebuild-main failed for $label (see $rebuild_log)"
-            echo "REBUILD_FAILED" > "$out_dir/status"
-            return 0
-        fi
+    # 1+2. Obtain tarball (cache hit OR rebuild-main + build-tarball).
+    local tarball
+    if ! tarball="$(obtain_tarball "$label" "$out_dir" "$rebuild_log" "$build_log")"; then
+        return 0   # status was already written by obtain_tarball
     fi
 
-    # 2. build-tarball (must run inside the rebuilt tree)
-    log "build-tarball $ver"
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        if ! ( cd "$REBUILT_TREE" && sudo -u "$SUDO_USER" "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
-            warn "build-tarball failed (see $build_log)"
-            echo "BUILD_FAILED" > "$out_dir/status"
-            return 0
-        fi
-    else
-        if ! ( cd "$REBUILT_TREE" && "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
-            warn "build-tarball failed (see $build_log)"
-            echo "BUILD_FAILED" > "$out_dir/status"
-            return 0
-        fi
-    fi
-    local tarball="$REBUILT_TREE/build/meshstor-ms-$ver.dkms.tar.gz"
-    if [[ ! -f "$tarball" ]]; then
-        warn "tarball not found: $tarball"
-        echo "BUILD_FAILED" > "$out_dir/status"
-        return 0
-    fi
-
-    # 3. dkms install
+    # 3. dkms install (with auto-heal on cache-sourced failure).
     if ! install_variant "$label" "$ver" "$tarball" >> "$build_log" 2>&1; then
-        warn "dkms install failed (see $build_log)"
-        dkms_remove_safe "meshstor-ms/$ver"
-        echo "INSTALL_FAILED" > "$out_dir/status"
-        return 0
+        if [[ "$tarball" == "$REPO_ROOT/build/cache/"* ]]; then
+            local cache_dir
+            cache_dir="$(dirname "$tarball")"
+            warn "CACHE CORRUPT: removing $cache_dir and rebuilding once"
+            rm -rf "$cache_dir"
+            dkms_remove_safe "meshstor-ms/$ver"
+            if ! tarball="$(obtain_tarball "$label" "$out_dir" "$rebuild_log" "$build_log")"; then
+                return 0
+            fi
+            if ! install_variant "$label" "$ver" "$tarball" >> "$build_log" 2>&1; then
+                warn "dkms install failed after auto-heal (see $build_log)"
+                dkms_remove_safe "meshstor-ms/$ver"
+                echo "INSTALL_FAILED" > "$out_dir/status"
+                return 0
+            fi
+        else
+            warn "dkms install failed (see $build_log)"
+            dkms_remove_safe "meshstor-ms/$ver"
+            echo "INSTALL_FAILED" > "$out_dir/status"
+            return 0
+        fi
     fi
 
     # 4. modprobe
