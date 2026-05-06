@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # perf-extract-table.sh — render a unicode-box comparison table from a
 # perf-feature-compare.sh results directory. Baseline row shows absolute
-# values (iops + p99 lat); other variants show percent delta vs baseline
-# for both iops and p99.
+# values (iops + mean clat + p99 clat); other variants show percent
+# delta vs baseline for all three.
+#
+# Mean is load-bearing for the latency-ewma branch: with asymmetric legs,
+# baseline ~50/50 routing → mean ≈ midpoint of the two leg latencies;
+# EWMA pinned to fast leg → mean ≈ fast-leg latency. p99 looks similar
+# in both cases (occasional slow-leg routes), so mean is the headline.
 #
 # Usage:
 #   dkms/scripts/perf-extract-table.sh <results-base-dir> [variant ...]
@@ -59,8 +64,8 @@ PREFERRED_ORDER=(
     snia-randwrite-iops
     snia-randread-lat
     snia-randwrite-lat
-    ewma-asymmetric-read
-    llbitmap-hot-region-write
+    kp-asym-read
+    kp-hot-region-write
 )
 SUITES=()
 for s in "${PREFERRED_ORDER[@]}"; do
@@ -78,10 +83,13 @@ unset _seen DISCOVERED
 
 # ---- extraction + formatting ----
 
-# Echo "iops p99_us"; both 0 if file missing/unparseable.
+# Echo "iops mean_us p99_us"; all 0 if file missing/unparseable.
+# Sums read+write fields — for our pure-read or pure-write suites only
+# one side is non-zero; would be misleading for randrw mixes (none in
+# default).
 extract_raw() {
     local f="$1"
-    if [[ ! -f "$f" ]]; then echo "0 0"; return; fi
+    if [[ ! -f "$f" ]]; then echo "0 0 0"; return; fi
     local out
     # sed strips leading non-JSON; awk strips trailing non-JSON (e.g. the
     # `==== per-rdev latency_ewma_ns ...` trailer ewma-asymmetric-read appends
@@ -92,11 +100,13 @@ extract_raw() {
            | jq -r '
                .jobs[0] as $j |
                (($j.read.iops + $j.write.iops)) as $iops |
+               ((($j.read.clat_ns.mean // 0)
+               + ($j.write.clat_ns.mean // 0)) / 1000) as $mean |
                ((($j.read.clat_ns.percentile."99.000000" // 0)
                + ($j.write.clat_ns.percentile."99.000000" // 0)) / 1000) as $p99 |
-               "\($iops) \($p99)"
+               "\($iops) \($mean) \($p99)"
            ' 2>/dev/null)" || out=""
-    [[ -z "$out" ]] && out="0 0"
+    [[ -z "$out" ]] && out="0 0 0"
     echo "$out"
 }
 
@@ -139,11 +149,12 @@ for s in "${SUITES[@]}"; do
 done
 
 # Capture baseline values for delta calc.
-declare -A BASE_IOPS BASE_P99
+declare -A BASE_IOPS BASE_MEAN BASE_P99
 if [[ -d "$BASE/baseline/results" ]]; then
     for s in "${SUITES[@]}"; do
-        read -r i p < <(extract_raw "$BASE/baseline/results/$s/run.log")
+        read -r i m p < <(extract_raw "$BASE/baseline/results/$s/run.log")
         BASE_IOPS[$s]="$i"
+        BASE_MEAN[$s]="$m"
         BASE_P99[$s]="$p"
     done
 fi
@@ -153,25 +164,29 @@ declare -A CELL
 for v in "${VARIANTS[@]}"; do
     for s in "${SUITES[@]}"; do
         f="$BASE/$v/results/$s/run.log"
-        read -r iops p99 < <(extract_raw "$f")
+        read -r iops mean p99 < <(extract_raw "$f")
         if [[ "$v" == "baseline" ]]; then
             if [[ "$iops" == "0" && "$p99" == "0" ]]; then
                 CELL[$v|$s]="-"
             else
-                CELL[$v|$s]="$(fmt_iops "$iops") / $(fmt_lat_us "$p99")"
+                CELL[$v|$s]="$(fmt_iops "$iops") / $(fmt_lat_us "$mean") / $(fmt_lat_us "$p99")"
             fi
         else
             local_base_iops="${BASE_IOPS[$s]:-0}"
+            local_base_mean="${BASE_MEAN[$s]:-0}"
             local_base_p99="${BASE_P99[$s]:-0}"
             if [[ "$iops" == "0" && "$p99" == "0" ]]; then
                 CELL[$v|$s]="-"
-            elif [[ "$local_base_iops" == "0" || "$local_base_p99" == "0" ]]; then
+            elif [[ "$local_base_iops" == "0" \
+                 || "$local_base_mean" == "0" \
+                 || "$local_base_p99"  == "0" ]]; then
                 # No baseline to diff against — show absolutes.
-                CELL[$v|$s]="$(fmt_iops "$iops") / $(fmt_lat_us "$p99")"
+                CELL[$v|$s]="$(fmt_iops "$iops") / $(fmt_lat_us "$mean") / $(fmt_lat_us "$p99")"
             else
                 pct_i="$(awk -v a="$iops" -v b="$local_base_iops" 'BEGIN {print (a-b)*100/b}')"
+                pct_m="$(awk -v a="$mean" -v b="$local_base_mean" 'BEGIN {print (a-b)*100/b}')"
                 pct_p="$(awk -v a="$p99"  -v b="$local_base_p99"  'BEGIN {print (a-b)*100/b}')"
-                CELL[$v|$s]="$(fmt_pct "$pct_i") / $(fmt_pct "$pct_p")"
+                CELL[$v|$s]="$(fmt_pct "$pct_i") / $(fmt_pct "$pct_m") / $(fmt_pct "$pct_p")"
             fi
         fi
     done
