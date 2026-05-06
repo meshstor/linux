@@ -323,7 +323,17 @@ _CACHE_SHAS_RESOLVED=0
 # remote ref cannot be resolved (the same network would fail rebuild-main).
 resolve_shas() {
     (( _CACHE_SHAS_RESOLVED == 1 )) && return 0
-    local mirror="${XDG_CACHE_HOME:-$HOME/.cache}/meshstor/torvalds-linux.git"
+    # When this script runs under sudo, $HOME is /root — but the upstream
+    # bare mirror was bootstrapped under the invoking user. Use SUDO_USER's
+    # home dir, falling back to $HOME only when not run under sudo.
+    local user_home
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+        [[ -n "$user_home" ]] || die "cannot resolve home for SUDO_USER=$SUDO_USER"
+    else
+        user_home="$HOME"
+    fi
+    local mirror="${XDG_CACHE_HOME:-$user_home/.cache}/meshstor/torvalds-linux.git"
     [[ -d "$mirror" ]] \
         || die "upstream bare mirror missing: $mirror (run rebuild-main once to bootstrap)"
     _UPSTREAM_MASTER_SHA="$(git -C "$mirror" rev-parse master 2>/dev/null)" \
@@ -361,7 +371,8 @@ cache_key_for() {
     local label="$1"
     resolve_shas
     local feature="${VARIANT_ARGS[$label]}"
-    local feature_sha="${_SHA_CACHE[$feature]:-}"
+    local feature_sha=""
+    [[ -n "$feature" ]] && feature_sha="${_SHA_CACHE[$feature]:-}"
     local ver="${VARIANT_VER[$label]}"
     local bt_sh_sha rm_sha
     bt_sh_sha="$(sha256sum "$BUILD_TARBALL" | awk '{print $1}')"
@@ -383,7 +394,8 @@ rebuild_main=$rm_sha" | sha256sum | awk '{print $1}'
 cache_write_key_txt() {
     local cache_dir="$1" label="$2" ver="$3"
     local feature="${VARIANT_ARGS[$label]}"
-    local feature_sha="${_SHA_CACHE[$feature]:-}"
+    local feature_sha=""
+    [[ -n "$feature" ]] && feature_sha="${_SHA_CACHE[$feature]:-}"
     local bt_sh_sha rm_sha
     bt_sh_sha="$(sha256sum "$BUILD_TARBALL" | awk '{print $1}')"
     rm_sha="$(sha256sum "$REBUILD_MAIN"     | awk '{print $1}')"
@@ -412,7 +424,9 @@ cache_store() {
     cp "$fresh_tarball" "$tmp" || { rm -f "$tmp"; return 1; }
     cache_write_key_txt "$cache_dir" "$label" "$ver" || true
     mv "$tmp" "$cache_tar" || { rm -f "$tmp"; return 1; }
-    log "cache: stored $cache_tar (key=${key:0:12})"
+    # cache_store is called from obtain_tarball (which is invoked via $(...)),
+    # so log output must go to stderr to avoid polluting the captured stdout.
+    log "cache: stored $cache_tar (key=${key:0:12})" >&2
     return 0
 }
 
@@ -429,6 +443,10 @@ cache_sweep_tmp() {
 # Args: $1=label  $2=out_dir  $3=rebuild_log path  $4=build_log path
 # On internal build failure: writes "$out_dir/status" with the failure code
 # (REBUILD_FAILED / BUILD_FAILED) and returns 1; caller should `return 0`.
+#
+# IMPORTANT: this function is called via $(...) by the caller, which captures
+# stdout into a variable. Diagnostic log()/warn() output therefore MUST go to
+# stderr — otherwise it would be embedded into the returned tarball path.
 obtain_tarball() {
     local label="$1" out_dir="$2" rebuild_log="$3" build_log="$4"
     local args="${VARIANT_ARGS[$label]}"
@@ -438,21 +456,25 @@ obtain_tarball() {
     local key="" key12="" cache_dir="" cache_tar=""
     if (( NO_CACHE == 0 )); then
         key="$(cache_key_for "$label")"
+        # Defensive: command substitution swallows die() exits; verify the
+        # function returned a well-formed sha256 hex.
+        [[ ${#key} -eq 64 ]] \
+            || die "cache: cache_key_for produced unexpected output for $label: '$key'"
         key12="${key:0:12}"
         cache_dir="$REPO_ROOT/build/cache/$key12"
         cache_tar="$cache_dir/meshstor-ms-$ver.dkms.tar.gz"
         if [[ -f "$cache_tar" ]]; then
-            log "CACHE HIT: $cache_tar (key=$key12)"
+            log "CACHE HIT: $cache_tar (key=$key12)" >&2
             echo "$cache_tar"
             return 0
         fi
-        log "cache: miss for $label (key=$key12); rebuilding"
+        log "cache: miss for $label (key=$key12); rebuilding" >&2
     fi
 
     # Cache miss (or --no-cache): rebuild + build. Block matches the original
     # inline implementation verbatim so failure paths are byte-identical to
     # the pre-cache behavior.
-    log "rebuild-main $args -> $REBUILT_TREE"
+    log "rebuild-main $args -> $REBUILT_TREE" >&2
     local rebuild_env=(
         MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD"
         GIT_CONFIG_COUNT=1
@@ -474,7 +496,7 @@ obtain_tarball() {
         fi
     fi
 
-    log "build-tarball $ver"
+    log "build-tarball $ver" >&2
     if [[ -n "${SUDO_USER:-}" ]]; then
         if ! ( cd "$REBUILT_TREE" && sudo -u "$SUDO_USER" "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
             warn "build-tarball failed (see $build_log)"
@@ -556,7 +578,14 @@ install_variant() {
     # the version in `added` state, which makes ldtarball below refuse.
     dkms_remove_safe "meshstor-ms/$ver"
     log "dkms ldtarball $tarball"
-    dkms ldtarball "$tarball" >/dev/null
+    # Explicitly propagate ldtarball failure: install_variant is invoked from
+    # `if ! install_variant ...` (which suppresses set -e), and a corrupt
+    # tarball would otherwise be masked by dkms install silently reusing a
+    # stale /usr/src/<pkg>-<ver>/ tree from a prior run — defeating the
+    # auto-heal path in run_variant.
+    if ! dkms ldtarball "$tarball" >/dev/null; then
+        return 1
+    fi
     log "dkms install meshstor-ms/$ver"
     dkms install "meshstor-ms/$ver" >/dev/null
 }
@@ -749,6 +778,11 @@ setup_msadm_wrapper
 setup_nvmet
 
 mkdir -p "$OUT_BASE"
+cache_sweep_tmp
+# Resolve cache-key inputs (network calls) up front so any failure aborts the
+# script in the main shell. cache_key_for is later invoked via $(...) inside
+# obtain_tarball, where set -e does not propagate die() out of the subshell.
+(( NO_CACHE == 0 )) && resolve_shas
 log "compare: parts=$PART_LOCAL+$PART_REMOTE variants=(${SELECTED_VARIANTS[*]})"
 log "compare: out=$OUT_BASE"
 
