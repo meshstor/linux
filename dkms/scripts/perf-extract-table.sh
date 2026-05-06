@@ -83,7 +83,12 @@ extract_raw() {
     local f="$1"
     if [[ ! -f "$f" ]]; then echo "0 0"; return; fi
     local out
+    # sed strips leading non-JSON; awk strips trailing non-JSON (e.g. the
+    # `==== per-rdev latency_ewma_ns ...` trailer ewma-asymmetric-read appends
+    # after its fio JSON). Without the awk pass, jq parses the JSON, then
+    # errors on the trailer and exits non-zero, and the value is lost.
     out="$(sed -n '/^{/,$p' "$f" 2>/dev/null \
+           | awk '/^==== per-rdev/{exit} 1' \
            | jq -r '
                .jobs[0] as $j |
                (($j.read.iops + $j.write.iops)) as $iops |

@@ -20,7 +20,7 @@ MSADM_WRAPPER="/tmp/msadm"
 # Use HTTPS for meshstor remote so SSH agent state inside sudo doesn't matter.
 MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshstor/linux.git}"
 
-DATE_TAG="$(date -u +%F)"
+DATE_TAG="${DATE_TAG:-$(date -u +%F)}"
 OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
 
 SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
@@ -208,6 +208,17 @@ EOF
     log "msadm wrapper: $MSADM_WRAPPER -> $MDADM_BIN --subsys=ms"
 }
 
+setup_nvmet() {
+    # run-perf-bench-tcp needs /sys/kernel/config/nvmet (created when nvmet
+    # is loaded). On a fresh boot the module isn't loaded; load it eagerly so
+    # the bench doesn't bail with "configfs not mounted at /sys/kernel/config/nvmet".
+    if [[ ! -d /sys/kernel/config/nvmet ]]; then
+        log "modprobe nvmet nvmet-tcp"
+        modprobe nvmet      || die "modprobe nvmet failed"
+        modprobe nvmet-tcp  || die "modprobe nvmet-tcp failed"
+    fi
+}
+
 # Wait until every parent NVMe of a leg partition cools below COOL_THRESH_K
 # (default 75 °C). Monitors the composite + all sensors on each device, takes
 # the max — different SSDs label the controller chip differently, and the
@@ -332,18 +343,30 @@ load_ms_modules() {
 }
 
 # ----- summary parsers (fio JSON output) -----
+#
+# Some suites (e.g. ewma-asymmetric-read) append diagnostic text after the
+# fio JSON object — passing the whole file to jq causes a parse error on
+# the trailer and jq exits non-zero, so the values get lost. Strip the
+# trailer before piping to jq.
+
+run_log_json() {
+    awk '/^==== per-rdev/{exit} {print}' "$1"
+}
 
 # Returns total IOPS (read+write — only one is non-zero per suite).
 extract_iops_json() {
-    jq -r '[.jobs[0].read.iops, .jobs[0].write.iops] | add | floor' "$1" 2>/dev/null || echo "-"
+    run_log_json "$1" \
+        | jq -r '[.jobs[0].read.iops, .jobs[0].write.iops] | add | floor' 2>/dev/null \
+        || echo "-"
 }
 
 # Returns p99 clat in microseconds (read+write — only one is non-zero per suite).
 extract_lat_p99_us_json() {
     local p99_ns
-    p99_ns="$(jq -r '[.jobs[0].read.clat_ns.percentile."99.000000" // 0,
-                     .jobs[0].write.clat_ns.percentile."99.000000" // 0] | add' \
-                "$1" 2>/dev/null)" || { echo "-"; return; }
+    p99_ns="$(run_log_json "$1" \
+        | jq -r '[.jobs[0].read.clat_ns.percentile."99.000000" // 0,
+                  .jobs[0].write.clat_ns.percentile."99.000000" // 0] | add' \
+        2>/dev/null)" || { echo "-"; return; }
     if [[ -z "$p99_ns" || "$p99_ns" == "0" || "$p99_ns" == "null" ]]; then
         echo "-"
         return
@@ -522,6 +545,7 @@ require_tools
 require_partitions
 require_suites
 setup_msadm_wrapper
+setup_nvmet
 
 mkdir -p "$OUT_BASE"
 log "compare: parts=$PART_LOCAL+$PART_REMOTE variants=(${SELECTED_VARIANTS[*]})"
