@@ -285,14 +285,25 @@ unload_ms_modules() {
 
 dkms_remove_safe() {
     local pkg="$1"
-    if dkms status | grep -q "^$pkg,"; then
+    # dkms status formats:
+    #   installed:  meshstor-ms/0.1.0-baseline, 6.8.0-111-generic, x86_64: installed
+    #   added only: meshstor-ms/0.1.0-baseline: added
+    # Match either by accepting `,` or `:` after the pkg name.
+    if dkms status | grep -qE "^$pkg[,:]"; then
         log "dkms remove $pkg"
         dkms remove "$pkg" --all >/dev/null 2>&1 || warn "dkms remove $pkg returned non-zero"
     fi
 }
 
 remove_existing_pkg() {
-    SYSTEM_DKMS_VER="$(dkms status | awk -F'[/,]' '/^meshstor-ms\//{gsub(/ /,"",$2); print $2; exit}')"
+    # Split on /, , and : so the version parses cleanly from both `installed` (",")
+    # and `added` (":") output forms.
+    #
+    # Don't use `exit` in awk: with `set -o pipefail`, awk closing stdin on
+    # first match causes `dkms status` to die with SIGPIPE, the pipeline
+    # returns 141, and `set -e` then aborts the whole script before
+    # remove_existing_pkg even finishes. Consume all input and emit at END.
+    SYSTEM_DKMS_VER="$(dkms status | awk -F'[/,:]' '/^meshstor-ms\// && !v{gsub(/ /,"",$2); v=$2} END{print v}')"
     if [[ -n "$SYSTEM_DKMS_VER" ]]; then
         log "saving system meshstor-ms version: $SYSTEM_DKMS_VER (will restore at end)"
         unload_ms_modules
@@ -304,6 +315,9 @@ remove_existing_pkg() {
 
 install_variant() {
     local label="$1" ver="$2" tarball="$3"
+    # Clear any stale entry for this slot — a prior failed run may have left
+    # the version in `added` state, which makes ldtarball below refuse.
+    dkms_remove_safe "meshstor-ms/$ver"
     log "dkms ldtarball $tarball"
     dkms ldtarball "$tarball" >/dev/null
     log "dkms install meshstor-ms/$ver"
