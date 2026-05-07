@@ -20,7 +20,7 @@ MSADM_WRAPPER="/tmp/msadm"
 # Use HTTPS for meshstor remote so SSH agent state inside sudo doesn't matter.
 MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshstor/linux.git}"
 
-DATE_TAG="${DATE_TAG:-$(date -u +%F)}"
+DATE_TAG="${DATE_TAG:-$(date -u +%s)}"
 OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
 
 SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
