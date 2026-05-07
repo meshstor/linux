@@ -24,17 +24,37 @@ DATE_TAG="${DATE_TAG:-$(date -u +%F)}"
 OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
 
 SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
-# Default suite set. ewma-asymmetric-read is the right test for the
-# latency-ewma branch — qd=8 single-thread random read so the read-balance
-# choice between legs determines per-IO latency. The four SNIA suites at
-# qd=64 saturate both legs and would hide EWMA's signal on their own.
+# Default suite set: 4 SNIA corners as a no-regression band, plus 2 kp-*
+# suites that target per-branch claims:
+#
+#   kp-asym-read           latency-ewma headline. 5 ms netem on lo + qd=8
+#                          single-thread randread — the only regime where
+#                          read-balance choice dominates per-IO latency.
+#                          Symmetric-leg SNIA suites show 0% gain by design.
+#   kp-hot-region-write    llbitmap-fastpath headline. 4 KiB randwrite into
+#                          a pre-seeded 64 MiB region — every IO hits the
+#                          single-chunk fast-path (commit 1). SNIA randwrite
+#                          dilutes this signal across the 10% SS noise floor.
+#
+# Branches without a default suite:
+#   per-bucket-arrays — raid10-only (dormant on raid1). Headline is
+#                       resync-overlap, not steady-state. Run separately;
+#                       see ~/DOCS/per-bucket-arrays.md.
+#   takeover          — no-regression-only per design. Steady-state raid1
+#                       paths are unchanged; SNIA band is the broad
+#                       insurance check.
+#
+# Planned but not yet written: kp-hot-region-write-seq256k (multi-chunk
+# fast-path probe — commit 2 of llbitmap-fastpath). See ~/DOCS/seq256k.md.
+#
 # Override the list with the SUITES env var (space-separated suite names).
 DEFAULT_SUITES=(
     snia-randread-iops
     snia-randwrite-iops
     snia-randread-lat
     snia-randwrite-lat
-    ewma-asymmetric-read
+    kp-asym-read
+    kp-hot-region-write
 )
 read -r -a _suite_names <<< "${SUITES:-${DEFAULT_SUITES[*]}}"
 SUITES=()
