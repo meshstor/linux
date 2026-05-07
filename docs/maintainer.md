@@ -432,16 +432,16 @@ Same expected output.
 # 4. raid1 + raid10 array assemble on the RHEL 10 host.
 ssh mykola@192.168.200.32 'sudo truncate -s 256M /tmp/d{0,1,2,3}.img
     for i in 0 1 2 3; do sudo losetup /dev/loop$i /tmp/d$i.img; done
-    sudo /tmp/msadm --create /dev/ms0 --level=raid1 --raid-devices=2 \
+    sudo build/msadm --create /dev/ms0 --level=raid1 --raid-devices=2 \
         --metadata=1.2 --bitmap=internal --run /dev/loop0 /dev/loop1
     sudo dd if=/dev/urandom of=/dev/ms0 bs=1M count=64 oflag=direct 2>&1 | tail -1
-    sudo /tmp/msadm --stop /dev/ms0
-    sudo /tmp/msadm --zero-superblock /dev/loop0 /dev/loop1
-    sudo /tmp/msadm --create /dev/ms0 --level=raid10 --raid-devices=4 \
+    sudo build/msadm --stop /dev/ms0
+    sudo build/msadm --zero-superblock /dev/loop0 /dev/loop1
+    sudo build/msadm --create /dev/ms0 --level=raid10 --raid-devices=4 \
         --metadata=1.2 --bitmap=internal --run \
         /dev/loop0 /dev/loop1 /dev/loop2 /dev/loop3
     sudo dd if=/dev/urandom of=/dev/ms0 bs=1M count=64 oflag=direct 2>&1 | tail -1
-    sudo /tmp/msadm --stop /dev/ms0
+    sudo build/msadm --stop /dev/ms0
     sudo losetup -D
     sudo rm -f /tmp/d*.img'
 ```
