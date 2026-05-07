@@ -12,8 +12,8 @@
 set -euo pipefail
 
 VER="${1:?usage: $0 <version> [<staging_dir>]}"
-STAGE="${2:-/tmp/debdirect}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+STAGE="${2:-$REPO_ROOT/build/debdirect}"
 
 if ! command -v dpkg-deb >/dev/null 2>&1; then
     echo "ERROR: dpkg-deb not found." >&2
