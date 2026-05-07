@@ -256,7 +256,7 @@ sudo sgdisk \
 sudo partprobe /dev/nvme0n1
 
 # 2. Install the meshstor-ms-dkms package (per docs/install.md)
-#    and an ms-aware mdadm fork at /tmp/msadm.
+#    and an ms-aware mdadm fork at build/msadm.
 
 # 3. Run the bench.
 sudo bash dkms/scripts/run-perf-bench.sh
