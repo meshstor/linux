@@ -424,6 +424,88 @@ cache_sweep_tmp() {
     find "$root" -name '.tmp.*' -mtime +1 -delete 2>/dev/null || true
 }
 
+# Return (via stdout) an absolute tarball path ready for `dkms ldtarball`,
+# either from cache (hit) or by running rebuild-main + build-tarball (miss).
+# Args: $1=label  $2=out_dir  $3=rebuild_log path  $4=build_log path
+# On internal build failure: writes "$out_dir/status" with the failure code
+# (REBUILD_FAILED / BUILD_FAILED) and returns 1; caller should `return 0`.
+obtain_tarball() {
+    local label="$1" out_dir="$2" rebuild_log="$3" build_log="$4"
+    local args="${VARIANT_ARGS[$label]}"
+    local ver="${VARIANT_VER[$label]}"
+    local fresh_tarball="$REBUILT_TREE/build/meshstor-ms-$ver.dkms.tar.gz"
+
+    local key="" key12="" cache_dir="" cache_tar=""
+    if (( NO_CACHE == 0 )); then
+        key="$(cache_key_for "$label")"
+        key12="${key:0:12}"
+        cache_dir="$REPO_ROOT/build/cache/$key12"
+        cache_tar="$cache_dir/meshstor-ms-$ver.dkms.tar.gz"
+        if [[ -f "$cache_tar" ]]; then
+            log "CACHE HIT: $cache_tar (key=$key12)"
+            echo "$cache_tar"
+            return 0
+        fi
+        log "cache: miss for $label (key=$key12); rebuilding"
+    fi
+
+    # Cache miss (or --no-cache): rebuild + build. Block matches the original
+    # inline implementation verbatim so failure paths are byte-identical to
+    # the pre-cache behavior.
+    log "rebuild-main $args -> $REBUILT_TREE"
+    local rebuild_env=(
+        MESHSTOR_URL="$MESHSTOR_URL_FOR_REBUILD"
+        GIT_CONFIG_COUNT=1
+        GIT_CONFIG_KEY_0=commit.gpgsign
+        GIT_CONFIG_VALUE_0=false
+    )
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        if ! sudo -u "$SUDO_USER" env "${rebuild_env[@]}" \
+                "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
+            warn "rebuild-main failed for $label (see $rebuild_log)"
+            echo "REBUILD_FAILED" > "$out_dir/status"
+            return 1
+        fi
+    else
+        if ! env "${rebuild_env[@]}" "$REBUILD_MAIN" --no-fetch $args > "$rebuild_log" 2>&1; then
+            warn "rebuild-main failed for $label (see $rebuild_log)"
+            echo "REBUILD_FAILED" > "$out_dir/status"
+            return 1
+        fi
+    fi
+
+    log "build-tarball $ver"
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        if ! ( cd "$REBUILT_TREE" && sudo -u "$SUDO_USER" "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
+            warn "build-tarball failed (see $build_log)"
+            echo "BUILD_FAILED" > "$out_dir/status"
+            return 1
+        fi
+    else
+        if ! ( cd "$REBUILT_TREE" && "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
+            warn "build-tarball failed (see $build_log)"
+            echo "BUILD_FAILED" > "$out_dir/status"
+            return 1
+        fi
+    fi
+    if [[ ! -f "$fresh_tarball" ]]; then
+        warn "tarball not found: $fresh_tarball"
+        echo "BUILD_FAILED" > "$out_dir/status"
+        return 1
+    fi
+
+    # Populate cache (best-effort). On store failure, fall back to fresh path.
+    if (( NO_CACHE == 0 )); then
+        if cache_store "$cache_dir" "$cache_tar" "$fresh_tarball" "$label" "$ver" "$key"; then
+            echo "$cache_tar"
+            return 0
+        fi
+        warn "cache: failed to store $cache_tar; falling back to fresh path"
+    fi
+    echo "$fresh_tarball"
+    return 0
+}
+
 unload_ms_modules() {
     if [[ -e /proc/msstat ]]; then
         for dev in /dev/ms*; do
