@@ -91,14 +91,21 @@ extract_raw() {
     local f="$1"
     if [[ ! -f "$f" ]]; then echo "0 0 0"; return; fi
     local out
-    # sed strips leading non-JSON; awk strips trailing non-JSON (e.g. the
-    # `==== per-rdev latency_ewma_ns ...` trailer ewma-asymmetric-read appends
-    # after its fio JSON). Without the awk pass, jq parses the JSON, then
-    # errors on the trailer and exits non-zero, and the value is lost.
+    # sed strips leading non-JSON; awk strips the per-rdev trailer
+    # (ewma-asymmetric-read appends `==== per-rdev latency_ewma_ns ...`
+    # after its fio JSON, which would crash jq otherwise). grep strips
+    # `[run] ...` runner echoes interleaved between back-to-back fio
+    # JSON blobs (e.g., snia-randwrite-lat does WDPC then measurement,
+    # producing two JSON objects with a `[run] measurement: ...` line
+    # in between). Without that strip, jq parses the first object then
+    # chokes on the `[run]` line. jq -s slurps the resulting stream
+    # into an array and `.[-1]` selects the final measurement object,
+    # discarding any preconditioning runs.
     out="$(sed -n '/^{/,$p' "$f" 2>/dev/null \
            | awk '/^==== per-rdev/{exit} 1' \
-           | jq -r '
-               .jobs[0] as $j |
+           | grep -v '^\[' \
+           | jq -s -r '
+               .[-1].jobs[0] as $j |
                (($j.read.iops + $j.write.iops)) as $iops |
                ((($j.read.clat_ns.mean // 0)
                + ($j.write.clat_ns.mean // 0)) / 1000) as $mean |
