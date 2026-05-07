@@ -6,12 +6,12 @@
 # 4. Run rpmbuild -bb.
 #
 # Usage: dkms/scripts/build-rpm.sh <version> [<rpmbuild_topdir>]
-# Default rpmbuild topdir: /tmp/rpmbuild
+# Default rpmbuild topdir: build/rpmbuild
 set -euo pipefail
 
 VER="${1:?usage: $0 <version> [<rpmbuild_topdir>]}"
-TOPDIR="${2:-/tmp/rpmbuild}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+TOPDIR="${2:-$REPO_ROOT/build/rpmbuild}"
 
 cd "$REPO_ROOT"
 
