@@ -52,7 +52,7 @@ test -f /lib/modules/$(uname -r)/build/include/uapi/linux/raid/md_p.h \
 
 ```bash
 # mdadm fork (the --subsys=ms aware mdadm; perf-feature-compare wraps
-# it as /tmp/msadm at run-time)
+# it as build/msadm at run-time)
 [ -d ~/mdadm ] || git clone git@github.com:meshstor/mdadm ~/mdadm
 ```
 
@@ -258,7 +258,7 @@ some future upstream:
 ```bash
 # See what the patch expects vs what's in the rebuilt tree
 diff -u ~/linux-meshstor/dkms/patches/0004-*.patch <(echo)
-sed -n '316,340p' ~/linux-meshstor-rebuilt/drivers/md/md.c
+sed -n '316,340p' build/linux-meshstor-rebuilt/drivers/md/md.c
 ```
 
 ### `nvme connect: invalid arguments/configuration`
@@ -287,7 +287,7 @@ A prior rebuild-main died mid-cycle and didn't write its sentinel.
 Clean it manually:
 
 ```bash
-sudo rm -rf ~/linux-meshstor-rebuilt
+sudo rm -rf build/linux-meshstor-rebuilt
 ```
 
 ### Suite output shows `iops=- p99_us=-` in SUMMARY.md but raw run.log has data
@@ -308,7 +308,7 @@ sudo modprobe -r raid1_ms raid10_ms ms_mod
 lsmod | head
 ls /dev/ms*
 # Stop any leftover ms array:
-sudo /tmp/msadm --stop /dev/ms0
+sudo build/msadm --stop /dev/ms0
 ```
 
 ---
