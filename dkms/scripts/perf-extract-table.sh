@@ -10,10 +10,14 @@
 # in both cases (occasional slow-leg routes), so mean is the headline.
 #
 # Usage:
-#   dkms/scripts/perf-extract-table.sh <results-base-dir> [variant ...]
+#   dkms/scripts/perf-extract-table.sh [--dot] <results-base-dir> [variant ...]
 #
 # When variant args are omitted, walks every subdir of <results-base-dir>
 # that has a results/ child; baseline (if present) is placed first.
+#
+# --dot replaces any percent-delta cell number whose absolute value is
+# below 1% with "." — visual noise reduction for runs that are within
+# baseline jitter.
 #
 # Robust against fio run.log files that have leading non-JSON lines
 # (e.g., "open path: No such file or directory" from drop_caches plumbing
@@ -21,8 +25,19 @@
 # first '{' before passing to jq.
 set -euo pipefail
 
+DOT=0
+_args=()
+for _a in "$@"; do
+    case "$_a" in
+        --dot) DOT=1 ;;
+        *) _args+=("$_a") ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+unset _args _a
+
 if (($# < 1)) || [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '2,12p' "$0" | sed 's/^# \?//'
+    sed -n '2,20p' "$0" | sed 's/^# \?//'
     exit 2
 fi
 
@@ -139,7 +154,9 @@ fmt_lat_us() {
     }'
 }
 fmt_pct() {
-    awk -v v="$1" 'BEGIN {
+    awk -v v="$1" -v dot="$DOT" 'BEGIN {
+        av = (v < 0) ? -v : v
+        if (dot == "1" && av < 1) { printf "."; exit }
         sign = (v >= 0) ? "+" : ""
         s = sprintf("%s%.2f", sign, v)
         sub(/\.?0+$/, "", s)
