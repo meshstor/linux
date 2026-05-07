@@ -3,10 +3,11 @@
 # Measures raid1 + raid10 IOPS at 4k randread/randwrite + llbitmap effect.
 #
 # Usage: bash ms-perf.sh
-# Requires: /dev/nvme0n1p4..p8 partitioned, /tmp/msadm, kernel mdadm, fio.
+# Requires: /dev/nvme0n1p4..p8 partitioned, build/msadm, kernel mdadm, fio.
 
 set -e
 
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 KVER=$(uname -r)
 DISTRO=$(awk -F'"' '/^PRETTY_NAME/{print $2}' /etc/os-release)
 PARTS=(/dev/nvme0n1p4 /dev/nvme0n1p5 /dev/nvme0n1p6 /dev/nvme0n1p7)
@@ -16,9 +17,9 @@ RAMP_S=5      # ramp-up
 SIZE=8G       # per-job working set
 
 cleanup() {
-    sudo /tmp/msadm --stop /dev/ms0 2>/dev/null || true
+    sudo "$REPO_ROOT/build/msadm" --stop /dev/ms0 2>/dev/null || true
     sudo mdadm --stop /dev/md0 2>/dev/null || true
-    sudo /tmp/msadm --zero-superblock "${PARTS[@]}" 2>/dev/null || true
+    sudo "$REPO_ROOT/build/msadm" --zero-superblock "${PARTS[@]}" 2>/dev/null || true
     sudo mdadm --zero-superblock "${PARTS[@]}" 2>/dev/null || true
     sleep 1
 }
@@ -59,7 +60,7 @@ echo -n "  randwrite: "; fio_run /dev/md0 randwrite r1-md-wr
 cleanup
 
 echo "=== 1b. raid1 / ms / internal bitmap ==="
-sudo /tmp/msadm --create /dev/ms0 --level=raid1 --raid-devices=2 \
+sudo "$REPO_ROOT/build/msadm" --create /dev/ms0 --level=raid1 --raid-devices=2 \
     --bitmap=internal --metadata=1.2 --run --assume-clean $P0 $P1 >/dev/null 2>&1
 sleep 2
 drop_caches
@@ -69,7 +70,7 @@ echo -n "  randwrite: "; fio_run /dev/ms0 randwrite r1-ms-wr
 cleanup
 
 echo "=== 1c. raid1 / ms / llbitmap ==="
-sudo /tmp/msadm --create /dev/ms0 --level=raid1 --raid-devices=2 \
+sudo "$REPO_ROOT/build/msadm" --create /dev/ms0 --level=raid1 --raid-devices=2 \
     --bitmap=lockless --metadata=1.2 --run --assume-clean $P0 $P1 >/dev/null 2>&1
 sleep 2
 drop_caches
@@ -92,7 +93,7 @@ echo -n "  randwrite: "; fio_run /dev/md0 randwrite r10-md-wr
 cleanup
 
 echo "=== 2b. raid10 / ms / internal bitmap ==="
-sudo /tmp/msadm --create /dev/ms0 --level=raid10 --raid-devices=4 \
+sudo "$REPO_ROOT/build/msadm" --create /dev/ms0 --level=raid10 --raid-devices=4 \
     --bitmap=internal --metadata=1.2 --run --assume-clean $P0 $P1 $P2 $P3 >/dev/null 2>&1
 sleep 2
 drop_caches
@@ -102,7 +103,7 @@ echo -n "  randwrite: "; fio_run /dev/ms0 randwrite r10-ms-wr
 cleanup
 
 echo "=== 2c. raid10 / ms / llbitmap ==="
-sudo /tmp/msadm --create /dev/ms0 --level=raid10 --raid-devices=4 \
+sudo "$REPO_ROOT/build/msadm" --create /dev/ms0 --level=raid10 --raid-devices=4 \
     --bitmap=lockless --metadata=1.2 --run --assume-clean $P0 $P1 $P2 $P3 >/dev/null 2>&1
 sleep 2
 drop_caches
@@ -126,7 +127,7 @@ sudo fio --name=r1-md-st-wr --filename=/dev/md0 --direct=1 --ioengine=libaio \
 cleanup
 
 echo "=== 3b. raid1 single-thread / ms internal ==="
-sudo /tmp/msadm --create /dev/ms0 --level=raid1 --raid-devices=2 \
+sudo "$REPO_ROOT/build/msadm" --create /dev/ms0 --level=raid1 --raid-devices=2 \
     --bitmap=internal --metadata=1.2 --run --assume-clean $P0 $P1 >/dev/null 2>&1
 sleep 2
 drop_caches
@@ -137,7 +138,7 @@ sudo fio --name=r1-ms-st-wr --filename=/dev/ms0 --direct=1 --ioengine=libaio \
 cleanup
 
 echo "=== 3c. raid1 single-thread / ms llbitmap ==="
-sudo /tmp/msadm --create /dev/ms0 --level=raid1 --raid-devices=2 \
+sudo "$REPO_ROOT/build/msadm" --create /dev/ms0 --level=raid1 --raid-devices=2 \
     --bitmap=lockless --metadata=1.2 --run --assume-clean $P0 $P1 >/dev/null 2>&1
 sleep 2
 drop_caches
