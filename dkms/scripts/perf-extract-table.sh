@@ -156,7 +156,7 @@ fmt_lat_us() {
 fmt_pct() {
     awk -v v="$1" -v dot="$DOT" 'BEGIN {
         av = (v < 0) ? -v : v
-        if (dot == "1" && av < 1) { printf "."; exit }
+        if (dot == "1" && av < 1.6) { printf "."; exit }
         sign = (v >= 0) ? "+" : ""
         s = sprintf("%s%.2f", sign, v)
         sub(/\.?0+$/, "", s)

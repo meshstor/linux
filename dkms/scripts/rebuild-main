@@ -61,7 +61,7 @@ while (($#)); do
 done
 
 # Resolve OUTPUT_DIR to an absolute path (parent must exist).
-OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_DIR")" && pwd)/$(basename "$OUTPUT_DIR")"
+OUTPUT_DIR="$(realpath -m "$OUTPUT_DIR")"
 
 require_git_version() {
     local have major minor
