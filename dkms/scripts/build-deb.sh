@@ -18,8 +18,8 @@
 set -euo pipefail
 
 VER="${1:?usage: $0 <version> [<staging_dir>]}"
-STAGE="${2:-/tmp/debbuild}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+STAGE="${2:-$REPO_ROOT/build/debbuild}"
 
 if ! command -v dpkg-buildpackage >/dev/null 2>&1; then
     echo "ERROR: dpkg-buildpackage not found. Run on a Debian/Ubuntu host or container." >&2
