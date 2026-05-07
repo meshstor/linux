@@ -15,10 +15,9 @@ UPSTREAM_BRANCH="master"
 MESHSTOR_URL="${MESHSTOR_URL:-git@github.com:meshstor/linux}"
 HARNESS_BRANCH="meshstor-harness"
 FILTER_PATHS=(drivers/md tools/testing/selftests/md)
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/meshstor"
-
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
-DEFAULT_OUTPUT="$(dirname "$REPO_ROOT")/linux-meshstor-rebuilt"
+CACHE_DIR="${MESHSTOR_UPSTREAM_MIRROR_DIR:-$REPO_ROOT/build}"
+DEFAULT_OUTPUT="$REPO_ROOT/build/linux-meshstor-rebuilt"
 
 usage() {
     cat <<EOF
