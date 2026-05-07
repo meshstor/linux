@@ -538,6 +538,36 @@ teardown_nvmet() {
     rmdir "$sub" 2>/dev/null || true
 }
 
+# Best-effort cleanup of any nvmet configfs port still listening on
+# $ADDR:$PORT from a prior bench run that crashed (or was SIGKILL'd)
+# before its EXIT trap ran. Matches by addr_traddr/addr_trsvcid only,
+# so unrelated nvmet exports on the host (different port or address)
+# are left untouched. Idempotent; mirrors teardown_nvmet's order.
+sweep_stale_nvmet_at_addr() {
+    [[ -d "$NVMET_ROOT/ports" ]] || return 0
+    local pdir traddr trsvcid sub_link
+    for pdir in "$NVMET_ROOT/ports"/*; do
+        [[ -d "$pdir" ]] || continue
+        traddr="$( cat "$pdir/addr_traddr"  2>/dev/null || true)"
+        trsvcid="$(cat "$pdir/addr_trsvcid" 2>/dev/null || true)"
+        [[ "$traddr"  == "$ADDR" ]] || continue
+        [[ "$trsvcid" == "$PORT" ]] || continue
+        log "preflight: removing stale nvmet port $(basename "$pdir") at $ADDR:$PORT"
+        for sub_link in "$pdir/subsystems"/*; do
+            [[ -e "$sub_link" || -L "$sub_link" ]] || continue
+            rm -f "$sub_link" 2>/dev/null || true
+        done
+        rmdir "$pdir/subsystems" 2>/dev/null || true
+        # Real configfs auto-cleans attribute files when the port
+        # directory is rmdir'd; the unit-test mock stages them as
+        # regular files which would block rmdir, so explicitly
+        # remove them first. rm -f against real configfs attribute
+        # files fails with EPERM and leaves them to the kernel.
+        rm -f "$pdir"/* 2>/dev/null || true
+        rmdir "$pdir" 2>/dev/null || true
+    done
+}
+
 preflight() {
     if [[ "${PBT_SKIP_ROOT_CHECK:-0}" != "1" ]] && [[ "$(id -u)" -ne 0 ]]; then
         die_pre "must run as root"
@@ -581,6 +611,7 @@ preflight() {
     done
 
     if [[ "${PBT_SKIP_ROOT_CHECK:-0}" != "1" ]]; then
+        sweep_stale_nvmet_at_addr
         if ss -lnt "sport = :$PORT" 2>/dev/null | tail -n +2 | grep -q .; then
             die_pre "port already bound: $ADDR:$PORT"
         fi
