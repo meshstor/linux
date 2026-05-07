@@ -1,12 +1,18 @@
 # meshstor-ms-dkms.spec — DKMS package for the parallel ms_* subsystem
 #
-# Builds a noarch .rpm that drops the source tree into /usr/src/meshstor-ms-@VERSION@/
-# and registers it with DKMS. DKMS handles per-kernel compilation on install
-# and on every kernel update via its dkms_autoinstaller / kmods systemd
-# integration on RHEL/Rocky/Alma.
+# Builds a noarch .rpm that drops the source tree into
+# /usr/src/meshstor-ms-@MODULE_VERSION@/ and registers it with DKMS. DKMS
+# handles per-kernel compilation on install and on every kernel update via
+# its dkms_autoinstaller / kmods systemd integration on RHEL/Rocky/Alma.
+#
+# Version          — RPM Version: tag (forbids '-', so '-' → '~' in build-rpm.sh).
+# module_version   — original upstream/DKMS version with '-' preserved;
+#                    matches the tarball filename, the unpacked directory,
+#                    and the DKMS module version used by `dkms add -v`.
 
-%global pkgname    meshstor-ms
-%global modname    meshstor-ms
+%global pkgname         meshstor-ms
+%global modname         meshstor-ms
+%global module_version  @MODULE_VERSION@
 
 Name:           %{pkgname}-dkms
 Version:        @VERSION@
@@ -15,7 +21,7 @@ Summary:        meshstor parallel md-style raid subsystem (ms_mod, raid1_ms, rai
 
 License:        GPL-2.0-or-later
 URL:            https://example.com/meshstor-ms
-Source0:        %{pkgname}-%{version}.dkms.tar.gz
+Source0:        %{pkgname}-%{module_version}.dkms.tar.gz
 
 BuildArch:      noarch
 Requires:       dkms >= 2.8.0
@@ -39,25 +45,25 @@ the alternate driver. Userspace tooling for ms is customer-supplied
 (ms-aware mdadm fork; not bundled).
 
 %prep
-%setup -q -n %{pkgname}-%{version}
+%setup -q -n %{pkgname}-%{module_version}
 
 %build
 # DKMS handles compilation per-kernel; nothing to do at package-build time.
 
 %install
-mkdir -p %{buildroot}/usr/src/%{pkgname}-%{version}
-cp -a . %{buildroot}/usr/src/%{pkgname}-%{version}/
+mkdir -p %{buildroot}/usr/src/%{pkgname}-%{module_version}
+cp -a . %{buildroot}/usr/src/%{pkgname}-%{module_version}/
 # DKMS picks up the package via /usr/src/<name>-<version>/dkms.conf
 
 %post
-dkms add -m %{pkgname} -v %{version} || :
-dkms build -m %{pkgname} -v %{version} || :
-dkms install -m %{pkgname} -v %{version} || :
+dkms add -m %{pkgname} -v %{module_version} || :
+dkms build -m %{pkgname} -v %{module_version} || :
+dkms install -m %{pkgname} -v %{module_version} || :
 
 %preun
 # Remove DKMS registration before package files are removed.
 if [ "$1" = "0" ]; then
-    dkms remove -m %{pkgname} -v %{version} --all || :
+    dkms remove -m %{pkgname} -v %{module_version} --all || :
 fi
 
 %postun
@@ -65,7 +71,7 @@ fi
 
 %files
 %license COPYING
-/usr/src/%{pkgname}-%{version}/
+/usr/src/%{pkgname}-%{module_version}/
 
 %changelog
 * @CHANGELOG_DATE@ Meshstor <support@example.com> - @VERSION@-1
