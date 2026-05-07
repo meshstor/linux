@@ -58,9 +58,9 @@ but no `raid0_ms.c` ships — RAID0 is out of scope per [compat.md](compat.md#ou
 `rpmbuild -bb`. Output is a `noarch` source-DKMS rpm.
 
 ```bash
-dkms/scripts/build-rpm.sh 0.1.0 /tmp/rpmbuild
+dkms/scripts/build-rpm.sh 0.1.0 build/rpmbuild
 # ...
-# Wrote: /tmp/rpmbuild/RPMS/noarch/meshstor-ms-dkms-0.1.0-1.el10.noarch.rpm
+# Wrote: build/rpmbuild/RPMS/noarch/meshstor-ms-dkms-0.1.0-1.el10.noarch.rpm
 ```
 
 The `dist` tag in the filename (e.g., `.el10`) is purely cosmetic — it
@@ -71,9 +71,9 @@ with the `dist` left unset). For repository hygiene, build per-distro
 rpms by setting `--define "dist .elN"`:
 
 ```bash
-rpmbuild --define "_topdir /tmp/rpmbuild" \
+rpmbuild --define "_topdir build/rpmbuild" \
          --define "dist .el9" \
-         -bb /tmp/rpmbuild/SPECS/meshstor-ms-dkms.spec
+         -bb build/rpmbuild/SPECS/meshstor-ms-dkms.spec
 ```
 
 The spec template lives at
@@ -92,8 +92,8 @@ canonical `dpkg-buildpackage -us -uc -b` flow. Run on a Debian/Ubuntu
 host that has `debhelper`, `dpkg-dev`, and `fakeroot` installed.
 
 ```bash
-dkms/scripts/build-deb.sh 0.1.0 /tmp/debbuild
-# Output: /tmp/debbuild/meshstor-ms-dkms_0.1.0-1_all.deb
+dkms/scripts/build-deb.sh 0.1.0 build/debbuild
+# Output: build/debbuild/meshstor-ms-dkms_0.1.0-1_all.deb
 ```
 
 For CI from a non-Debian build server, run it inside a container:
@@ -116,8 +116,8 @@ build server is RHEL/Rocky/Alma and we don't want a container hop.
 ```bash
 # RHEL host, with EPEL's dpkg installed:
 sudo dnf install -y dpkg
-dkms/scripts/build-deb-direct.sh 0.1.0 /tmp/debdirect
-# Output: /tmp/debdirect/meshstor-ms-dkms_0.1.0-1_all.deb
+dkms/scripts/build-deb-direct.sh 0.1.0 build/debdirect
+# Output: build/debdirect/meshstor-ms-dkms_0.1.0-1_all.deb
 ```
 
 The output is byte-equivalent in structure to the native-built deb;
@@ -296,7 +296,7 @@ KDIR=/path/to/kernel-headers \
 ```
 
 If `build-rpm.sh` fails inside `rpmbuild`, look at the rpmbuild log
-under `/tmp/rpmbuild/BUILD/` and `/tmp/rpmbuild/BUILDROOT/`. The
+under `build/rpmbuild/BUILD/` and `build/rpmbuild/BUILDROOT/`. The
 typical issue is a missing build-time dependency on the build host
 (`rpm-build`, `kernel-headers`).
 
