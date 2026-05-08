@@ -66,6 +66,8 @@ PREFERRED_ORDER=(
     snia-randwrite-lat
     kp-asym-read
     kp-hot-region-write
+    kp-hot-region-largeio-write
+    kp-bucket-contention-write
 )
 SUITES=()
 for s in "${PREFERRED_ORDER[@]}"; do
