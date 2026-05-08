@@ -14,9 +14,9 @@ REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 REBUILD_MAIN="$REPO_ROOT/dkms/scripts/rebuild-main"
 BUILD_TARBALL="$REPO_ROOT/dkms/scripts/build-tarball.sh"
 RUN_PERF="$REPO_ROOT/dkms/scripts/run-perf-bench-tcp.sh"
-REBUILT_TREE="${REBUILT_TREE:-$(dirname "$REPO_ROOT")/linux-meshstor-rebuilt}"
+REBUILT_TREE="${REBUILT_TREE:-$REPO_ROOT/build/linux-meshstor-rebuilt}"
 MDADM_BIN="${MDADM_BIN:-/home/$SUDO_USER/mdadm/mdadm}"
-MSADM_WRAPPER="/tmp/msadm"
+MSADM_WRAPPER="$REPO_ROOT/build/msadm"
 # Use HTTPS for meshstor remote so SSH agent state inside sudo doesn't matter.
 MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshstor/linux.git}"
 
@@ -118,7 +118,7 @@ Flags:
                         (forces a fresh rebuild-main + build-tarball per variant)
 
 Environment overrides:
-  REBUILT_TREE   Path for rebuild-main output (default: ../linux-meshstor-rebuilt)
+  REBUILT_TREE   Path for rebuild-main output (default: build/linux-meshstor-rebuilt)
   MDADM_BIN      Path to mdadm-fork binary (default: /home/$SUDO_USER/mdadm/mdadm)
   SUITES_BASE    csi-perf-test suites directory (default: /home/$SUDO_USER/csi-perf-test/suites)
   SUITES         space-separated suite names override (default: 4 SNIA + all kp-* suites)
@@ -341,7 +341,7 @@ resolve_shas() {
     else
         user_home="$HOME"
     fi
-    local mirror="${XDG_CACHE_HOME:-$user_home/.cache}/meshstor/torvalds-linux.git"
+    local mirror="${MESHSTOR_UPSTREAM_MIRROR_DIR:-$REPO_ROOT/build}/torvalds-linux.git"
     [[ -d "$mirror" ]] \
         || die "upstream bare mirror missing: $mirror (run rebuild-main once to bootstrap)"
     _UPSTREAM_MASTER_SHA="$(git -C "$mirror" rev-parse master 2>/dev/null)" \
