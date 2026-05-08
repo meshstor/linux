@@ -24,28 +24,34 @@ DATE_TAG="${DATE_TAG:-$(date -u +%F)}"
 OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
 
 SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
-# Default suite set: 4 SNIA corners as a no-regression band, plus 2 kp-*
-# suites that target per-branch claims:
+# Default suite set: 4 SNIA corners as a no-regression band, plus every kp-*
+# suite that targets a per-branch claim:
 #
-#   kp-asym-read           latency-ewma headline. 5 ms netem on lo + qd=8
-#                          single-thread randread — the only regime where
-#                          read-balance choice dominates per-IO latency.
-#                          Symmetric-leg SNIA suites show 0% gain by design.
-#   kp-hot-region-write    llbitmap-fastpath headline. 4 KiB randwrite into
-#                          a pre-seeded 64 MiB region — every IO hits the
-#                          single-chunk fast-path (commit 1). SNIA randwrite
-#                          dilutes this signal across the 10% SS noise floor.
+#   kp-asym-read                  latency-ewma headline. 5 ms netem on lo +
+#                                 qd=8 single-thread randread — the only
+#                                 regime where read-balance choice dominates
+#                                 per-IO latency. Symmetric-leg SNIA suites
+#                                 show 0% gain by design.
+#   kp-hot-region-write           llbitmap-fastpath headline (patch 1, single-
+#                                 chunk). 4 KiB randwrite into a pre-seeded
+#                                 64 MiB region — every IO hits the start-write
+#                                 fast-path. SNIA randwrite dilutes this signal
+#                                 across the 10% SS noise floor.
+#   kp-hot-region-largeio-write   llbitmap-fastpath patch 2 probe (multi-chunk
+#                                 per-bit short-circuit). 1 MiB randwrite over
+#                                 8 × 64 MiB pre-dirtied regions; every IO
+#                                 spans 16 bitmap chunks so only the per-bit
+#                                 loop fast-path can fire.
+#   kp-bucket-contention-write    per-bucket-arrays headline (steady-state).
+#                                 16 randwrite sub-jobs each pinned to its own
+#                                 64 MiB region — exercises the seqlock
+#                                 fast-path on raid10. Dormant (flat) on raid1
+#                                 by design; included in defaults so a single
+#                                 raid10 invocation covers it.
 #
-# Branches without a default suite:
-#   per-bucket-arrays — raid10-only (dormant on raid1). Headline is
-#                       resync-overlap, not steady-state. Run separately;
-#                       see ~/DOCS/per-bucket-arrays.md.
-#   takeover          — no-regression-only per design. Steady-state raid1
-#                       paths are unchanged; SNIA band is the broad
-#                       insurance check.
-#
-# Planned but not yet written: kp-hot-region-write-seq256k (multi-chunk
-# fast-path probe — commit 2 of llbitmap-fastpath). See ~/DOCS/seq256k.md.
+# Branches without a kp-* default suite:
+#   takeover  — no-regression-only per design. Steady-state raid1 paths are
+#               unchanged; SNIA band is the broad insurance check.
 #
 # Override the list with the SUITES env var (space-separated suite names).
 DEFAULT_SUITES=(
@@ -55,6 +61,8 @@ DEFAULT_SUITES=(
     snia-randwrite-lat
     kp-asym-read
     kp-hot-region-write
+    kp-hot-region-largeio-write
+    kp-bucket-contention-write
 )
 read -r -a _suite_names <<< "${SUITES:-${DEFAULT_SUITES[*]}}"
 SUITES=()
@@ -113,7 +121,7 @@ Environment overrides:
   REBUILT_TREE   Path for rebuild-main output (default: ../linux-meshstor-rebuilt)
   MDADM_BIN      Path to mdadm-fork binary (default: /home/$SUDO_USER/mdadm/mdadm)
   SUITES_BASE    csi-perf-test suites directory (default: /home/$SUDO_USER/csi-perf-test/suites)
-  SUITES         space-separated suite names override (default: 4 SNIA suites)
+  SUITES         space-separated suite names override (default: 4 SNIA + all kp-* suites)
 
 Output: $OUT_BASE/<variant>/results/...
         $OUT_BASE/SUMMARY.md
