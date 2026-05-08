@@ -69,6 +69,9 @@ run_log() {
 REQUIRED_TOOLS=(mdadm nvme fio lsblk jq udevadm awk modprobe ss)
 REQUIRED_MODULES=(nvmet nvmet-tcp nvme-tcp ms-mod)
 
+# Locate the repo for build-dir paths used below.
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+
 die_pre() { echo "preflight: $*" >&2; exit "$EXIT_PREFLIGHT"; }
 
 resolve_msadm() {
@@ -76,8 +79,8 @@ resolve_msadm() {
         [[ -x "$MSADM" ]] || return 1
         return 0
     fi
-    if [[ -x /tmp/msadm ]]; then
-        MSADM=/tmp/msadm
+    if [[ -x "$REPO_ROOT/build/msadm" ]]; then
+        MSADM="$REPO_ROOT/build/msadm"
         return 0
     fi
     if command -v msadm >/dev/null 2>&1; then
@@ -546,7 +549,7 @@ preflight() {
     done
 
     if ! resolve_msadm; then
-        die_pre "msadm not found (tried --msadm, /tmp/msadm, PATH)"
+        die_pre "msadm not found (tried --msadm, \$REPO_ROOT/build/msadm, PATH)"
     fi
 
     local m
@@ -690,7 +693,7 @@ Flags:
   --out-dir=PATH        results root (default: ./results/<UTC>-<host>-<kver>)
   --port=N              nvmet tcp port (default: 4420)
   --addr=IP             nvmet tcp listen addr (default: 127.0.0.1)
-  --msadm=PATH          msadm binary (default: /tmp/msadm if exists, else PATH)
+  --msadm=PATH          msadm binary (default: build/msadm if exists, else PATH)
   --fail-fast           stop after first failing suite (default: continue)
   --keep                skip teardown on success (debugging only)
   -h, --help            this message
