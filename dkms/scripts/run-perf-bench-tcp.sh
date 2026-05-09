@@ -245,13 +245,53 @@ msraid_verify() {
     fi
 }
 
+# is_whole_disk_with_gpt PATH -> exit 0 if the path is a whole-disk
+# block device (no `pN` partition suffix) AND has a recognised
+# partition table (GPT or DOS). Used by safe_zero_superblock as the
+# guard against destroying primary GPT headers on 4 KiB-LBS NVMe —
+# see docs/superpowers/specs/2026-05-09-llbitmap-gpt-corruption-analysis.md.
+is_whole_disk_with_gpt() {
+    local path="$1"
+    [[ -b "$path" ]] || return 1
+    case "$path" in
+        */nvme[0-9]*n[0-9]*p[0-9]*) return 1 ;;   # /dev/nvmeXnYpZ — partition
+        */loop[0-9]*p[0-9]*)        return 1 ;;
+        */sd[a-z]*[0-9]*)           return 1 ;;
+        */vd[a-z]*[0-9]*)           return 1 ;;
+        */hd[a-z]*[0-9]*)           return 1 ;;
+    esac
+    # Reaching here = whole-disk node. Detect a partition table.
+    local pttype
+    pttype="$(blkid -o value -s PTTYPE "$path" 2>/dev/null)"
+    [[ -n "$pttype" ]]
+}
+
+# safe_zero_superblock PATH -> run msadm --zero-superblock unless the
+# path is a whole-disk node with a partition table on it. In that
+# case, skip with a loud warning. This prevents the failure mode
+# documented in
+#   docs/superpowers/specs/2026-05-09-llbitmap-gpt-corruption-analysis.md
+# where mdadm zeros 4 KiB at byte 4096 of a 4 KiB-LBS disk = the
+# primary GPT header.
+safe_zero_superblock() {
+    local path="$1"
+    [[ -n "$path" ]] || return 0
+    # audit-ignore: H5 — the warning string mentions $path; not a destructive call
+    if is_whole_disk_with_gpt "$path"; then
+        echo "warning: refusing to --zero-superblock $path: whole-disk node has a partition table" >&2
+        echo "warning: pass a partition node (e.g. ${path}p1) instead, or wipefs the disk first" >&2
+        return 0
+    fi
+    # audit-ignore: H5 — guarded above by is_whole_disk_with_gpt
+    "$MSADM" --zero-superblock "$path" >/dev/null 2>&1 || true
+}
+
 msraid_teardown() {
     [[ "$MSRAID_ASSEMBLED" -eq 1 ]] || return 0
     "$MSADM" --stop "$MS_DEV" >/dev/null 2>&1 || true
     local m
     for m in "${LOCALS[@]}" "${IMPORTEDS[@]}"; do
-        [[ -n "$m" ]] || continue
-        "$MSADM" --zero-superblock "$m" >/dev/null 2>&1 || true
+        safe_zero_superblock "$m"
     done
 }
 
@@ -674,6 +714,18 @@ parse_args() {
         die "--local count (${#LOCALS[@]}) must equal --remote count (${#REMOTES[@]})"
     fi
     RAID_DEVICES=$(( ${#LOCALS[@]} + ${#REMOTES[@]} ))
+
+    # Refuse --local= values that point at a whole-disk node with a
+    # partition table on it. Such paths cause `mdadm --zero-superblock`
+    # to wipe byte 4096 of the disk = primary GPT header on 4 KiB-LBS
+    # NVMe. See:
+    #   docs/superpowers/specs/2026-05-09-llbitmap-gpt-corruption-analysis.md
+    local l
+    for l in "${LOCALS[@]}"; do
+        if is_whole_disk_with_gpt "$l"; then
+            die "refusing --local=$l: whole-disk node has a partition table; pass a partition node (e.g. ${l}p1) instead"
+        fi
+    done
 
     case "$LEVEL" in
         raid1)
