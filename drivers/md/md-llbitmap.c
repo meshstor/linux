@@ -414,6 +414,7 @@ static char state_machine[BitStateCount][BitmapActionCount] = {
 };
 
 static void __llbitmap_flush(struct mddev *mddev);
+static void llbitmap_update_sb(void *data);
 
 static enum llbitmap_state llbitmap_read(struct llbitmap *llbitmap, loff_t pos)
 {
@@ -926,6 +927,16 @@ static int llbitmap_init(struct llbitmap *llbitmap)
 
 	llbitmap_state_machine(llbitmap, 0, llbitmap->chunks - 1,
 			       BitmapActionInit);
+
+	/*
+	 * Persist BITMAP_FIRST_USE clear (and the llbitmap-chosen
+	 * chunksize, daemon_sleep, sectors_reserved) before the bulk
+	 * page flush. Without this, a crash between RUN_ARRAY and the
+	 * first md_update_sb leaves FIRST_USE set on disk and the next
+	 * assemble re-runs llbitmap_init, clobbering sync state.
+	 */
+	llbitmap_update_sb(llbitmap);
+
 	/* flush initial llbitmap to disk */
 	__llbitmap_flush(mddev);
 
