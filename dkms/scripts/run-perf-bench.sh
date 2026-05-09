@@ -16,6 +16,22 @@ RUN_S=20      # seconds per fio run
 RAMP_S=5      # ramp-up
 SIZE=8G       # per-job working set
 
+# Sanity check: PARTS must be partition nodes, not whole-disk nodes.
+# Running --zero-superblock against a whole-disk node on a 4 KiB-LBS
+# NVMe wipes byte 4096 = primary GPT header. See
+#   docs/superpowers/specs/2026-05-09-llbitmap-gpt-corruption-analysis.md
+for _p in "${PARTS[@]}"; do
+    case "$_p" in
+        */nvme[0-9]*n[0-9]*p[0-9]*|*/sd[a-z]*[0-9]*|*/vd[a-z]*[0-9]*|*/loop[0-9]*p[0-9]*) : ;;
+        *)
+            echo "fatal: PARTS contains whole-disk path '$_p'; refusing to run" >&2
+            echo "       Use partition nodes (e.g. /dev/nvme0n1p4)" >&2
+            exit 1
+            ;;
+    esac
+done
+unset _p
+
 cleanup() {
     sudo "$REPO_ROOT/build/msadm" --stop /dev/ms0 2>/dev/null || true
     sudo mdadm --stop /dev/md0 2>/dev/null || true
