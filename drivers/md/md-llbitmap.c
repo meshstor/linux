@@ -985,7 +985,24 @@ static int llbitmap_read_sb(struct llbitmap *llbitmap)
 	}
 
 	if (mddev->bitmap_info.space == 0) {
-		int room = le32_to_cpu(sb->sectors_reserved);
+		u32 room = le32_to_cpu(sb->sectors_reserved);
+
+		/*
+		 * Reject torn-write garbage values for sectors_reserved.
+		 * The reserved bitmap region must fit between sb_start and
+		 * data_offset; an absurd value (e.g. 0xFFFFFFFF from a
+		 * partial sb update) should not be silently accepted as
+		 * the bitmap_info.space — that would let later code address
+		 * sectors well outside the partition. Use a generous upper
+		 * bound (1 GiB worth of 512-byte sectors = 2^21) which is
+		 * far beyond any plausible legitimate value but rejects
+		 * UINT_MAX-class garbage.
+		 */
+		if (room > (1U << 21)) {
+			pr_err("md/llbitmap: %s: sectors_reserved %u implausibly large (torn write?)",
+			       mdname(mddev), room);
+			goto out_put_page;
+		}
 
 		if (room)
 			mddev->bitmap_info.space = room;
@@ -1002,6 +1019,19 @@ static int llbitmap_read_sb(struct llbitmap *llbitmap)
 	if (!is_power_of_2(chunksize)) {
 		pr_err("md/llbitmap: %s: chunksize not a power of 2",
 		       mdname(mddev));
+		goto out_put_page;
+	}
+
+	/*
+	 * Upper-bound chunksize against the array size. A torn write may
+	 * leave a power-of-2 value that's larger than resync_max_sectors;
+	 * accepting it would yield a bitmap with chunks=1 covering the
+	 * entire array — useless and a sign of metadata corruption rather
+	 * than a legitimate configuration.
+	 */
+	if (chunksize > mddev->resync_max_sectors) {
+		pr_err("md/llbitmap: %s: chunksize %lu sectors exceeds array size %llu",
+		       mdname(mddev), chunksize, mddev->resync_max_sectors);
 		goto out_put_page;
 	}
 
