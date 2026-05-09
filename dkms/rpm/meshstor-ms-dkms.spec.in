@@ -69,6 +69,45 @@ fi
 %postun
 # DKMS rebuild on kernel updates is handled automatically; nothing to do here.
 
+%posttrans
+# Self-heal dangling weak-updates symlinks for the three modules this
+# package owns. RHEL's weak-modules mechanism can leave broken symlinks
+# under /usr/lib/modules/<other-kver>/weak-updates/ pointing into a
+# kernel whose extra/ payload has been removed; dracut then fails with
+# "installkernel failed in module kernel-modules-extra" when it walks
+# those broken symlinks. We delete only links matching our three module
+# names that have no resolvable target (-xtype l). Live links (target
+# exists) and broken links owned by other DKMS packages are untouched.
+for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
+    [ -d "$kdir" ] || continue
+    for name in ms_mod raid1_ms raid10_ms; do
+        find "$kdir" -maxdepth 2 -name "${name}.ko*" -xtype l -delete
+    done
+done 2>/dev/null || :
+
+%triggerin -- kernel-core, kernel
+# After a new kernel is installed, weak-modules may have created links
+# under that kernel's weak-updates/ that are already broken (target
+# kernel's extra/ payload was removed in the same transaction). Prune
+# them. See the same comment block in %posttrans for full rationale.
+for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
+    [ -d "$kdir" ] || continue
+    for name in ms_mod raid1_ms raid10_ms; do
+        find "$kdir" -maxdepth 2 -name "${name}.ko*" -xtype l -delete
+    done
+done 2>/dev/null || :
+
+%triggerun -- kernel-core, kernel
+# A kernel is being removed. Symlinks in *other* kernels' weak-updates/
+# that pointed into the kernel being removed are about to become
+# dangling. Prune them across all kernels' weak-updates/ trees.
+for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
+    [ -d "$kdir" ] || continue
+    for name in ms_mod raid1_ms raid10_ms; do
+        find "$kdir" -maxdepth 2 -name "${name}.ko*" -xtype l -delete
+    done
+done 2>/dev/null || :
+
 %files
 %license COPYING
 /usr/src/%{pkgname}-%{module_version}/
