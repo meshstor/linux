@@ -6,4 +6,4 @@ Out-of-tree DKMS package providing a parallel `ms_*` MD subsystem
 For installation, operation, architecture, and maintenance docs see
 [../docs/index.md](../docs/index.md).
 
-Build the tarball: `dkms/scripts/build-tarball.sh <version>`.
+Build the tarball: `bin/build-tarball <version>`.

@@ -18,7 +18,7 @@ distinguishes "DKMS called us" from "kbuild recursed back into us".
 ## RHEL 10.1 — full install/load/uninstall round trip
 
 ```bash
-$ dkms/scripts/build-rpm.sh 0.1.0 /tmp/rpmbuild
+$ bin/build-rpm 0.1.0 /tmp/rpmbuild
 Built: build/meshstor-ms-0.1.0.dkms.tar.gz
 RPMS/noarch/meshstor-ms-dkms-0.1.0-1.el10.noarch.rpm  (155 KB)
 
@@ -57,13 +57,13 @@ ls: cannot access '/lib/modules/.../extra/': No such file or directory
 
 DKMS auto-signs with its self-generated MOK key. Customers using Secure Boot
 enroll that MOK via `mokutil --import /var/lib/dkms/mok.pub` (one-time per host)
-or use `dkms/scripts/meshstor-mok-enroll` to handle the flow.
+or use `bin/mok-enroll` to handle the flow.
 
 ## Ubuntu .deb build
 
 `.deb` packages are normally built with `dpkg-buildpackage` on a Debian/Ubuntu
-host. To support cross-build from a RHEL host (CI scenarios), `dkms/scripts/
-build-deb-direct.sh` uses `dpkg-deb` directly — bypassing `debhelper` and
+host. To support cross-build from a RHEL host (CI scenarios),
+`bin/build-deb-direct` uses `dpkg-deb` directly — bypassing `debhelper` and
 `dpkg-buildpackage`. Tested:
 
 ```bash
@@ -75,7 +75,7 @@ $ for r in *.rpm; do rpm2cpio "$r" | (cd prefix && cpio -idum --quiet); done
 $ # Build the .deb
 $ PATH=/tmp/dpkg-tools/prefix/usr/bin:$PATH \
   LD_LIBRARY_PATH=/tmp/dpkg-tools/prefix/usr/lib64 \
-  dkms/scripts/build-deb-direct.sh 0.1.0
+  bin/build-deb-direct 0.1.0
 Built: /tmp/debdirect/meshstor-ms-dkms_0.1.0-1_all.deb  (144 KB)
 
 $ dpkg-deb --info /tmp/debdirect/meshstor-ms-dkms_0.1.0-1_all.deb
@@ -102,9 +102,9 @@ $ dpkg-deb --info /tmp/debdirect/meshstor-ms-dkms_0.1.0-1_all.deb
    `--enable-virtfs`. None block the deliverable; they're just CI-pipeline
    choices.
 
-2. **Vendor-key signing of pre-built modules.** `dkms/scripts/build-vendor-key.sh`
+2. **Vendor-key signing of pre-built modules.** `bin/build-vendor-key`
    generates the key pair, but we haven't actually signed pre-built `.ko.xz`
-   files with it. To do that, run `build-vendor-key.sh` once on the build
+   files with it. To do that, run `bin/build-vendor-key` once on the build
    server, then for each (kernel × distro) tuple sign the resulting modules
    with `sign-file sha256 vendor.priv vendor.pem module.ko`. CI scripting work.
 
@@ -139,7 +139,7 @@ sudo depmod -a 6.14.0-37-generic
 
 # 2. Build our DKMS modules against the target headers.
 env -u KDIR KDIR=/tmp/kdevs/u24/usr/src/linux-headers-6.14.0-37-generic \
-    bash dkms/scripts/build-tarball.sh 0.1.0
+    bash bin/build-tarball 0.1.0
 # (then make CC=gcc HOSTCC=gcc against the same KDIR if cross-host)
 
 # 3. Boot vng with the target vmlinuz and run the test script.

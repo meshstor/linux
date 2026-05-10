@@ -101,7 +101,7 @@ detection in [`dkms/Makefile.in`](../dkms/Makefile.in)'s
 
 **Pattern C: upstream changed context lines around a pre-rename patch.**
 
-Symptom: `dkms/scripts/build-tarball.sh` fails at step 4 (apply
+Symptom: `bin/build-tarball` fails at step 4 (apply
 patches) with `patch: **** malformed patch at line N` or `Hunk #1
 FAILED`.
 
@@ -109,7 +109,7 @@ Fix: regenerate the patch.
 
 ```bash
 # Regenerate from a fresh tarball-staging tree.
-dkms/scripts/build-tarball.sh 0.1.0  # Will fail at the patch step;
+bin/build-tarball 0.1.0  # Will fail at the patch step;
 # the partial tree is left under build/meshstor-ms-0.1.0/
 
 # Apply the patch manually with --merge (gets you to a usable state):
@@ -124,7 +124,7 @@ diff -u --recursive ../meshstor-ms-0.1.0-original/ . \
 mv ../../dkms/patches/000N-foo.patch.new ../../dkms/patches/000N-foo.patch
 ```
 
-Verify the new patch applies cleanly by re-running `build-tarball.sh`.
+Verify the new patch applies cleanly by re-running `bin/build-tarball`.
 
 ### Verification before merging the rebase
 
@@ -136,7 +136,7 @@ for K in /tmp/kdevs/r10/usr/src/kernels/6.12.0-* \
          /tmp/kdevs/u24/usr/src/linux-headers-6.14.0-* \
          /tmp/kdevs/u26/usr/src/linux-headers-6.17.0-*; do
     echo "=== $K ==="
-    env -u KDIR KDIR=$K dkms/scripts/build-tarball.sh 0.1.0 \
+    env -u KDIR KDIR=$K bin/build-tarball 0.1.0 \
         2>&1 | tail -2
 done
 ```
@@ -232,7 +232,7 @@ patch. Otherwise it's a header shim.
    ```
 
    The patch must use `-p1` paths (i.e., `a/raid1.c`, `b/raid1.c`)
-   matching the tarball-flat layout that `build-tarball.sh` works in.
+   matching the tarball-flat layout that `bin/build-tarball` works in.
 
 3. Bracket version-conditional changes in `#if LINUX_VERSION_CODE`
    blocks, using `KERNEL_VERSION(MAJOR, MINOR, PATCH)`, so the same
@@ -396,7 +396,7 @@ for K in /tmp/kdevs/r10/usr/src/kernels/6.12.0-* \
          /tmp/kdevs/u24/usr/src/linux-headers-6.14.0-* \
          /tmp/kdevs/u26/usr/src/linux-headers-6.17.0-*; do
     echo "=== $K ==="
-    env -u KDIR KDIR=$K dkms/scripts/build-tarball.sh 0.1.0 \
+    env -u KDIR KDIR=$K bin/build-tarball 0.1.0 \
         2>&1 | tail -2
 done
 ```
@@ -405,7 +405,7 @@ Each line must end with `Built: …`.
 
 ```bash
 # 2. Build the rpm, install on RHEL 10 baremetal, verify modprobe.
-dkms/scripts/build-rpm.sh 0.1.0 /tmp/test-release
+bin/build-rpm 0.1.0 /tmp/test-release
 scp /tmp/test-release/RPMS/noarch/meshstor-ms-dkms-0.1.0-*.rpm \
     mykola@192.168.200.32:/tmp/ms.rpm
 ssh mykola@192.168.200.32 'sudo rpm -e meshstor-ms-dkms 2>/dev/null

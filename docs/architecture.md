@@ -45,7 +45,7 @@ The rename pass is the structural mechanism that keeps our subsystem isolated
 from the kernel's. It runs at tarball-assembly time (i.e., once per release),
 not at module-build time, so the customer sees only post-rename source files.
 
-`dkms/scripts/build-tarball.sh:60-89` runs `sed` against every `.c` and `.h`
+`bin/build-tarball:60-89` runs `sed` against every `.c` and `.h`
 file in the assembled tarball, applying rules from `dkms/rename.sed`. The
 script auto-generates a keep-list (lines 67-79) by scanning the running
 kernel's UAPI headers (`<linux/raid/md_p.h>`, `<linux/raid/md_u.h>`,
@@ -92,7 +92,7 @@ Auto-extracted keep entries (regenerated per build from kernel headers):
 - All lowercase `md_*` identifiers from `md_p.h` / `md_u.h` — typically
   struct field names like `md_magic`, `md_minor`.
 
-The auto-extraction (`dkms/scripts/build-tarball.sh:67-79`) means the
+The auto-extraction (`bin/build-tarball:67-79`) means the
 keep-list updates itself when upstream adds new on-disk format constants;
 we don't need to manually track them.
 
@@ -205,6 +205,14 @@ linux-meshstor/                     # kernel-fork repo
 │   ├── Makefile, Kconfig           # upstream's in-tree build files (verbatim)
 │   └── (raid0.c, raid5.*, md-cluster.c — present for upstream rebase
 │        completeness, but NOT shipped via dkms/manifest.txt)
+├── bin/                            # invokable helpers (build / perf / MOK)
+│   ├── build-tarball               # assembles meshstor-ms-X.Y.Z.dkms.tar.gz
+│   ├── build-rpm, build-deb, build-deb-direct
+│   ├── build-vendor-key            # vendor-signing key generation
+│   ├── mok-enroll, detect-secureboot
+│   ├── perf-bench, perf-bench-tcp  # benchmark drivers
+│   ├── perf-compare, perf-extract-table, perf-make-test-partitions
+│   └── rebuild-main                # rebuild feature branches off torvalds master
 ├── dkms/                           # DKMS packaging — ours alone
 │   ├── dkms.conf.in                # template, version-substituted
 │   ├── Makefile.in                 # out-of-tree wrapper template
@@ -217,18 +225,13 @@ linux-meshstor/                     # kernel-fork repo
 │   │   ├── 0001-*.patch            # pre-rename source-level patches
 │   │   └── README.md
 │   ├── debian/                     # .deb packaging
-│   ├── rpm/                        # .rpm spec
-│   └── scripts/
-│       ├── build-tarball.sh        # assembles meshstor-ms-X.Y.Z.dkms.tar.gz
-│       ├── build-rpm.sh, build-deb*.sh
-│       ├── build-vendor-key.sh     # vendor-signing key generation
-│       ├── meshstor-mok-enroll     # MOK enrollment helper
-│       └── meshstor-detect-secureboot
+│   └── rpm/                        # .rpm spec
 ├── docs/                           # this documentation set
 │   ├── index.md, install.md, admin.md, architecture.md (this file),
 │   ├── build.md, maintainer.md, compat.md, performance.md
+│   ├── findings/                   # curated post-mortems and analyses
 │   └── superpowers/                # specs and plans for the dev workflow
-└── notes/                          # engineering journal entries (primary sources)
+└── results/                        # gitignored — perf/test run outputs
 ```
 
 The two source-tree directories serve disjoint roles:
