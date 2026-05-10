@@ -193,12 +193,28 @@ resolve_imported() {
     for i in "${!REMOTES[@]}"; do
         nsid=$(( i + 1 ))
         dev="/dev/${ctl}n${nsid}"
-        if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && [[ ! -b "$dev" ]]; then
-            die_setup "expected block device $dev but not found"
+        if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && ! wait_for_block_device "$dev"; then
+            die_setup "expected block device $dev but not found (waited 10s)"
         fi
         IMPORTEDS+=("$dev")
     done
     log "imported devices: ${IMPORTEDS[*]} (ctl=$ctl, ${#IMPORTEDS[@]} ns)"
+}
+
+# nvme-tcp namespace enumeration is async: nvme connect returns and udevadm
+# settle drains, but the kernel may not yet have probed the namespace and
+# created /dev/nvmeXnY. Poll for up to ~10s.
+wait_for_block_device() {
+    local dev="$1" i=0
+    while (( i < 100 )); do
+        if [[ -b "$dev" ]]; then
+            (( i > 0 )) && log "waited $(( i * 100 ))ms for $dev"
+            return 0
+        fi
+        sleep 0.1
+        (( i++ ))
+    done
+    return 1
 }
 
 disconnect_nvme_client() {
