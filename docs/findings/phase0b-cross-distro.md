@@ -41,7 +41,7 @@ resolves: **API age, not nominal version, is what matters**, and RHEL 9.7's
 effective API age is ~6.10+, while Ubuntu 24.04 GA's is ~6.8.
 
 This is exactly the case the feature-flag detection system was designed
-for. `dkms/scripts/build-tarball.sh` audits the actual headers on each
+for. `bin/build-tarball` audits the actual headers on each
 target and emits `HAVE_*` defines accordingly — `LINUX_VERSION_CODE`
 comparisons would have been wrong on RHEL 9.7 (under-detecting features
 the kernel really has).
@@ -88,7 +88,7 @@ patch series.
 
 ### Round 1: feature-flag-based detection (replaces LINUX_VERSION_CODE gates)
 
-`dkms/scripts/build-tarball.sh` scans the target kernel's headers and
+`bin/build-tarball` scans the target kernel's headers and
 generates `compat/feature_flags.h` with `#define HAVE_<SYMBOL>` for each
 present symbol. `compat.h` gates each shim on `#ifndef HAVE_X`.
 
