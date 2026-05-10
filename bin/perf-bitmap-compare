@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# perf-bitmap-compare — orchestrate a 3-mode bitmap perf comparison
+# (kernel-md-internal, ms-internal, ms-lockless) on the same code base.
+#
+# Spec: docs/superpowers/specs/2026-05-10-perf-bitmap-compare-design.md
+# Plan: docs/superpowers/plans/2026-05-10-perf-bitmap-compare.md
+#
+# Usage: sudo bin/perf-bitmap-compare PART_LOCAL PART_REMOTE [SUITE...]
+set -euo pipefail
+
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+REBUILD_MAIN="$REPO_ROOT/bin/rebuild-main"
+BUILD_TARBALL="$REPO_ROOT/bin/build-tarball"
+RUN_PERF="$REPO_ROOT/bin/perf-bench-tcp"
+EXTRACT_TABLE="$REPO_ROOT/bin/perf-extract-table"
+REBUILT_TREE="${REBUILT_TREE:-$REPO_ROOT/build/linux-meshstor-rebuilt}"
+MDADM_BIN="${MDADM_BIN:-/home/${SUDO_USER:-$USER}/mdadm/mdadm}"
+MSADM_WRAPPER="$REPO_ROOT/build/msadm"
+MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshstor/linux.git}"
+
+DATE_TAG="${DATE_TAG:-$(date -u +%s)}"
+OUT_BASE="$REPO_ROOT/results/perf-bitmap-$DATE_TAG"
+
+# Default suites — same set perf-compare uses.
+SUITES_BASE="${SUITES_BASE:-/home/${SUDO_USER:-$USER}/csi-perf-test/suites}"
+DEFAULT_SUITES=(
+    snia-randread-iops snia-randwrite-iops
+    snia-randread-lat  snia-randwrite-lat
+    kp-asym-read kp-hot-region-write
+    kp-hot-region-largeio-write kp-bucket-contention-write
+)
+
+# ---- mode tables ----
+declare -A MODE_ENGINE=(
+    [kernel-md-internal]=md
+    [ms-internal]=ms
+    [ms-lockless]=ms
+)
+declare -A MODE_BITMAP=(
+    [kernel-md-internal]=internal
+    [ms-internal]=internal
+    [ms-lockless]=lockless
+)
+declare -A MODE_NEEDS_MS=(
+    [kernel-md-internal]=0
+    [ms-internal]=1
+    [ms-lockless]=1
+)
+DEFAULT_MODE_ORDER=(kernel-md-internal ms-internal ms-lockless)
+
+# ---- globals ----
+LEVEL="raid1"
+BRANCH=""
+PORT="7720"
+COOL_THRESH_K="${COOL_THRESH_K:-348}"
+NO_CACHE=0
+LOCALS=()
+REMOTES=()
+SELECTED_MODES=()
+SUITES_POS=()
+SELECTED_VARIANTS=("meshstor")
+VARIANT_LABELS=("meshstor")
+declare -A VARIANT_ARGS=( [meshstor]="" )
+declare -A VARIANT_VER=(  [meshstor]="0.1.0-bitmapcmp" )
+# shellcheck disable=SC2034  # set by remove_existing_pkg, read by restore_system (both in lib)
+SYSTEM_DKMS_VER=""
+
+# Source the shared lib for log/warn/die, cooling, cache, dkms helpers.
+# shellcheck source=perf-compare-lib.sh
+source "$REPO_ROOT/bin/perf-compare-lib.sh"
+
+# ---- pure helpers (testable) ----
+
+parse_modes() {
+    local raw="$1"
+    if [[ -z "$raw" ]]; then
+        SELECTED_MODES=("${DEFAULT_MODE_ORDER[@]}")
+        return 0
+    fi
+    SELECTED_MODES=()
+    local IFS=','
+    local m
+    for m in $raw; do
+        if [[ -z "${MODE_ENGINE[$m]:-}" ]]; then
+            echo "error: unknown mode '$m' (choices: ${!MODE_ENGINE[*]})" >&2
+            return 1
+        fi
+        SELECTED_MODES+=("$m")
+    done
+    return 0
+}
+
+derive_variant_ver() {
+    if [[ -n "${BRANCH:-}" ]]; then
+        VARIANT_VER[meshstor]="0.1.0-bitmapcmp-${BRANCH}"
+    else
+        VARIANT_VER[meshstor]="0.1.0-bitmapcmp"
+    fi
+    VARIANT_ARGS[meshstor]="${BRANCH:-}"
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  sudo $(basename "$0") PART_LOCAL PART_REMOTE [SUITE...]
+  sudo $(basename "$0") --level=raid10 --local=A --local=B \\
+                        --remote=C --remote=D [SUITE...]
+
+Compare bitmap performance across kernel-md-internal, ms-internal, and
+ms-lockless on the same code base. Builds and installs meshstor-ms
+once (or merges \$BRANCH atop meshstor-main), runs each mode, then
+restores the prior system meshstor-ms package.
+
+Flags:
+  --level=raid1|raid10   raid level (default: raid1)
+  --branch=NAME          feature branch to merge atop meshstor-main
+                         (default: empty = pure meshstor-main)
+  --modes=M1,M2,M3       comma-separated mode labels (default: all 3 in
+                         fixed order: kernel-md-internal,ms-internal,ms-lockless)
+  --port=N               nvmet-tcp port (default: 7720)
+  --cool-thresh-k=N      max sensor temp Kelvin before next mode runs
+                         (default: 348 = 75 °C; 0 disables)
+  --no-cache             bypass build/cache/
+
+Defaults:
+  Suites: same 8 as perf-compare (4 SNIA + 4 kp-*).
+  Override via positional args or the SUITES env var.
+
+Output:
+  $OUT_BASE/<mode>/results/<suite>/run.log
+  View with: $EXTRACT_TABLE $OUT_BASE
+EOF
+}
+
+main() {
+    # Filled in by Task 9. Skeleton just shows usage on -h.
+    if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        usage; exit 0
+    fi
+    echo "error: main() not yet implemented (skeleton)" >&2
+    exit 70
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
