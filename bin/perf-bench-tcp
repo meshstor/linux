@@ -69,7 +69,8 @@ run_log() {
 
 # ---- preflight ----
 REQUIRED_TOOLS=(mdadm nvme fio lsblk jq udevadm awk modprobe ss)
-REQUIRED_MODULES=(nvmet nvmet-tcp nvme-tcp ms-mod)
+REQUIRED_MODULES_BASE=(nvmet nvmet-tcp nvme-tcp)
+REQUIRED_MODULES_MS=(ms-mod)
 
 # Locate the repo for build-dir paths used below.
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
@@ -77,6 +78,10 @@ REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 die_pre() { echo "preflight: $*" >&2; exit "$EXIT_PREFLIGHT"; }
 
 resolve_msadm() {
+    if [[ "$ENGINE" == "md" ]]; then
+        # md path uses system mdadm, not msadm wrapper.
+        return 0
+    fi
     if [[ -n "$MSADM" ]]; then
         [[ -x "$MSADM" ]] || return 1
         return 0
@@ -370,12 +375,14 @@ write_manifest() {
     host="$(hostname -s)"
     kver="$(uname -r)"
 
-    local ms_version ms_srcversion msadm_v nvme_v mdadm_v
-    ms_version="$(   safe modinfo ms-mod | awk -F': *' '/^version:/    {print $2; exit}')"
-    ms_srcversion="$(safe modinfo ms-mod | awk -F': *' '/^srcversion:/ {print $2; exit}')"
-    msadm_v="$(      safe "$MSADM" --version | head -1)"
-    nvme_v="$(       safe nvme --version    | head -1)"
-    mdadm_v="$(      safe mdadm --version 2>&1 | head -1)"
+    local ms_version="" ms_srcversion="" msadm_v="" nvme_v mdadm_v
+    if [[ "$ENGINE" == "ms" ]]; then
+        ms_version="$(   safe modinfo ms-mod | awk -F': *' '/^version:/    {print $2; exit}')"
+        ms_srcversion="$(safe modinfo ms-mod | awk -F': *' '/^srcversion:/ {print $2; exit}')"
+        msadm_v="$(      safe "$MSADM" --version | head -1)"
+    fi
+    nvme_v="$( safe nvme  --version       | head -1)"
+    mdadm_v="$(safe mdadm --version 2>&1   | head -1)"
 
     # Build per-leg JSON arrays for partitions and imported devices.
     local part_obj_json p
@@ -408,14 +415,16 @@ write_manifest() {
     local members_json
     members_json="$(printf '%s\n' "${ARRAY_MEMBERS[@]}" | jq -R . | jq -s .)"
 
-    local cmdline ms_params
+    local cmdline ms_params=""
     cmdline="$(safe cat /proc/cmdline | tr -d '\n')"
-    ms_params="$(
-        for p in /sys/module/ms_mod/parameters/*; do
-            [ -e "$p" ] || continue
-            printf '%s=%s\n' "$(basename "$p")" "$(safe cat "$p")"
-        done 2>/dev/null
-    )"
+    if [[ "$ENGINE" == "ms" ]]; then
+        ms_params="$(
+            for p in /sys/module/ms_mod/parameters/*; do
+                [ -e "$p" ] || continue
+                printf '%s=%s\n' "$(basename "$p")" "$(safe cat "$p")"
+            done 2>/dev/null
+        )"
+    fi
 
     jq -n \
         --arg started        "$started" \
@@ -675,8 +684,12 @@ preflight() {
         die_pre "msadm not found (tried --msadm, \$REPO_ROOT/build/msadm, PATH)"
     fi
 
+    local -a required_modules=("${REQUIRED_MODULES_BASE[@]}")
+    if [[ "$ENGINE" == "ms" ]]; then
+        required_modules+=("${REQUIRED_MODULES_MS[@]}")
+    fi
     local m
-    for m in "${REQUIRED_MODULES[@]}"; do
+    for m in "${required_modules[@]}"; do
         if ! modprobe -n "$m" >/dev/null 2>&1; then
             die_pre "kernel module not loadable: $m"
         fi
