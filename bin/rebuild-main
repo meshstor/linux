@@ -5,7 +5,7 @@
 #
 # See docs/superpowers/specs/2026-05-04-rebuild-main-script-design.md
 #
-# Usage: dkms/scripts/rebuild-main [options] [feature ...]
+# Usage: bin/rebuild-main [options] [feature ...]
 set -euo pipefail
 
 UPSTREAM_URL="https://github.com/torvalds/linux.git"

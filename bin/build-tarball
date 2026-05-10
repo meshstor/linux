@@ -8,7 +8,7 @@
 #   5. Rename source filenames (md.c -> ms.c, raid1.c -> raid1_ms.c, etc.)
 #   6. Render templates with version substituted
 #   7. Tar the result
-# Usage: dkms/scripts/build-tarball.sh <version>
+# Usage: bin/build-tarball <version>
 set -euo pipefail
 
 VER="${1:?usage: $0 <version>}"

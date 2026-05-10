@@ -5,15 +5,15 @@
 # Spec: docs/superpowers/specs/2026-05-05-perf-feature-comparison-design.md
 # Plan: docs/superpowers/plans/2026-05-05-perf-feature-comparison.md
 #
-# Usage: sudo dkms/scripts/perf-feature-compare.sh PART_LOCAL PART_REMOTE [VARIANT ...]
+# Usage: sudo bin/perf-compare PART_LOCAL PART_REMOTE [VARIANT ...]
 set -euo pipefail
 
 die() { echo "$*" 1>&2; exit 1; }
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
-REBUILD_MAIN="$REPO_ROOT/dkms/scripts/rebuild-main"
-BUILD_TARBALL="$REPO_ROOT/dkms/scripts/build-tarball.sh"
-RUN_PERF="$REPO_ROOT/dkms/scripts/run-perf-bench-tcp.sh"
+REBUILD_MAIN="$REPO_ROOT/bin/rebuild-main"
+BUILD_TARBALL="$REPO_ROOT/bin/build-tarball"
+RUN_PERF="$REPO_ROOT/bin/perf-bench-tcp"
 REBUILT_TREE="${REBUILT_TREE:-$REPO_ROOT/build/linux-meshstor-rebuilt}"
 MDADM_BIN="${MDADM_BIN:-/home/$SUDO_USER/mdadm/mdadm}"
 MSADM_WRAPPER="$REPO_ROOT/build/msadm"
@@ -21,7 +21,7 @@ MSADM_WRAPPER="$REPO_ROOT/build/msadm"
 MESHSTOR_URL_FOR_REBUILD="${MESHSTOR_URL_FOR_REBUILD:-https://github.com/meshstor/linux.git}"
 
 DATE_TAG="${DATE_TAG:-$(date -u +%s)}"
-OUT_BASE="$REPO_ROOT/notes/perf-rebuild-$DATE_TAG"
+OUT_BASE="$REPO_ROOT/results/perf-$DATE_TAG"
 
 SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
 # Default suite set: 4 SNIA corners as a no-regression band, plus every kp-*
@@ -647,7 +647,7 @@ write_summary() {
         echo ""
         echo "Host: $(hostname)  Kernel: $(uname -r)"
         echo "Level: $LEVEL  Local legs: ${LOCALS[*]:-(none)}  TCP legs: ${REMOTES[*]:-(none)}"
-        echo "Bench: dkms/scripts/run-perf-bench-tcp.sh --bitmap=lockless --level=$LEVEL"
+        echo "Bench: bin/perf-bench-tcp --bitmap=lockless --level=$LEVEL"
         echo ""
         local suite_dir suite_name label out status run_log iops lat
         for suite_dir in "${SUITES[@]}"; do

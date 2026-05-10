@@ -11,10 +11,10 @@
 #
 #   podman run --rm -it -v $(pwd):/work ubuntu:24.04 bash -c '
 #     apt-get update && apt-get install -y debhelper-compat dpkg-dev fakeroot
-#     cd /work && dkms/scripts/build-deb.sh 0.1.0
+#     cd /work && bin/build-deb 0.1.0
 #   '
 #
-# Usage: dkms/scripts/build-deb.sh <version> [<staging_dir>]
+# Usage: bin/build-deb <version> [<staging_dir>]
 set -euo pipefail
 
 VER="${1:?usage: $0 <version> [<staging_dir>]}"
@@ -28,7 +28,7 @@ if ! command -v dpkg-buildpackage >/dev/null 2>&1; then
 fi
 
 cd "$REPO_ROOT"
-"$REPO_ROOT/dkms/scripts/build-tarball.sh" "$VER"
+"$REPO_ROOT/bin/build-tarball" "$VER"
 
 # Stage <pkg>-<version>/ with debian/ inside.
 rm -rf "$STAGE"

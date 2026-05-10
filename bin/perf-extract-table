@@ -10,7 +10,7 @@
 # in both cases (occasional slow-leg routes), so mean is the headline.
 #
 # Usage:
-#   dkms/scripts/perf-extract-table.sh [--dot] <results-base-dir> [variant ...]
+#   bin/perf-extract-table [--dot] <results-base-dir> [variant ...]
 #
 # When variant args are omitted, walks every subdir of <results-base-dir>
 # that has a results/ child; baseline (if present) is placed first.

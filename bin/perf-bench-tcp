@@ -14,7 +14,7 @@
 #   2. Pick a SNIA suite, e.g.
 #      /home/$USER/csi-perf-test/suites/snia-randread-iops.
 #   3. Run:
-#        sudo dkms/scripts/run-perf-bench-tcp.sh \
+#        sudo bin/perf-bench-tcp \
 #             /dev/nvme0n1p4 /dev/nvme0n1p5 \
 #             /home/$USER/csi-perf-test/suites/snia-randread-iops
 #   4. Inspect ./results/<UTC>-<host>-<kver>/{manifest.json,suiteX/run.log}.
