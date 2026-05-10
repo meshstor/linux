@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# perf-make-test-partitions.sh — validate an NVMe device and add two
-# 25 GiB test partitions in its trailing free space, 1 MiB aligned.
+# perf-make-test-partitions.sh — manage NVMe perf-test partitions.
+# Default mode adds two 25 GiB test partitions in the disk's trailing
+# free space; --remove tears them down. Idempotent on re-run.
 #
-# Validations:
+# Validations (both modes):
 #   - argument is a block device under /dev/nvme*n*
 #   - transport is nvme (lsblk -no TRAN)
 #   - partition table is GPT (lsblk -no PTTYPE)
-#   - logical block size is 4096 (i.e. 4Kn drive)
-#   - at least 50 GiB of contiguous unallocated free space
+#   - physical block size is 4096 — accepts 4Kn AND 512e (rejects 512n)
+#
+# Create mode also requires:
+#   - at least COUNT * SIZE_GIB of contiguous unallocated free space
 #
 # Created partitions:
-#   - 2 × 25 GiB (configurable via SIZE_GIB / COUNT env)
-#   - 1 MiB aligned (the historical "max compatibility + good perf" rule;
-#     parted handles this automatically when offsets are given in MiB)
+#   - COUNT × SIZE_GIB (default 2 × 25 GiB; configurable via env)
+#   - aligned to max(1 MiB, optimal_io_size from sysfs) — covers 4 KiB
+#     physical blocks and honors enterprise-NVMe optimal-io hints
 #   - GPT names: <devbasename>-test1, <devbasename>-test2
 #     (e.g. nvme0n1-test1, nvme0n1-test2)
+#
+# Idempotency:
+#   - re-running create with matching state is a no-op (exit 0)
+#   - re-running create with mismatched state dies, instructs --remove
+#   - --remove refuses to act on busy partitions (mounted, swap, mdraid,
+#     holders, lsof) and removes nothing if anything is busy
 #
 # Usage:
 #   sudo bin/perf-make-test-partitions /dev/nvme0n1            # create (default)
@@ -190,7 +199,7 @@ main() {
             --remove)  REMOVE=1 ;;
             -y|--yes)  YES=1 ;;
             -h|--help)
-                sed -n '2,30p' "$0" | sed 's/^# \?//'
+                sed -n '2,39p' "$0" | sed 's/^# \?//'
                 exit 0
                 ;;
             -*) die "unknown flag: $arg" ;;
