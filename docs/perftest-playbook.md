@@ -85,7 +85,7 @@ test -f /lib/modules/$(uname -r)/build/include/uapi/linux/raid/md_p.h \
 
 ```bash
 # meshstor kernel fork (this repo)
-[ -d ~/linux-meshstor ] || git clone git@github.com:meshstor/linux ~/linux-meshstor
+[ -d ~/linux-meshstor ] || git clone -b meshstor-harness git@github.com:meshstor/linux ~/linux-meshstor
 ```
 
 ```bash
@@ -111,7 +111,7 @@ test -x ~/mdadm/mdadm && echo OK || echo "BUILD FAILED"
 ```bash
 # wctemp = warning composite temp (Kelvin). cctemp = critical.
 # COOL_THRESH_K (default 348 K = 75 °C) should be ~10-15 K below wctemp.
-sudo nvme id-ctrl /dev/nvme0n1 | grep -iE 'wctemp|cctemp'
+sudo nvme id-ctrl /dev/nvme1n1 | grep -iE 'wctemp|cctemp'
 ```
 
 ---
@@ -131,7 +131,7 @@ If you don't have free partitions of suitable size, create two 25 GiB
 test partitions in the disk's trailing free space:
 
 ```bash
-sudo ~/linux-meshstor/bin/perf-make-test-partitions /dev/nvme0n1
+sudo COUNT=4 ~/linux-meshstor/bin/perf-make-test-partitions /dev/nvme1n1
 ```
 
 The script accepts both 4Kn and 512e drives, requires an existing GPT
@@ -139,7 +139,7 @@ label (it prints the `mklabel gpt` command if missing, but never runs it
 itself), and is idempotent on re-runs. To clean up afterwards:
 
 ```bash
-sudo ~/linux-meshstor/bin/perf-make-test-partitions /dev/nvme0n1 --remove
+sudo ~/linux-meshstor/bin/perf-make-test-partitions /dev/nvme1n1 --remove
 ```
 
 ### 2.2 Confirm no existing nvmet / nvme-tcp state will collide
@@ -307,14 +307,14 @@ tail -f /tmp/perf-run.log | grep -E '===|WARN|ERROR|all done|FAIL|done:|suite sn
 
 ```bash
 # One-shot temperature snapshot (max of composite + all sensors, in Kelvin).
-sudo nvme smart-log /dev/nvme0n1 -o json | \
+sudo nvme smart-log /dev/nvme1n1 -o json | \
     jq -r '[.temperature, .temperature_sensor_1, .temperature_sensor_2,
             (.temperature_sensor_3 // 0), (.temperature_sensor_4 // 0)] | max'
 ```
 
 ```bash
 # Continuous temperature watch (every 10 s).
-watch -n 10 'sudo nvme smart-log /dev/nvme0n1 -o json | jq -r "[.temperature, .temperature_sensor_1, .temperature_sensor_2, (.temperature_sensor_3 // 0), (.temperature_sensor_4 // 0)] | max" | xargs -I{} echo "max sensor {} K = $((( {} - 273)))°C"'
+watch -n 10 'sudo nvme smart-log /dev/nvme1n1 -o json | jq -r "[.temperature, .temperature_sensor_1, .temperature_sensor_2, (.temperature_sensor_3 // 0), (.temperature_sensor_4 // 0)] | max" | xargs -I{} echo "max sensor {} K = $((( {} - 273)))°C"'
 ```
 
 ---
@@ -490,8 +490,8 @@ sudo apt install -y fio dkms git-filter-repo nvme-cli jq mdadm \
 ```bash
 sudo ~/linux-meshstor/bin/perf-compare \
     --level=raid10 --port=14420 \
-    --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
-    --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
+    --local=/dev/nvme1n1p2 --local=/dev/nvme1n1p3 \
+    --remote=/dev/nvme1n1p4 --remote=/dev/nvme1n1p5 \
     | tee /tmp/perf-run.log
 
 OUT_BASE=$(ls -dt $HOME/linux-meshstor/results/perf-* | grep -v perf-bitmap | head -1)
