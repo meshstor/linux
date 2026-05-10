@@ -9,21 +9,35 @@
 #   6. Render templates with version substituted
 #   7. Tar the result
 # Usage: bin/build-tarball <version>
+#
+# KERNEL_TREE (env, optional): directory holding drivers/md/ to copy from.
+# Defaults to the rebuild-main output dir (build/linux-meshstor-rebuilt) —
+# run bin/rebuild-main first, or set KERNEL_TREE=$(git rev-parse --show-toplevel)
+# to package directly from this repo's drivers/md/. dkms/ inputs and build
+# outputs always come from / land in this repo.
 set -euo pipefail
 
 VER="${1:?usage: $0 <version>}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+KERNEL_TREE="$(realpath -m "${KERNEL_TREE:-$REPO_ROOT/build/linux-meshstor-rebuilt}")"
 OUT="$REPO_ROOT/build/meshstor-ms-$VER"
+
+if [[ ! -d "$KERNEL_TREE/drivers/md" ]]; then
+    echo "error: KERNEL_TREE=$KERNEL_TREE has no drivers/md/" >&2
+    echo "       run bin/rebuild-main first, or set KERNEL_TREE explicitly" >&2
+    exit 1
+fi
 
 cd "$REPO_ROOT"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
 # 1. Copy kernel sources per manifest (one file per line, supports globs)
+#    $entry stays unquoted so the manifest can use globs like raid*.c.
 while IFS= read -r entry; do
     [ -z "$entry" ] && continue
     [[ "$entry" =~ ^# ]] && continue
-    cp drivers/md/$entry "$OUT/"
+    cp "$KERNEL_TREE"/drivers/md/$entry "$OUT/"
 done < dkms/manifest.txt
 
 # 2. Copy compat layer
