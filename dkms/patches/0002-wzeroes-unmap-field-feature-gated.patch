@@ -1,10 +1,10 @@
 --- a/raid1.c
 +++ b/raid1.c
 @@ -3265,7 +3265,9 @@
- 
+
  	md_init_stacking_limits(&lim);
  	lim.max_write_zeroes_sectors = 0;
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++#ifdef HAVE_MAX_HW_WZEROES_UNMAP_SECTORS
  	lim.max_hw_wzeroes_unmap_sectors = 0;
 +#endif
  	lim.logical_block_size = mddev->logical_block_size;
@@ -13,10 +13,10 @@
 --- a/raid10.c
 +++ b/raid10.c
 @@ -4085,7 +4085,9 @@
- 
+
  	md_init_stacking_limits(&lim);
  	lim.max_write_zeroes_sectors = 0;
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++#ifdef HAVE_MAX_HW_WZEROES_UNMAP_SECTORS
  	lim.max_hw_wzeroes_unmap_sectors = 0;
 +#endif
  	lim.logical_block_size = mddev->logical_block_size;
