@@ -17,7 +17,7 @@
 #     (e.g. nvme0n1-test1, nvme0n1-test2)
 #
 # Usage:
-#   sudo dkms/scripts/perf-make-test-partitions.sh /dev/nvme0n1 [-y|--yes]
+#   sudo bin/perf-make-test-partitions /dev/nvme0n1 [-y|--yes]
 #
 # Defaults to printing the plan and waiting 5 s for Ctrl-C before acting.
 # Pass --yes to skip the wait.

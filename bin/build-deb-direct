@@ -8,7 +8,7 @@
 #   - We hand-write the control fields and scripts
 #   - But: portable across non-Debian build hosts
 #
-# Usage: dkms/scripts/build-deb-direct.sh <version> [<staging_dir>]
+# Usage: bin/build-deb-direct <version> [<staging_dir>]
 set -euo pipefail
 
 VER="${1:?usage: $0 <version> [<staging_dir>]}"
@@ -24,7 +24,7 @@ fi
 cd "$REPO_ROOT"
 
 # 1. Build the DKMS tarball.
-"$REPO_ROOT/dkms/scripts/build-tarball.sh" "$VER"
+"$REPO_ROOT/bin/build-tarball" "$VER"
 
 # 2. Stage <pkgdir>/DEBIAN/ + content.
 PKG="meshstor-ms-dkms_${VER}-1_all"
