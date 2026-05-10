@@ -63,6 +63,26 @@ dkms install -m %{pkgname} -v %{module_version} || :
 %preun
 # Remove DKMS registration before package files are removed.
 if [ "$1" = "0" ]; then
+    # Pre-emptively prune cross-kernel weak-updates symlinks for our three
+    # modules across every installed kernel, BEFORE calling `dkms remove`.
+    # Rationale: DKMS's framework default `post_transaction` runs
+    # `dracut --regenerate-all --force` at the end of `dkms remove`. If a
+    # newer kernel has weak-updates/ symlinks pointing into the kernel
+    # whose extra/ payload `dkms remove` just deleted, those links become
+    # dangling between the file delete and the dracut step, and dracut
+    # fails on that kernel with "installkernel failed in module
+    # kernel-modules-extra". Removing the symlinks up front avoids the
+    # window. We use -type l (not -xtype l like %posttrans) because the
+    # links are still live at this point — they only become dangling
+    # moments later, inside `dkms remove`. The package is being erased,
+    # so any reference to our modules is going away regardless.
+    for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
+        [ -d "$kdir" ] || continue
+        for name in ms_mod raid1_ms raid10_ms; do
+            find "$kdir" -maxdepth 2 -name "${name}.ko*" -type l -delete
+        done
+    done 2>/dev/null || :
+
     dkms remove -m %{pkgname} -v %{module_version} --all || :
 fi
 
