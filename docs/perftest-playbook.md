@@ -86,8 +86,20 @@ lsblk
 cat /proc/mdstat
 ```
 
-If you don't have free partitions of suitable size, create them with
-`parted` / `gdisk` first (out of scope here).
+If you don't have free partitions of suitable size, create two 25 GiB
+test partitions in the disk's trailing free space:
+
+```bash
+sudo ~/linux-meshstor/bin/perf-make-test-partitions /dev/nvme0n1
+```
+
+The script accepts both 4Kn and 512e drives, requires an existing GPT
+label (it prints the `mklabel gpt` command if missing, but never runs it
+itself), and is idempotent on re-runs. To clean up afterwards:
+
+```bash
+sudo ~/linux-meshstor/bin/perf-make-test-partitions /dev/nvme0n1 --remove
+```
 
 ### 2.2 Confirm no existing nvmet / nvme-tcp state will collide
 
