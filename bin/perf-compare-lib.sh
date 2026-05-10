@@ -243,7 +243,9 @@ obtain_tarball() {
     local label="$1" out_dir="$2" rebuild_log="$3" build_log="$4"
     local args="${VARIANT_ARGS[$label]}"
     local ver="${VARIANT_VER[$label]}"
-    local fresh_tarball="$REBUILT_TREE/build/meshstor-ms-$ver.dkms.tar.gz"
+    # build-tarball writes its output to <its-REPO_ROOT>/build/. We invoke
+    # it from $REPO_ROOT (this repo), so the tarball lands under our build/.
+    local fresh_tarball="$REPO_ROOT/build/meshstor-ms-$ver.dkms.tar.gz"
 
     local key="" key12="" cache_dir="" cache_tar=""
     if (( NO_CACHE == 0 )); then
@@ -289,14 +291,20 @@ obtain_tarball() {
     fi
 
     log "build-tarball $ver" >&2
+    # build-tarball expects to run from this repo's REPO_ROOT (its own `git
+    # rev-parse --show-toplevel` selects what becomes its REPO_ROOT — used
+    # for dkms/ inputs and build outputs). REBUILT_TREE has its own .git
+    # (rebuild-main does `git clone` into it), so we must NOT cd into it,
+    # and must pass KERNEL_TREE explicitly so build-tarball reads kernel
+    # sources from the rebuilt tree rather than its broken default.
     if [[ -n "${SUDO_USER:-}" ]]; then
-        if ! ( cd "$REBUILT_TREE" && sudo -u "$SUDO_USER" "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
+        if ! ( cd "$REPO_ROOT" && sudo -u "$SUDO_USER" env KERNEL_TREE="$REBUILT_TREE" "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
             warn "build-tarball failed (see $build_log)"
             echo "BUILD_FAILED" > "$out_dir/status"
             return 1
         fi
     else
-        if ! ( cd "$REBUILT_TREE" && "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
+        if ! ( cd "$REPO_ROOT" && KERNEL_TREE="$REBUILT_TREE" "$BUILD_TARBALL" "$ver" ) > "$build_log" 2>&1; then
             warn "build-tarball failed (see $build_log)"
             echo "BUILD_FAILED" > "$out_dir/status"
             return 1
