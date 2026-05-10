@@ -17,145 +17,354 @@
 #     (e.g. nvme0n1-test1, nvme0n1-test2)
 #
 # Usage:
-#   sudo bin/perf-make-test-partitions /dev/nvme0n1 [-y|--yes]
+#   sudo bin/perf-make-test-partitions /dev/nvme0n1            # create (default)
+#   sudo bin/perf-make-test-partitions /dev/nvme0n1 --remove   # remove its test partitions
 #
-# Defaults to printing the plan and waiting 5 s for Ctrl-C before acting.
-# Pass --yes to skip the wait.
+# Flags:
+#   -y, --yes      skip the 5-second cancel window
+#       --remove   remove existing <base>-testN partitions (no creation)
+#   -h, --help     show this help
+#
+# Env (create mode only):
+#   SIZE_GIB=N     size of each partition (default 25)
+#   COUNT=N        number of partitions to create (default 2)
 set -euo pipefail
-
-SIZE_GIB="${SIZE_GIB:-25}"
-COUNT="${COUNT:-2}"
 
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 log()  { printf '%s\n' "$*"; }
 
-YES=0
-DEV=""
-for arg in "$@"; do
-    case "$arg" in
-        -y|--yes) YES=1 ;;
-        -h|--help)
-            sed -n '2,28p' "$0" | sed 's/^# \?//'
-            exit 0
-            ;;
-        -*) die "unknown flag: $arg" ;;
-        *)  [[ -z "$DEV" ]] || die "extra positional arg: $arg"
-            DEV="$arg" ;;
-    esac
-done
-[[ -n "$DEV" ]] || die "usage: $0 /dev/nvmeXnY [-y|--yes]"
+# round_up X Y -> smallest multiple of Y that is >= X (integer math)
+round_up() {
+    local x="$1" y="$2"
+    if (( x == 0 )); then printf '0\n'; return; fi
+    printf '%s\n' "$(( ((x + y - 1) / y) * y ))"
+}
 
-# ---- root check ----
-[[ $EUID -eq 0 ]] || die "must run as root (try: sudo $0 $*)"
+# compute_align_bytes PHYS OPT -> max(1 MiB, OPT). PHYS is accepted for
+# call-site self-documentation but the 1 MiB floor always covers it.
+compute_align_bytes() {
+    local phys="$1" opt="$2"
+    : "$phys"  # unused; documented in the gate
+    local floor=$((1024 * 1024))
+    if (( opt > floor )); then
+        printf '%s\n' "$opt"
+    else
+        printf '%s\n' "$floor"
+    fi
+}
 
-# ---- tool check ----
-for t in lsblk blockdev parted partprobe udevadm awk; do
-    command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
-done
+# parse_free_region_b: reads `parted -m unit B print free` on stdin,
+# writes "START_B END_B SIZE_B" of the largest free region to stdout.
+# Exits non-zero (with no output) when no free region exists.
+parse_free_region_b() {
+    awk -F: '
+        /:free;$/ {
+            # Strip trailing "B" from start/end fields.
+            s = $2; sub(/B$/, "", s)
+            e = $3; sub(/B$/, "", e)
+            sz = e - s
+            if (sz > max) { max = sz; mstart = s; mend = e }
+        }
+        END {
+            if (max == 0) exit 1
+            printf "%s %s %s\n", mstart, mend, max
+        }
+    '
+}
 
-# ---- device validation ----
-[[ -b "$DEV" ]] || die "not a block device: $DEV"
-[[ "$DEV" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || die "device name doesn't look like a whole-NVMe disk: $DEV (expected /dev/nvmeXnY)"
+# match_test_label BASE LABEL -> 0 if LABEL matches "<BASE>-test<digits>"
+match_test_label() {
+    local base="$1" label="$2"
+    [[ "$label" =~ ^${base}-test[0-9]+$ ]]
+}
 
-TRAN="$(lsblk -dno TRAN "$DEV" 2>/dev/null || echo)"
-[[ "$TRAN" == "nvme" ]] || die "not an NVMe device (lsblk TRAN=$TRAN)"
-
-PTTYPE="$(lsblk -dno PTTYPE "$DEV" 2>/dev/null || echo)"
-[[ "$PTTYPE" == "gpt" ]] || die "partition table is not GPT (PTTYPE='$PTTYPE'); refusing to repartition"
-
-LOG_SEC="$(blockdev --getss "$DEV")"
-[[ "$LOG_SEC" == "4096" ]] || die "drive is not 4Kn (logical block size = ${LOG_SEC}B; expected 4096)"
-
-# ---- free space discovery ----
-# parted -m machine-readable: ":start:end:size:fs-type:name:flags;" per line.
-# Free regions look like: ":913000MiB:953000MiB:40000MiB:free;"
-# (the leading partition number is empty for free entries)
-read -r FREE_MIB FREE_START_MIB FREE_END_MIB < <(
-    parted -s -m "$DEV" unit MiB print free 2>/dev/null \
-        | awk -F: '
-            /:free;$/ {
-                s = $2 + 0
-                e = $3 + 0
-                sz = e - s
-                if (sz > max) { max = sz; mstart = s; mend = e }
+# scan_test_partitions DEV BASE -> writes "NUM NAME LABEL SIZE" lines to
+# stdout for each partition on DEV whose PARTLABEL matches the test
+# pattern. Numbers are partition numbers (column from lsblk PARTN).
+scan_test_partitions() {
+    local dev="$1" base="$2"
+    lsblk -ln -o NAME,PARTN,PARTLABEL,SIZE "$dev" 2>/dev/null \
+        | awk -v base="$base" '
+            $3 ~ ("^" base "-test[0-9]+$") {
+                printf "%s %s %s %s\n", $2, $1, $3, $4
             }
-            END { printf "%d %d %d\n", (max+0), (mstart+0), (mend+0) }
         '
-)
-NEEDED_GIB=$((SIZE_GIB * COUNT))
-NEEDED_MIB=$((NEEDED_GIB * 1024))
-(( FREE_MIB >= NEEDED_MIB )) \
-    || die "largest free region is ${FREE_MIB} MiB; need at least ${NEEDED_MIB} MiB ($NEEDED_GIB GiB)"
+}
 
-# ---- compute aligned partition offsets (MiB) ----
-# parted reports MiB rounded; the actual free start may be misaligned by less
-# than 1 MiB. Round up to the next MiB boundary to guarantee 1 MiB alignment.
-ALIGN_START=$FREE_START_MIB
-P1_START=$ALIGN_START
-P1_END=$((P1_START + SIZE_GIB * 1024))
-P2_START=$P1_END
-P2_END=$((P2_START + SIZE_GIB * 1024))
-(( P2_END <= FREE_END_MIB )) \
-    || die "internal: would overflow free region (P2_END=$P2_END MiB > free end=$FREE_END_MIB MiB)"
+# remove_mode DEV BASE YES -> validate, list, refuse-if-busy, delete.
+remove_mode() {
+    local dev="$1" base="$2" yes="$3"
+    local entries blockers=()
 
-DEV_NAME="$(basename "$DEV")"
-LABEL1="${DEV_NAME}-test1"
-LABEL2="${DEV_NAME}-test2"
+    # Snapshot the test partitions.
+    mapfile -t entries < <(scan_test_partitions "$dev" "$base")
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        log "nothing to remove on $dev (no ${base}-testN partitions)"
+        return 0
+    fi
 
-# ---- print plan ----
-cat <<EOF
+    # Refuse if any candidate is busy. Collect ALL hits before failing.
+    local mountinfo swaps mdstat
+    mountinfo="$(cat /proc/self/mountinfo 2>/dev/null || true)"
+    swaps="$(cat /proc/swaps 2>/dev/null || true)"
+    mdstat="$(cat /proc/mdstat 2>/dev/null || true)"
+
+    local entry num name label size pdev holders_dir
+    for entry in "${entries[@]}"; do
+        read -r num name label size <<<"$entry"
+        pdev="/dev/$name"
+        if grep -qE "[[:space:]]${pdev}[[:space:]]" <<<"$mountinfo"; then
+            blockers+=("$pdev ($label): mounted")
+        fi
+        if grep -qE "^${pdev}[[:space:]]" <<<"$swaps"; then
+            blockers+=("$pdev ($label): active swap")
+        fi
+        if grep -q "${name}\b" <<<"$mdstat"; then
+            blockers+=("$pdev ($label): in /proc/mdstat")
+        fi
+        holders_dir="/sys/class/block/${name}/holders"
+        # shellcheck disable=SC2012  # sysfs entries are simple names; ls is fine
+        if [[ -d "$holders_dir" ]] && [[ -n "$(ls -A "$holders_dir" 2>/dev/null)" ]]; then
+            # shellcheck disable=SC2012
+            blockers+=("$pdev ($label): has holders ($(ls -A "$holders_dir" | tr '\n' ' '))")
+        fi
+        if command -v lsof >/dev/null 2>&1; then
+            if lsof -- "$pdev" >/dev/null 2>&1; then
+                blockers+=("$pdev ($label): open file handles (lsof)")
+            fi
+        fi
+    done
+
+    if [[ ${#blockers[@]} -gt 0 ]]; then
+        printf 'error: refusing to remove — %d busy partition(s):\n' "${#blockers[@]}" >&2
+        printf '  %s\n' "${blockers[@]}" >&2
+        exit 1
+    fi
+
+    # Print plan.
+    log "Plan: remove ${#entries[@]} test partition(s) from $dev:"
+    for entry in "${entries[@]}"; do
+        read -r num name label size <<<"$entry"
+        log "  /dev/$name  $label  $size"
+    done
+
+    if [[ "$yes" -eq 0 ]]; then
+        printf 'Proceeding in 5 s — Ctrl-C to cancel'
+        for _ in 1 2 3 4 5; do printf '.'; sleep 1; done
+        printf '\n'
+    fi
+
+    # Remove in DESCENDING partition-number order.
+    local nums=()
+    for entry in "${entries[@]}"; do
+        read -r num _ _ _ <<<"$entry"
+        nums+=("$num")
+    done
+    # Sort numerically descending.
+    IFS=$'\n' read -r -d '' -a nums_sorted < <(printf '%s\n' "${nums[@]}" | sort -rn && printf '\0')
+    for num in "${nums_sorted[@]}"; do
+        parted -s "$dev" rm "$num"
+    done
+
+    partprobe "$dev" 2>/dev/null || true
+    udevadm settle
+
+    # Verify nothing matching remains.
+    mapfile -t entries < <(scan_test_partitions "$dev" "$base")
+    if [[ ${#entries[@]} -ne 0 ]]; then
+        die "post-remove: still found matching partitions: ${entries[*]}"
+    fi
+    log "removed ${#nums_sorted[@]} test partition(s) from $dev"
+}
+
+main() {
+    SIZE_GIB="${SIZE_GIB:-25}"
+    COUNT="${COUNT:-2}"
+
+    REMOVE=0
+    YES=0
+    DEV=""
+    for arg in "$@"; do
+        case "$arg" in
+            --remove)  REMOVE=1 ;;
+            -y|--yes)  YES=1 ;;
+            -h|--help)
+                sed -n '2,30p' "$0" | sed 's/^# \?//'
+                exit 0
+                ;;
+            -*) die "unknown flag: $arg" ;;
+            *)  [[ -z "$DEV" ]] || die "extra positional arg: $arg"
+                DEV="$arg" ;;
+        esac
+    done
+    [[ -n "$DEV" ]] || die "usage: $0 /dev/nvmeXnY [--remove] [-y|--yes]"
+
+    # ---- root check ----
+    [[ $EUID -eq 0 ]] || die "must run as root (try: sudo $0 $*)"
+
+    # ---- tool check ----
+    for t in lsblk blockdev parted partprobe udevadm awk; do
+        command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
+    done
+
+    # ---- device validation ----
+    [[ -b "$DEV" ]] || die "not a block device: $DEV"
+    [[ "$DEV" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || die "device name doesn't look like a whole-NVMe disk: $DEV (expected /dev/nvmeXnY)"
+
+    TRAN="$(lsblk -dno TRAN "$DEV" 2>/dev/null || echo)"
+    [[ "$TRAN" == "nvme" ]] || die "not an NVMe device (lsblk TRAN=$TRAN)"
+
+    PTTYPE="$(lsblk -dno PTTYPE "$DEV" 2>/dev/null || echo)"
+    if [[ -z "$PTTYPE" ]]; then
+        die "$DEV has no partition table (PTTYPE='')
+to initialize an empty disk, run:
+    sudo parted -s $DEV mklabel gpt
+then re-run this script."
+    elif [[ "$PTTYPE" != "gpt" ]]; then
+        die "$DEV has a non-GPT partition table (PTTYPE='$PTTYPE')
+this script refuses to convert non-GPT labels — running 'mklabel gpt' on
+this disk would destroy any existing partition data. If the disk is
+genuinely unused, wipe it first:
+    sudo wipefs -a $DEV
+    sudo parted -s $DEV mklabel gpt
+then re-run this script."
+    fi
+
+    LOG_SEC="$(blockdev --getss "$DEV")"        # 512 on 512e, 4096 on 4Kn
+    PHY_SEC="$(blockdev --getpbsz "$DEV")"      # 4096 on both 4Kn and 512e
+    OPT_IO="$(cat "/sys/class/block/$(basename "$DEV")/queue/optimal_io_size" 2>/dev/null || echo 0)"
+
+    [[ "$PHY_SEC" == "4096" ]] || die \
+        "drive is not 4K-physical (physical_block_size=${PHY_SEC}B); refusing
+       (4Kn drives have logical=4096 physical=4096; 512e drives have
+        logical=512 physical=4096; both are accepted; only true 512n
+        drives are rejected)"
+
+    DEV_NAME="$(basename "$DEV")"
+
+    if [[ $REMOVE -eq 1 ]]; then
+        if [[ -n "${SIZE_GIB+x}" ]] && [[ "$SIZE_GIB" != "25" ]]; then
+            log "(SIZE_GIB ignored in --remove mode)"
+        fi
+        if [[ -n "${COUNT+x}" ]] && [[ "$COUNT" != "2" ]]; then
+            log "(COUNT ignored in --remove mode)"
+        fi
+        remove_mode "$DEV" "$DEV_NAME" "$YES"
+        exit 0
+    fi
+
+    # Idempotency: if test partitions already exist, decide what to do.
+    mapfile -t existing < <(scan_test_partitions "$DEV" "$DEV_NAME")
+    if [[ ${#existing[@]} -gt 0 ]]; then
+        expected_size_h="${SIZE_GIB}G"
+        all_match=1
+        if [[ ${#existing[@]} -ne $COUNT ]]; then all_match=0; fi
+        for entry in "${existing[@]}"; do
+            read -r _ _ _ size <<<"$entry"
+            [[ "$size" == "$expected_size_h" ]] || all_match=0
+        done
+        if [[ $all_match -eq 1 ]]; then
+            log "$COUNT test partition(s) of size ${SIZE_GIB}G already present on $DEV — nothing to do"
+            exit 0
+        fi
+        {
+            printf 'error: partial / mismatched test partitions exist on %s:\n' "$DEV"
+            for entry in "${existing[@]}"; do
+                read -r _ name label size <<<"$entry"
+                printf '  /dev/%s  %s  %s\n' "$name" "$label" "$size"
+            done
+            printf 're-run with: sudo %s %s --remove\n' "$0" "$DEV"
+            printf 'then re-run this script.\n'
+        } >&2
+        exit 1
+    fi
+
+    # ---- free space discovery (exact bytes) ----
+    read -r FREE_START_B FREE_END_B FREE_SIZE_B < <(
+        parted -s -m "$DEV" unit B print free 2>/dev/null | parse_free_region_b
+    ) || die "no free region found on $DEV"
+
+    # ---- compute alignment ----
+    ALIGN_B="$(compute_align_bytes "$PHY_SEC" "$OPT_IO")"
+    GIB=$((1024 * 1024 * 1024))
+    SIZE_B=$((SIZE_GIB * GIB))
+
+    # Partition starts: round free-region start UP to the alignment boundary.
+    P1_START_B="$(round_up "$FREE_START_B" "$ALIGN_B")"
+    P1_END_B=$((P1_START_B + SIZE_B))
+    P2_START_B=$P1_END_B
+    P2_END_B=$((P2_START_B + SIZE_B))
+
+    (( P2_END_B <= FREE_END_B )) \
+        || die "would overflow free region: need ${SIZE_GIB}GiB × ${COUNT} = $((SIZE_B*COUNT)) B aligned to ${ALIGN_B} B starting at ${P1_START_B} B; free region ends at ${FREE_END_B} B"
+
+    LABEL1="${DEV_NAME}-test1"
+    LABEL2="${DEV_NAME}-test2"
+
+    # ---- print plan ----
+    cat <<EOF
 Device:        $DEV
   transport:   $TRAN
   pt type:     $PTTYPE
   logical sec: $LOG_SEC B
-  free region: ${FREE_START_MIB}–${FREE_END_MIB} MiB ($((FREE_MIB / 1024)) GiB)
+  physical:    $PHY_SEC B
+  optimal io:  $OPT_IO B
+  free region: ${FREE_START_B}–${FREE_END_B} B  ($((FREE_SIZE_B / GIB)) GiB)
+  align:       ${ALIGN_B} B
 
-Plan: create $COUNT partition(s), $SIZE_GIB GiB each, 1 MiB aligned:
-  ${LABEL1}: ${P1_START} MiB → ${P1_END} MiB  ($((P1_END - P1_START)) MiB = $SIZE_GIB GiB)
-  ${LABEL2}: ${P2_START} MiB → ${P2_END} MiB  ($((P2_END - P2_START)) MiB = $SIZE_GIB GiB)
+Plan: create $COUNT partition(s), $SIZE_GIB GiB each, ${ALIGN_B}-byte aligned:
+  ${LABEL1}: ${P1_START_B} → ${P1_END_B} B  ($SIZE_GIB GiB)
+  ${LABEL2}: ${P2_START_B} → ${P2_END_B} B  ($SIZE_GIB GiB)
 EOF
 
-if [[ $YES -eq 0 ]]; then
-    printf 'Proceeding in 5 s — Ctrl-C to cancel'
-    for _ in 1 2 3 4 5; do printf '.'; sleep 1; done
-    printf '\n'
-fi
-
-# ---- create partitions ----
-# parted with explicit MiB offsets gives 1 MiB alignment by construction;
-# we don't need --align optimal (which would jump to the device's
-# optimal_io_size — typically larger than 1 MiB on NVMe).
-parted -s "$DEV" \
-    mkpart "$LABEL1" ext4 "${P1_START}MiB" "${P1_END}MiB" \
-    mkpart "$LABEL2" ext4 "${P2_START}MiB" "${P2_END}MiB"
-
-# Re-read the partition table.
-partprobe "$DEV"
-udevadm settle
-
-# ---- post-create verification ----
-echo
-echo "Verification — new layout:"
-parted -s "$DEV" unit MiB print | tail -n +2
-
-# Check the two new device nodes exist + are 1 MiB aligned.
-P1_DEV="${DEV}p1" ; P2_DEV="${DEV}p2"
-# Discover by NAME instead of guessing the suffix
-P1_DEV="$(lsblk -ln -o NAME,PARTLABEL "$DEV" | awk -v lbl="$LABEL1" '$2==lbl {print "/dev/"$1; exit}')"
-P2_DEV="$(lsblk -ln -o NAME,PARTLABEL "$DEV" | awk -v lbl="$LABEL2" '$2==lbl {print "/dev/"$1; exit}')"
-[[ -b "$P1_DEV" && -b "$P2_DEV" ]] \
-    || die "post-create: could not locate /dev nodes for $LABEL1 / $LABEL2"
-
-for p in "$P1_DEV" "$P2_DEV"; do
-    start_b="$(cat "/sys/class/block/$(basename "$p")/start" 2>/dev/null)"
-    start_b_offset=$(( start_b * LOG_SEC ))   # bytes
-    if (( start_b_offset % (1024*1024) != 0 )); then
-        warn "$p start offset $start_b_offset B is NOT 1 MiB aligned"
+    if [[ $YES -eq 0 ]]; then
+        printf 'Proceeding in 5 s — Ctrl-C to cancel'
+        for _ in 1 2 3 4 5; do printf '.'; sleep 1; done
+        printf '\n'
     fi
-done
 
-echo
-echo "Created:"
-echo "  $P1_DEV  ($LABEL1)"
-echo "  $P2_DEV  ($LABEL2)"
+    # ---- create partitions ----
+    # parted's `B` end is inclusive — subtract 1 byte from the exclusive end.
+    parted -s "$DEV" \
+        mkpart "$LABEL1" ext4 "${P1_START_B}B" "$((P1_END_B - 1))B" \
+        mkpart "$LABEL2" ext4 "${P2_START_B}B" "$((P2_END_B - 1))B"
+
+    # Re-read the partition table.
+    partprobe "$DEV"
+    udevadm settle
+
+    # ---- post-create verification ----
+    echo
+    echo "Verification — new layout:"
+    parted -s "$DEV" unit MiB print | tail -n +2
+
+    # Check the two new device nodes exist + are 1 MiB aligned.
+    P1_DEV="${DEV}p1" ; P2_DEV="${DEV}p2"
+    # Discover by NAME instead of guessing the suffix
+    P1_DEV="$(lsblk -ln -o NAME,PARTLABEL "$DEV" | awk -v lbl="$LABEL1" '$2==lbl {print "/dev/"$1; exit}')"
+    P2_DEV="$(lsblk -ln -o NAME,PARTLABEL "$DEV" | awk -v lbl="$LABEL2" '$2==lbl {print "/dev/"$1; exit}')"
+    [[ -b "$P1_DEV" && -b "$P2_DEV" ]] \
+        || die "post-create: could not locate /dev nodes for $LABEL1 / $LABEL2"
+
+    # Verify each new partition starts on an ALIGN_B byte boundary. Kernel
+    # always reports /sys/.../start in 512 B sectors regardless of LBA size.
+    for p in "$P1_DEV" "$P2_DEV"; do
+        start_sectors="$(cat "/sys/class/block/$(basename "$p")/start" 2>/dev/null)"
+        start_bytes=$(( start_sectors * 512 ))
+        if (( start_bytes % ALIGN_B != 0 )); then
+            die "post-create: $p start offset $start_bytes B is NOT a multiple of ${ALIGN_B} B (alignment broken)"
+        fi
+    done
+
+    echo
+    echo "Created:"
+    echo "  $P1_DEV  ($LABEL1)"
+    echo "  $P2_DEV  ($LABEL2)"
+}
+
+# Library mode guard: when sourced (e.g., by tests), expose helpers but do
+# not run main. When executed directly, run main with the script's argv.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
