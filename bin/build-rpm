@@ -5,7 +5,7 @@
 # 3. Render the spec template with VERSION + CHANGELOG_DATE substituted.
 # 4. Run rpmbuild -bb.
 #
-# Usage: dkms/scripts/build-rpm.sh <version> [<rpmbuild_topdir>]
+# Usage: bin/build-rpm <version> [<rpmbuild_topdir>]
 # Default rpmbuild topdir: build/rpmbuild
 set -euo pipefail
 
@@ -23,7 +23,7 @@ TOPDIR="$(realpath -m "${2:-$REPO_ROOT/build/rpmbuild}")"
 cd "$REPO_ROOT"
 
 # 1. Build the DKMS tarball.
-"$REPO_ROOT/dkms/scripts/build-tarball.sh" "$VER"
+"$REPO_ROOT/bin/build-tarball" "$VER"
 
 # 2. Stage rpmbuild tree.
 mkdir -p "$TOPDIR"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
