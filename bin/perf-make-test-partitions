@@ -219,10 +219,15 @@ main() {
 
     # ---- device validation ----
     [[ -b "$DEV" ]] || die "not a block device: $DEV"
-    [[ "$DEV" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || die "device name doesn't look like a whole-NVMe disk: $DEV (expected /dev/nvmeXnY)"
-
-    TRAN="$(lsblk -dno TRAN "$DEV" 2>/dev/null || echo)"
-    [[ "$TRAN" == "nvme" ]] || die "not an NVMe device (lsblk TRAN=$TRAN)"
+    # _TEST_ALLOW_NON_NVME=1 bypasses the NVMe path/TRAN gates (integration tests).
+    # Not documented in --help; intentionally hidden.
+    if [[ "${_TEST_ALLOW_NON_NVME:-0}" != "1" ]]; then
+        [[ "$DEV" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || die "device name doesn't look like a whole-NVMe disk: $DEV (expected /dev/nvmeXnY)"
+        TRAN="$(lsblk -dno TRAN "$DEV" 2>/dev/null || echo)"
+        [[ "$TRAN" == "nvme" ]] || die "not an NVMe device (lsblk TRAN=$TRAN)"
+    else
+        TRAN="(test)"
+    fi
 
     PTTYPE="$(lsblk -dno PTTYPE "$DEV" 2>/dev/null || echo)"
     if [[ -z "$PTTYPE" ]]; then
