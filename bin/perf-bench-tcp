@@ -203,16 +203,27 @@ disconnect_nvme_client() {
 }
 
 # ---- raid array (engine-aware) ----
-# ARRAY_DEV defaults to /dev/ms0 for back-compat with engine=ms; the engine=md
-# branch reassigns it to /dev/md0 via resolve_array_dev (see Task 5).
-ARRAY_DEV="${ARRAY_DEV:-/dev/ms0}"
+# Helpers below switch on $ENGINE between mdadm and msadm. ARRAY_DEV may be
+# pre-set by caller (or by legacy MS_DEV env); otherwise resolve_array_dev
+# fills it from $ENGINE just before assembly.
+ARRAY_DEV="${ARRAY_DEV:-}"
 ARRAY_ASSEMBLED=0
 ARRAY_MEMBERS=()
-# Back-compat: callers may still set MS_DEV directly. Honor it (overrides any
-# default) — only meaningful for engine=ms.
+# Back-compat: callers may still set MS_DEV directly. Honor it as an override
+# (only meaningful for engine=ms).
 if [[ -n "${MS_DEV:-}" ]]; then
     ARRAY_DEV="$MS_DEV"
 fi
+
+# Pick the default device path for $ENGINE if the caller didn't set ARRAY_DEV.
+resolve_array_dev() {
+    [[ -n "$ARRAY_DEV" ]] && return 0
+    case "$ENGINE" in
+        ms) ARRAY_DEV="/dev/ms0" ;;
+        md) ARRAY_DEV="/dev/md0" ;;
+        *)  die_setup "resolve_array_dev: unknown engine: $ENGINE" ;;
+    esac
+}
 
 # Build the interleaved member list: LOCAL[0] IMPORTED[0] LOCAL[1] IMPORTED[1] ...
 # For raid10 near-2 layout this puts each mirror pair as one local +
@@ -227,18 +238,36 @@ array_member_list() {
 
 array_assemble() {
     array_member_list
+    resolve_array_dev
     log "array: assemble $ARRAY_DEV engine=$ENGINE level=$LEVEL devices=$RAID_DEVICES bitmap=$BITMAP members=${ARRAY_MEMBERS[*]}"
-    run_log "$MSADM" --create "$ARRAY_DEV" \
-        --level="$LEVEL" --raid-devices="$RAID_DEVICES" \
-        --bitmap="$BITMAP" --metadata=1.2 \
-        --run --assume-clean \
-        "${ARRAY_MEMBERS[@]}"
+    case "$ENGINE" in
+        ms)
+            run_log "$MSADM" --create "$ARRAY_DEV" \
+                --level="$LEVEL" --raid-devices="$RAID_DEVICES" \
+                --bitmap="$BITMAP" --metadata=1.2 \
+                --run --assume-clean \
+                "${ARRAY_MEMBERS[@]}"
+            ;;
+        md)
+            run_log mdadm --create "$ARRAY_DEV" \
+                --level="$LEVEL" --raid-devices="$RAID_DEVICES" \
+                --bitmap="$BITMAP" --metadata=1.2 \
+                --run --assume-clean \
+                "${ARRAY_MEMBERS[@]}"
+            ;;
+        *) die_setup "array_assemble: unknown engine: $ENGINE" ;;
+    esac
     ARRAY_ASSEMBLED=1
 }
 
 array_verify() {
-    local detail state working failed
-    detail="$("$MSADM" --detail "$ARRAY_DEV")" || die_setup "msadm --detail failed"
+    local detail state working failed adm
+    case "$ENGINE" in
+        ms) adm="$MSADM" ;;
+        md) adm="mdadm" ;;
+        *)  die_setup "array_verify: unknown engine: $ENGINE" ;;
+    esac
+    detail="$("$adm" --detail "$ARRAY_DEV")" || die_setup "$adm --detail failed"
     state="$(  printf '%s\n' "$detail" | awk -F': *' '/State *:/{print $2; exit}'        | xargs)"
     working="$(printf '%s\n' "$detail" | awk -F': *' '/Working Devices/{print $2; exit}' | xargs)"
     failed="$( printf '%s\n' "$detail" | awk -F': *' '/Failed Devices/{print $2; exit}'  | xargs)"
@@ -247,10 +276,10 @@ array_verify() {
     # recovering, etc.
     case "$state" in
         active|clean) ;;
-        *) die_setup "msraid not healthy: state='$state' working=$working failed=$failed" ;;
+        *) die_setup "array not healthy: state='$state' working=$working failed=$failed" ;;
     esac
     if [[ "$working" != "$RAID_DEVICES" ]] || [[ "$failed" != "0" ]]; then
-        die_setup "msraid not healthy: state='$state' working=$working failed=$failed (expected working=$RAID_DEVICES)"
+        die_setup "array not healthy: state='$state' working=$working failed=$failed (expected working=$RAID_DEVICES)"
     fi
 }
 
@@ -292,12 +321,24 @@ safe_zero_superblock() {
         return 0
     fi
     # audit-ignore: H5 — guarded above by is_whole_disk_with_gpt
-    "$MSADM" --zero-superblock "$path" >/dev/null 2>&1 || true
+    local adm
+    case "$ENGINE" in
+        ms) adm="$MSADM" ;;
+        md) adm="mdadm" ;;
+        *)  return 0 ;;
+    esac
+    "$adm" --zero-superblock "$path" >/dev/null 2>&1 || true
 }
 
 array_teardown() {
     [[ "$ARRAY_ASSEMBLED" -eq 1 ]] || return 0
-    "$MSADM" --stop "$ARRAY_DEV" >/dev/null 2>&1 || true
+    local adm
+    case "$ENGINE" in
+        ms) adm="$MSADM" ;;
+        md) adm="mdadm" ;;
+        *)  return 0 ;;
+    esac
+    "$adm" --stop "$ARRAY_DEV" >/dev/null 2>&1 || true
     local m
     for m in "${LOCALS[@]}" "${IMPORTEDS[@]}"; do
         safe_zero_superblock "$m"
@@ -437,8 +478,10 @@ write_manifest() {
         echo "array:       $ARRAY_DEV engine=$ENGINE level=$LEVEL devices=$RAID_DEVICES bitmap=$BITMAP"
         echo "members:     ${ARRAY_MEMBERS[*]}"
         echo
-        echo "--- msadm --detail $ARRAY_DEV ---"
-        safe "$MSADM" --detail "$ARRAY_DEV"
+        case "$ENGINE" in
+            ms) echo "--- $MSADM --detail $ARRAY_DEV ---"; safe "$MSADM" --detail "$ARRAY_DEV" ;;
+            md) echo "--- mdadm --detail $ARRAY_DEV ---";  safe mdadm   --detail "$ARRAY_DEV" ;;
+        esac
         echo
         echo "--- lsblk ---"
         safe lsblk
