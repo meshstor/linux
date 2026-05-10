@@ -11,7 +11,7 @@ For adding compat shims and rebasing on upstream Linux see
 ## Tarball pipeline
 
 The package source artifact is a single tarball, `meshstor-ms-<VER>.dkms.tar.gz`,
-produced by [`dkms/scripts/build-tarball.sh`](../dkms/scripts/build-tarball.sh).
+produced by [`bin/build-tarball`](../bin/build-tarball).
 The tarball contains a flat directory of post-rename `.c`/`.h` files plus
 the compat layer, the templated `dkms.conf` and `Makefile`, and the
 `COPYING` license. Both `.rpm` and `.deb` packagers consume this same
@@ -21,20 +21,20 @@ The pipeline:
 
 | Step | What it does | Source |
 |---|---|---|
-| 1. Copy manifest sources | Per-line entries in `dkms/manifest.txt` are copied from `drivers/md/` into the staging directory. | `build-tarball.sh:23-27` |
-| 2. Copy compat layer | `dkms/compat/` (containing `compat.h`) into the staging directory. | `build-tarball.sh:30` |
-| 3. Stub feature_flags.h | A no-op header is dropped in. The real one is generated at module-build time on the customer host (so it matches the *running* kernel, not whichever kernel produced the tarball). | `build-tarball.sh:39-46` |
-| 4. Apply pre-rename patches | Each `dkms/patches/NNNN-*.patch` applied in glob-sorted order. These touch upstream-named identifiers, so they must run before step 5. | `build-tarball.sh:54-58` |
-| 5. Rename pass | `sed` rules from `dkms/rename.sed` (plus auto-generated UAPI keep-list) translate `md_*` → `ms_*`, `MD_*` → `MS_*`, `mddev` → `mssev` across every `.c` and `.h`. | `build-tarball.sh:60-89` |
-| 6. Rename source filenames | `md.c` → `ms.c`, `raid1.c` → `raid1_ms.c`, etc. | `build-tarball.sh:91-100` |
-| 7. Inject `extern int ms_major` | One-time bridge: the rename produces a `ms_major` reference but no extern declaration, so we add one to `ms.h`. | `build-tarball.sh:104-114` |
-| 8. Render templates | `dkms.conf.in` and `Makefile.in` get the `@VERSION@` token substituted. | `build-tarball.sh:117-119` |
-| 9. Tar | `tar czf build/meshstor-ms-<VER>.dkms.tar.gz`. | `build-tarball.sh:124-126` |
+| 1. Copy manifest sources | Per-line entries in `dkms/manifest.txt` are copied from `drivers/md/` into the staging directory. | `bin/build-tarball:23-27` |
+| 2. Copy compat layer | `dkms/compat/` (containing `compat.h`) into the staging directory. | `bin/build-tarball:30` |
+| 3. Stub feature_flags.h | A no-op header is dropped in. The real one is generated at module-build time on the customer host (so it matches the *running* kernel, not whichever kernel produced the tarball). | `bin/build-tarball:39-46` |
+| 4. Apply pre-rename patches | Each `dkms/patches/NNNN-*.patch` applied in glob-sorted order. These touch upstream-named identifiers, so they must run before step 5. | `bin/build-tarball:54-58` |
+| 5. Rename pass | `sed` rules from `dkms/rename.sed` (plus auto-generated UAPI keep-list) translate `md_*` → `ms_*`, `MD_*` → `MS_*`, `mddev` → `mssev` across every `.c` and `.h`. | `bin/build-tarball:60-89` |
+| 6. Rename source filenames | `md.c` → `ms.c`, `raid1.c` → `raid1_ms.c`, etc. | `bin/build-tarball:91-100` |
+| 7. Inject `extern int ms_major` | One-time bridge: the rename produces a `ms_major` reference but no extern declaration, so we add one to `ms.h`. | `bin/build-tarball:104-114` |
+| 8. Render templates | `dkms.conf.in` and `Makefile.in` get the `@VERSION@` token substituted. | `bin/build-tarball:117-119` |
+| 9. Tar | `tar czf build/meshstor-ms-<VER>.dkms.tar.gz`. | `bin/build-tarball:124-126` |
 
 Run it directly:
 
 ```bash
-dkms/scripts/build-tarball.sh 0.1.0
+bin/build-tarball 0.1.0
 # ...
 # Built: /home/mykola/sync/linux-meshstor/build/meshstor-ms-0.1.0.dkms.tar.gz
 ```
@@ -53,12 +53,12 @@ but no `raid0_ms.c` ships — RAID0 is out of scope per [compat.md](compat.md#ou
 
 ## rpm packaging
 
-[`dkms/scripts/build-rpm.sh`](../dkms/scripts/build-rpm.sh) calls
-`build-tarball.sh`, then renders the spec template, then runs
+[`bin/build-rpm`](../bin/build-rpm) calls
+`bin/build-tarball`, then renders the spec template, then runs
 `rpmbuild -bb`. Output is a `noarch` source-DKMS rpm.
 
 ```bash
-dkms/scripts/build-rpm.sh 0.1.0 build/rpmbuild
+bin/build-rpm 0.1.0 build/rpmbuild
 # ...
 # Wrote: build/rpmbuild/RPMS/noarch/meshstor-ms-dkms-0.1.0-1.el10.noarch.rpm
 ```
@@ -85,14 +85,14 @@ The render step substitutes `@VERSION@` and `@CHANGELOG_DATE@`.
 Two paths, depending on whether the build host is Debian/Ubuntu native
 or non-Debian:
 
-### `build-deb.sh` — native Debian/Ubuntu
+### `bin/build-deb` — native Debian/Ubuntu
 
-[`dkms/scripts/build-deb.sh`](../dkms/scripts/build-deb.sh) uses the
+[`bin/build-deb`](../bin/build-deb) uses the
 canonical `dpkg-buildpackage -us -uc -b` flow. Run on a Debian/Ubuntu
 host that has `debhelper`, `dpkg-dev`, and `fakeroot` installed.
 
 ```bash
-dkms/scripts/build-deb.sh 0.1.0 build/debbuild
+bin/build-deb 0.1.0 build/debbuild
 # Output: build/debbuild/meshstor-ms-dkms_0.1.0-1_all.deb
 ```
 
@@ -102,13 +102,13 @@ For CI from a non-Debian build server, run it inside a container:
 podman run --rm -it -v "$PWD:/work" ubuntu:24.04 bash -c '
     apt-get update
     apt-get install -y debhelper-compat dpkg-dev fakeroot
-    cd /work && dkms/scripts/build-deb.sh 0.1.0
+    cd /work && bin/build-deb 0.1.0
 '
 ```
 
-### `build-deb-direct.sh` — cross-build from RHEL
+### `bin/build-deb-direct` — cross-build from RHEL
 
-[`dkms/scripts/build-deb-direct.sh`](../dkms/scripts/build-deb-direct.sh)
+[`bin/build-deb-direct`](../bin/build-deb-direct)
 uses `dpkg-deb` directly, hand-writing the control fields and DKMS
 postinst/prerm scripts. Bypasses `debhelper` entirely. Used when the
 build server is RHEL/Rocky/Alma and we don't want a container hop.
@@ -116,7 +116,7 @@ build server is RHEL/Rocky/Alma and we don't want a container hop.
 ```bash
 # RHEL host, with EPEL's dpkg installed:
 sudo dnf install -y dpkg
-dkms/scripts/build-deb-direct.sh 0.1.0 build/debdirect
+bin/build-deb-direct 0.1.0 build/debdirect
 # Output: build/debdirect/meshstor-ms-dkms_0.1.0-1_all.deb
 ```
 
@@ -160,10 +160,10 @@ This is what [install.md](install.md#path-1-dkms-rebuild--auto-mok-default)
 
 We generate a long-lived keypair once at build-infrastructure setup
 time using
-[`dkms/scripts/build-vendor-key.sh`](../dkms/scripts/build-vendor-key.sh):
+[`bin/build-vendor-key`](../bin/build-vendor-key):
 
 ```bash
-dkms/scripts/build-vendor-key.sh /vault/meshstor-keys
+bin/build-vendor-key /vault/meshstor-keys
 # Generates:
 #   meshstor-vendor.priv  — KEEP SECRET, build-server only
 #   meshstor-vendor.pem   — internal use
@@ -236,14 +236,14 @@ line to bump in those files.)
 
 ```bash
 # 3. Build the rpm. Verify clean build.
-dkms/scripts/build-rpm.sh X.Y.Z /tmp/release-rpm
+bin/build-rpm X.Y.Z /tmp/release-rpm
 ls -la /tmp/release-rpm/RPMS/noarch/
 # Expected: meshstor-ms-dkms-X.Y.Z-1.el10.noarch.rpm
 ```
 
 ```bash
 # 4. Build the deb (cross-build from RHEL OK):
-dkms/scripts/build-deb-direct.sh X.Y.Z /tmp/release-deb
+bin/build-deb-direct X.Y.Z /tmp/release-deb
 ls -la /tmp/release-deb/
 # Expected: meshstor-ms-dkms_X.Y.Z-1_all.deb
 ```
@@ -286,21 +286,21 @@ get the new version on their next `dnf update` / `apt update`.
 
 ## Troubleshooting the build
 
-If `build-tarball.sh` fails, the most common cause is a kernel header
+If `bin/build-tarball` fails, the most common cause is a kernel header
 path missing or different. Run with the `KDIR` variable pointing at the
 intended target kernel's headers:
 
 ```bash
 KDIR=/path/to/kernel-headers \
-    dkms/scripts/build-tarball.sh X.Y.Z
+    bin/build-tarball X.Y.Z
 ```
 
-If `build-rpm.sh` fails inside `rpmbuild`, look at the rpmbuild log
+If `bin/build-rpm` fails inside `rpmbuild`, look at the rpmbuild log
 under `build/rpmbuild/BUILD/` and `build/rpmbuild/BUILDROOT/`. The
 typical issue is a missing build-time dependency on the build host
 (`rpm-build`, `kernel-headers`).
 
-If `build-deb-direct.sh` fails, the typical issue is `dpkg-deb` not in
+If `bin/build-deb-direct` fails, the typical issue is `dpkg-deb` not in
 `PATH` on the RHEL host — install `dpkg` from EPEL.
 
 For rebase-related build failures (upstream changed an identifier

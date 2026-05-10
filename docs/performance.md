@@ -59,7 +59,7 @@ page cache doesn't carry state between configurations. 5-second ramp,
 20-second measurement window.
 
 The full bench script is committed at
-[`dkms/scripts/run-perf-bench.sh`](../dkms/scripts/run-perf-bench.sh).
+[`bin/perf-bench`](../bin/perf-bench).
 Raw output for the runs in this doc is in
 [`notes/perf-baremetal-r10-2026-05-02.log`](../notes/perf-baremetal-r10-2026-05-02.log)
 and
@@ -259,7 +259,7 @@ sudo partprobe /dev/nvme0n1
 #    and an ms-aware mdadm fork at build/msadm.
 
 # 3. Run the bench.
-sudo bash dkms/scripts/run-perf-bench.sh
+sudo bash bin/perf-bench
 ```
 
 The full bench takes ~6 minutes and produces the three tables above

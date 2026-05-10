@@ -117,7 +117,7 @@ Pick the topology block matching your hardware.
 
 ```bash
 # Backward-compat positional form. Replace pX with your free partitions.
-sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/bin/perf-compare \
     /dev/nvme0n1p4 /dev/nvme0n1p5 \
     | tee /tmp/perf-run.log
 ```
@@ -125,7 +125,7 @@ sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
 ### 3.B — raid10 cross-disk (4 partitions, two disks; each disk has 1 local + 1 tcp)
 
 ```bash
-sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/bin/perf-compare \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
@@ -138,7 +138,7 @@ Append the variant names (any of `baseline per-bucket-arrays takeover
 latency-ewma llbitmap-fastpath`) at the end of any of the above:
 
 ```bash
-sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/bin/perf-compare \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
@@ -160,10 +160,10 @@ are derived automatically from --local + --remote):
 
 ```bash
 # Looser gate (e.g., 80 °C — closer to wctemp; faster but may throttle).
-sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/bin/perf-compare \
     --cool-thresh-k=353 ...
 # Disable cooldown entirely (back-to-back, watch your wctemp):
-sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/bin/perf-compare \
     --cool-thresh-k=0 ...
 ```
 
@@ -196,9 +196,9 @@ watch -n 10 'sudo nvme smart-log /dev/nvme0n1 -o json | jq -r "[.temperature, .t
 
 ```bash
 # OUT_BASE is the directory perf-feature-compare wrote to. With the
-# default DATE_TAG it's notes/perf-rebuild-<UTC date>/.
-OUT_BASE="$HOME/linux-meshstor/notes/perf-rebuild-$(date -u +%F)"
-~/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE"
+# default DATE_TAG it's results/perf-<UTC date>/.
+OUT_BASE="$HOME/linux-meshstor/results/perf-$(date -u +%F)"
+~/linux-meshstor/bin/perf-extract-table "$OUT_BASE"
 ```
 
 The helper auto-discovers variants and suites and emits a markdown table
@@ -210,7 +210,7 @@ where the bench's `drop_caches` plumbing emits warnings into `run.log`).
 To redirect to a file:
 
 ```bash
-~/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE" \
+~/linux-meshstor/bin/perf-extract-table "$OUT_BASE" \
     > "$OUT_BASE/TABLE.md"
 ```
 
@@ -268,7 +268,7 @@ script generates a unique hostnqn + hostid per run since 2026-05-05;
 verify with:
 
 ```bash
-grep hostnqn ~/linux-meshstor/dkms/scripts/run-perf-bench-tcp.sh
+grep hostnqn ~/linux-meshstor/bin/perf-bench-tcp
 # Should show "msbench-host-..." string
 ```
 
@@ -294,7 +294,7 @@ sudo rm -rf build/linux-meshstor-rebuilt
 
 `perf-feature-compare`'s built-in `extract_iops_json` has a known bug
 where it doesn't strip leading non-JSON lines from `run.log`. Use
-`perf-extract-table.sh` instead — it handles that case.
+`bin/perf-extract-table` instead — it handles that case.
 
 ### `modprobe: ERROR: could not insert 'raid10_ms': Invalid argument`
 
@@ -325,13 +325,13 @@ sudo dnf install -y fio fio-engine-libaio libaio dkms git-filter-repo \
 [ -x ~/mdadm/mdadm ]    || ( cd ~/mdadm && make -j$(nproc) mdadm )
 
 # Per-run (Phase 3, raid10 cross-disk example):
-sudo ~/linux-meshstor/dkms/scripts/perf-feature-compare.sh \
+sudo ~/linux-meshstor/bin/perf-compare \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
     | tee /tmp/perf-run.log
 
 # Results table (Phase 5):
-OUT_BASE="$HOME/linux-meshstor/notes/perf-rebuild-$(date -u +%F)"
-~/linux-meshstor/dkms/scripts/perf-extract-table.sh "$OUT_BASE"
+OUT_BASE="$HOME/linux-meshstor/results/perf-$(date -u +%F)"
+~/linux-meshstor/bin/perf-extract-table "$OUT_BASE"
 ```
