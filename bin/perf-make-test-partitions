@@ -16,8 +16,8 @@
 #   - COUNT × SIZE_GIB (default 2 × 25 GiB; configurable via env)
 #   - aligned to max(1 MiB, optimal_io_size from sysfs) — covers 4 KiB
 #     physical blocks and honors enterprise-NVMe optimal-io hints
-#   - GPT names: <devbasename>-test1, <devbasename>-test2
-#     (e.g. nvme0n1-test1, nvme0n1-test2)
+#   - GPT names: <devbasename>-test1 … <devbasename>-test<COUNT>
+#     (e.g. with COUNT=2: nvme0n1-test1, nvme0n1-test2)
 #
 # Idempotency:
 #   - re-running create with matching state is a no-op (exit 0)
@@ -304,17 +304,27 @@ then re-run this script."
     GIB=$((1024 * 1024 * 1024))
     SIZE_B=$((SIZE_GIB * GIB))
 
-    # Partition starts: round free-region start UP to the alignment boundary.
-    P1_START_B="$(round_up "$FREE_START_B" "$ALIGN_B")"
-    P1_END_B=$((P1_START_B + SIZE_B))
-    P2_START_B=$P1_END_B
-    P2_END_B=$((P2_START_B + SIZE_B))
+    [[ "$COUNT" =~ ^[1-9][0-9]*$ ]] \
+        || die "COUNT must be a positive integer (got: '$COUNT')"
+    # Each partition begins where the previous one ends, so per-partition
+    # alignment requires SIZE_B to be a whole multiple of ALIGN_B. With the
+    # 1 MiB floor this holds for any sane SIZE_GIB; fail loudly otherwise.
+    (( SIZE_B % ALIGN_B == 0 )) \
+        || die "SIZE_GIB=${SIZE_GIB} is not a multiple of alignment ${ALIGN_B} B"
 
-    (( P2_END_B <= FREE_END_B )) \
-        || die "would overflow free region: need ${SIZE_GIB}GiB × ${COUNT} = $((SIZE_B*COUNT)) B aligned to ${ALIGN_B} B starting at ${P1_START_B} B; free region ends at ${FREE_END_B} B"
+    # Per-partition byte ranges and labels (1-based indexing).
+    declare -a P_START_B P_END_B LABELS
+    P_START_B[1]="$(round_up "$FREE_START_B" "$ALIGN_B")"
+    P_END_B[1]=$(( P_START_B[1] + SIZE_B ))
+    LABELS[1]="${DEV_NAME}-test1"
+    for (( i = 2; i <= COUNT; i++ )); do
+        P_START_B[i]=${P_END_B[i-1]}
+        P_END_B[i]=$(( P_START_B[i] + SIZE_B ))
+        LABELS[i]="${DEV_NAME}-test${i}"
+    done
 
-    LABEL1="${DEV_NAME}-test1"
-    LABEL2="${DEV_NAME}-test2"
+    (( P_END_B[COUNT] <= FREE_END_B )) \
+        || die "would overflow free region: need ${SIZE_GIB}GiB × ${COUNT} = $((SIZE_B*COUNT)) B aligned to ${ALIGN_B} B starting at ${P_START_B[1]} B; free region ends at ${FREE_END_B} B"
 
     # ---- print plan ----
     cat <<EOF
@@ -328,9 +338,11 @@ Device:        $DEV
   align:       ${ALIGN_B} B
 
 Plan: create $COUNT partition(s), $SIZE_GIB GiB each, ${ALIGN_B}-byte aligned:
-  ${LABEL1}: ${P1_START_B} → ${P1_END_B} B  ($SIZE_GIB GiB)
-  ${LABEL2}: ${P2_START_B} → ${P2_END_B} B  ($SIZE_GIB GiB)
 EOF
+    for (( i = 1; i <= COUNT; i++ )); do
+        printf '  %s: %s → %s B  (%s GiB)\n' \
+            "${LABELS[i]}" "${P_START_B[i]}" "${P_END_B[i]}" "$SIZE_GIB"
+    done
 
     if [[ $YES -eq 0 ]]; then
         printf 'Proceeding in 5 s — Ctrl-C to cancel'
@@ -340,9 +352,12 @@ EOF
 
     # ---- create partitions ----
     # parted's `B` end is inclusive — subtract 1 byte from the exclusive end.
-    parted -s "$DEV" \
-        mkpart "$LABEL1" ext4 "${P1_START_B}B" "$((P1_END_B - 1))B" \
-        mkpart "$LABEL2" ext4 "${P2_START_B}B" "$((P2_END_B - 1))B"
+    local -a parted_args=( -s "$DEV" )
+    for (( i = 1; i <= COUNT; i++ )); do
+        parted_args+=( mkpart "${LABELS[i]}" ext4 \
+            "${P_START_B[i]}B" "$(( P_END_B[i] - 1 ))B" )
+    done
+    parted "${parted_args[@]}"
 
     # Re-read the partition table.
     partprobe "$DEV"
@@ -353,28 +368,28 @@ EOF
     echo "Verification — new layout:"
     parted -s "$DEV" unit MiB print | tail -n +2
 
-    # Check the two new device nodes exist + are 1 MiB aligned.
-    P1_DEV="${DEV}p1" ; P2_DEV="${DEV}p2"
-    # Discover by NAME instead of guessing the suffix
-    P1_DEV="$(lsblk -ln -o NAME,PARTLABEL "$DEV" | awk -v lbl="$LABEL1" '$2==lbl {print "/dev/"$1; exit}')"
-    P2_DEV="$(lsblk -ln -o NAME,PARTLABEL "$DEV" | awk -v lbl="$LABEL2" '$2==lbl {print "/dev/"$1; exit}')"
-    [[ -b "$P1_DEV" && -b "$P2_DEV" ]] \
-        || die "post-create: could not locate /dev nodes for $LABEL1 / $LABEL2"
-
-    # Verify each new partition starts on an ALIGN_B byte boundary. Kernel
-    # always reports /sys/.../start in 512 B sectors regardless of LBA size.
-    for p in "$P1_DEV" "$P2_DEV"; do
-        start_sectors="$(cat "/sys/class/block/$(basename "$p")/start" 2>/dev/null)"
+    # Discover the new device nodes by PARTLABEL and verify each starts on
+    # an ALIGN_B byte boundary. Kernel always reports /sys/.../start in
+    # 512 B sectors regardless of LBA size.
+    declare -a PART_DEVS
+    for (( i = 1; i <= COUNT; i++ )); do
+        pdev="$(lsblk -ln -o NAME,PARTLABEL "$DEV" \
+            | awk -v lbl="${LABELS[i]}" '$2==lbl {print "/dev/"$1; exit}')"
+        [[ -b "$pdev" ]] \
+            || die "post-create: could not locate /dev node for ${LABELS[i]}"
+        start_sectors="$(cat "/sys/class/block/$(basename "$pdev")/start" 2>/dev/null)"
         start_bytes=$(( start_sectors * 512 ))
         if (( start_bytes % ALIGN_B != 0 )); then
-            die "post-create: $p start offset $start_bytes B is NOT a multiple of ${ALIGN_B} B (alignment broken)"
+            die "post-create: $pdev start offset $start_bytes B is NOT a multiple of ${ALIGN_B} B (alignment broken)"
         fi
+        PART_DEVS[i]="$pdev"
     done
 
     echo
     echo "Created:"
-    echo "  $P1_DEV  ($LABEL1)"
-    echo "  $P2_DEV  ($LABEL2)"
+    for (( i = 1; i <= COUNT; i++ )); do
+        echo "  ${PART_DEVS[i]}  (${LABELS[i]})"
+    done
 }
 
 # Library mode guard: when sourced (e.g., by tests), expose helpers but do
