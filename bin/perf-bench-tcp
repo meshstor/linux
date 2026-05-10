@@ -28,6 +28,7 @@ set -euo pipefail
 DEFAULT_BITMAP="lockless"
 DEFAULT_PORT="4420"
 DEFAULT_ADDR="127.0.0.1"
+DEFAULT_ENGINE="ms"
 
 # ---- exit codes ----
 EXIT_USAGE=2
@@ -48,6 +49,7 @@ MSADM=""
 OUT_DIR=""
 FAIL_FAST=0
 KEEP=0
+ENGINE="$DEFAULT_ENGINE"
 
 die() { echo "error: $*" >&2; exit "$EXIT_USAGE"; }
 
@@ -672,6 +674,7 @@ parse_args() {
     OUT_DIR=""
     FAIL_FAST=0
     KEEP=0
+    ENGINE="$DEFAULT_ENGINE"
 
     local pos=()
     while [[ $# -gt 0 ]]; do
@@ -680,6 +683,7 @@ parse_args() {
             --local=*)    LOCALS+=("${1#--local=}") ;;
             --remote=*)   REMOTES+=("${1#--remote=}") ;;
             --bitmap=*)   BITMAP="${1#--bitmap=}" ;;
+            --engine=*)   ENGINE="${1#--engine=}" ;;
             --port=*)     PORT="${1#--port=}" ;;
             --addr=*)     ADDR="${1#--addr=}" ;;
             --out-dir=*)  OUT_DIR="${1#--out-dir=}" ;;
@@ -738,6 +742,11 @@ parse_args() {
         *)  die "unsupported --level: $LEVEL (raid1, raid10)" ;;
     esac
 
+    case "$ENGINE" in
+        md|ms) ;;
+        *) die "unsupported --engine: $ENGINE (md, ms)" ;;
+    esac
+
     # Reject duplicates anywhere in the merged member list.
     local p seen=()
     for p in "${LOCALS[@]}" "${REMOTES[@]}"; do
@@ -772,7 +781,9 @@ Flags:
                         2 or more)
   --remote=PATH         tcp-leg partition (repeatable; same count as
                         --local)
-  --bitmap=VAL          passed verbatim to msadm --bitmap (default: lockless)
+  --engine=md|ms        which raid stack: md=kernel mdadm; ms=meshstor msadm
+                        (default: ms)
+  --bitmap=VAL          passed verbatim to mdadm/msadm --bitmap (default: lockless)
   --out-dir=PATH        results root (default: ./results/<UTC>-<host>-<kver>)
   --port=N              nvmet tcp port (default: 4420)
   --addr=IP             nvmet tcp listen addr (default: 127.0.0.1)
