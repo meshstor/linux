@@ -63,25 +63,48 @@ dkms install -m %{pkgname} -v %{module_version} || :
 %preun
 # Remove DKMS registration before package files are removed.
 if [ "$1" = "0" ]; then
-    # Pre-emptively prune cross-kernel weak-updates symlinks for our three
-    # modules across every installed kernel, BEFORE calling `dkms remove`.
-    # Rationale: DKMS's framework default `post_transaction` runs
-    # `dracut --regenerate-all --force` at the end of `dkms remove`. If a
-    # newer kernel has weak-updates/ symlinks pointing into the kernel
-    # whose extra/ payload `dkms remove` just deleted, those links become
-    # dangling between the file delete and the dracut step, and dracut
-    # fails on that kernel with "installkernel failed in module
-    # kernel-modules-extra". Removing the symlinks up front avoids the
-    # window. We use -type l (not -xtype l like %posttrans) because the
-    # links are still live at this point — they only become dangling
-    # moments later, inside `dkms remove`. The package is being erased,
-    # so any reference to our modules is going away regardless.
+    # Pre-emptively prune cross-kernel weak-updates symlinks AND refresh
+    # `modules.dep` for affected kernels BEFORE calling `dkms remove`.
+    # Two failures we are working around:
+    #
+    #  1. DKMS's framework default `post_transaction` runs
+    #     `dracut --regenerate-all --force` at the end of `dkms remove`.
+    #     If a non-DKMS-built kernel has weak-updates/<our-mod>.ko*
+    #     symlinks pointing into the DKMS-built kernel's just-deleted
+    #     extra/ payload, those links go dangling between the file
+    #     delete and the dracut step.
+    #
+    #  2. Even after the dangling symlinks are deleted, modules.dep and
+    #     modules.dep.bin in those non-DKMS-built kernels still contain
+    #     "weak-updates/<our-mod>.ko*: ..." lines from when the symlinks
+    #     were live. `dkms remove` runs `depmod` only for the kernel it
+    #     built for; weak-modules-2 does not reliably re-depmod the
+    #     other affected kernels on remove. dracut's
+    #     90kernel-modules-extra reads modules.dep (per kernel), finds
+    #     the stale lines, calls `realpath` on them, and bails with
+    #     "installkernel failed in module kernel-modules-extra".
+    #
+    # We delete the symlinks (-type l, not -xtype l like %posttrans,
+    # because they are still live here — they only go dangling moments
+    # later inside `dkms remove`) AND run `depmod -a <kver>` for every
+    # kernel where we touched a symlink, so its modules.dep no longer
+    # advertises a path that is about to disappear.
+    affected_kvers=
     for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
         [ -d "$kdir" ] || continue
+        touched=
         for name in ms_mod raid1_ms raid10_ms; do
-            find "$kdir" -maxdepth 2 -name "${name}.ko*" -type l -delete
+            for f in "$kdir/${name}".ko*; do
+                if [ -L "$f" ]; then
+                    rm -f "$f" && touched=1
+                fi
+            done
         done
-    done 2>/dev/null || :
+        [ -n "$touched" ] && affected_kvers="$affected_kvers $(basename "$(dirname "$kdir")")"
+    done
+    for kver in $affected_kvers; do
+        /usr/sbin/depmod -a "$kver" 2>/dev/null || :
+    done
 
     dkms remove -m %{pkgname} -v %{module_version} --all || :
 fi
@@ -96,37 +119,77 @@ fi
 # kernel whose extra/ payload has been removed; dracut then fails with
 # "installkernel failed in module kernel-modules-extra" when it walks
 # those broken symlinks. We delete only links matching our three module
-# names that have no resolvable target (-xtype l). Live links (target
-# exists) and broken links owned by other DKMS packages are untouched.
+# names that have no resolvable target. Live links (target exists) and
+# broken links owned by other DKMS packages are untouched.
+#
+# Deleting a dangling symlink is necessary but not sufficient: that
+# kernel's modules.dep / modules.dep.bin still contains a
+# "weak-updates/<mod>.ko*: ..." line indexed by depmod when the link was
+# live. dracut's 90kernel-modules-extra reads modules.dep and trips on
+# the missing path. So we re-run `depmod -a <kver>` for every kernel
+# where we just removed a symlink, refreshing its index files.
+affected_kvers=
 for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
     [ -d "$kdir" ] || continue
+    touched=
     for name in ms_mod raid1_ms raid10_ms; do
-        find "$kdir" -maxdepth 2 -name "${name}.ko*" -xtype l -delete
+        for f in "$kdir/${name}".ko*; do
+            if [ -L "$f" ] && [ ! -e "$f" ]; then
+                rm -f "$f" && touched=1
+            fi
+        done
     done
-done 2>/dev/null || :
+    [ -n "$touched" ] && affected_kvers="$affected_kvers $(basename "$(dirname "$kdir")")"
+done
+for kver in $affected_kvers; do
+    /usr/sbin/depmod -a "$kver" 2>/dev/null || :
+done
 
 %triggerin -- kernel-core, kernel
 # After a new kernel is installed, weak-modules may have created links
 # under that kernel's weak-updates/ that are already broken (target
 # kernel's extra/ payload was removed in the same transaction). Prune
-# them. See the same comment block in %posttrans for full rationale.
+# them and refresh the affected kernel's modules.dep. See the same
+# comment block in %posttrans for full rationale.
+affected_kvers=
 for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
     [ -d "$kdir" ] || continue
+    touched=
     for name in ms_mod raid1_ms raid10_ms; do
-        find "$kdir" -maxdepth 2 -name "${name}.ko*" -xtype l -delete
+        for f in "$kdir/${name}".ko*; do
+            if [ -L "$f" ] && [ ! -e "$f" ]; then
+                rm -f "$f" && touched=1
+            fi
+        done
     done
-done 2>/dev/null || :
+    [ -n "$touched" ] && affected_kvers="$affected_kvers $(basename "$(dirname "$kdir")")"
+done
+for kver in $affected_kvers; do
+    /usr/sbin/depmod -a "$kver" 2>/dev/null || :
+done
 
 %triggerun -- kernel-core, kernel
 # A kernel is being removed. Symlinks in *other* kernels' weak-updates/
 # that pointed into the kernel being removed are about to become
-# dangling. Prune them across all kernels' weak-updates/ trees.
+# dangling. Prune them across all kernels' weak-updates/ trees and
+# refresh modules.dep for each kernel we touched. See the same comment
+# block in %posttrans for full rationale.
+affected_kvers=
 for kdir in "${MESHSTOR_MOD_ROOT:-/usr/lib/modules}"/*/weak-updates; do
     [ -d "$kdir" ] || continue
+    touched=
     for name in ms_mod raid1_ms raid10_ms; do
-        find "$kdir" -maxdepth 2 -name "${name}.ko*" -xtype l -delete
+        for f in "$kdir/${name}".ko*; do
+            if [ -L "$f" ] && [ ! -e "$f" ]; then
+                rm -f "$f" && touched=1
+            fi
+        done
     done
-done 2>/dev/null || :
+    [ -n "$touched" ] && affected_kvers="$affected_kvers $(basename "$(dirname "$kdir")")"
+done
+for kver in $affected_kvers; do
+    /usr/sbin/depmod -a "$kver" 2>/dev/null || :
+done
 
 %files
 %license COPYING
