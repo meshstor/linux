@@ -26,37 +26,48 @@ Usage: $(basename "$0") [options] [feature ...]
 Reconstruct a meshstor-main-equivalent tree from upstream + harness +
 the listed feature branches (applied as patches in the given order).
 
+By default produces a kernel-tree-only output (filtered upstream + features);
+pass --with-harness to also bake in $HARNESS_BRANCH (selftests, dkms scripts,
+docs, bin helpers). Packaging (bin/build-rpm etc.) reads drivers/md/ from
+this output by default — run from this repo regardless of --with-harness.
+
 Options:
   -o, --output DIR     Output directory (default: $DEFAULT_OUTPUT)
   --no-fetch           Skip refreshing the cached upstream mirror
+  --with-harness       Also apply $HARNESS_BRANCH on top of filtered upstream
+                       before features (default: kernel tree only)
   --keep               Bail (instead of wiping) if OUTPUT_DIR already exists
   -h, --help           Show this help
 
 Examples:
   $(basename "$0")
-      -> harness only
+      -> filtered upstream only
   $(basename "$0") md-latency-ewma
-      -> harness + latency-ewma
+      -> filtered upstream + latency-ewma
   $(basename "$0") per-bucket-arrays md-latency-ewma \\
                    wip/md-llbitmap-hot-write-fast-path
-      -> harness + three features in given order
+      -> filtered upstream + three features in given order
+  $(basename "$0") --with-harness md-latency-ewma
+      -> filtered upstream + harness + latency-ewma
 EOF
 }
 
 OUTPUT_DIR="$DEFAULT_OUTPUT"
 NO_FETCH=
+WITH_HARNESS=
 KEEP=
 FEATURES=()
 
 while (($#)); do
     case "$1" in
-        -o|--output)   OUTPUT_DIR="$2"; shift 2 ;;
-        --no-fetch)    NO_FETCH=1; shift ;;
-        --keep)        KEEP=1; shift ;;
-        -h|--help)     usage; exit 0 ;;
-        --)            shift; FEATURES+=("$@"); break ;;
-        -*)            echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
-        *)             FEATURES+=("$1"); shift ;;
+        -o|--output)    OUTPUT_DIR="$2"; shift 2 ;;
+        --no-fetch)     NO_FETCH=1; shift ;;
+        --with-harness) WITH_HARNESS=1; shift ;;
+        --keep)         KEEP=1; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        --)             shift; FEATURES+=("$@"); break ;;
+        -*)             echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *)              FEATURES+=("$1"); shift ;;
     esac
 done
 
@@ -137,7 +148,7 @@ prepare_output_dir() {
 prepare_output_dir
 
 require_remote_reachable
-require_branch_on_remote "$HARNESS_BRANCH" harness
+[[ -n "$WITH_HARNESS" ]] && require_branch_on_remote "$HARNESS_BRANCH" harness
 for f in "${FEATURES[@]}"; do
     require_branch_on_remote "$f" feature
 done
@@ -211,17 +222,27 @@ apply_branch_as_patches() {
     echo "$count"
 }
 
-stage3_apply_harness() {
+stage3_setup_remote() {
     git remote add meshstor "$MESHSTOR_URL"
     # One-shot fetch of upstream master as the format-patch base for both
     # harness and feature branches (all rebased on a torvalds master snapshot).
     git fetch meshstor "$UPSTREAM_BRANCH:refs/remotes/meshstor/$UPSTREAM_BRANCH"
+}
+
+stage3_apply_harness() {
     HARNESS_PATCH_COUNT="$(apply_branch_as_patches "$HARNESS_BRANCH" harness)"
     HARNESS_SHA="$(git rev-parse HEAD)"
     echo "rebuild-main: harness HEAD = $HARNESS_SHA"
 }
 
-stage3_apply_harness
+stage3_setup_remote
+if [[ -n "$WITH_HARNESS" ]]; then
+    stage3_apply_harness
+else
+    HARNESS_PATCH_COUNT=0
+    HARNESS_SHA="(skipped; pass --with-harness to apply)"
+    echo "rebuild-main: skipping $HARNESS_BRANCH (pass --with-harness to apply)"
+fi
 
 stage4_apply_features() {
     APPLIED_FEATURES=()  # parallel arrays for the summary
@@ -255,7 +276,7 @@ Output:        $OUTPUT_DIR
 Branch:        meshstor-main-rebuilt
 Upstream:      $UPSTREAM_SHA
 Filtered:      $FILTERED_SHA
-Harness:       $HARNESS_SHA ($HARNESS_PATCH_COUNT patches from $HARNESS_BRANCH)
+Harness:       $(if [[ -n "$WITH_HARNESS" ]]; then echo "$HARNESS_SHA ($HARNESS_PATCH_COUNT patches from $HARNESS_BRANCH)"; else echo "(skipped; pass --with-harness to apply)"; fi)
 EOF
     if (( ${#APPLIED_FEATURES[@]} == 0 )); then
         echo "Features:      (none)"
