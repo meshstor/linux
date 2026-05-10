@@ -62,6 +62,7 @@ feature_flags:
 	        bdev_count_inflight:linux/blkdev.h \
 	        bdev_count_inflight:linux/part_stat.h \
 	        bdev_write_zeroes_unmap_sectors:linux/blkdev.h \
+	        max_hw_wzeroes_unmap_sectors:linux/blkdev.h \
 	        timer_container_of:linux/timer.h \
 	        kzalloc_obj:linux/slab.h \
 	        kmalloc_obj:linux/slab.h \
