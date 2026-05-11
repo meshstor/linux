@@ -175,3 +175,29 @@ llbitmap_member_state() {
 llbitmap_pass() { echo "PASS: $1"; exit 0; }
 llbitmap_fail() { echo "FAIL: $1" >&2; exit 1; }
 llbitmap_skip() { echo "SKIP: $1" >&2; exit 4; }
+
+# llbitmap_events_of LOOP_OR_BLOCK -> echoes the integer events counter
+# from `mdadm --examine`. mdadm prints lines like
+#       Events :     17
+# We strip leading whitespace and the field separator, then trim.
+# Returns "" and exits 1 if mdadm fails or the field isn't found.
+llbitmap_events_of() {
+	local dev="$1"
+	local line
+	line="$("$MDADM" --examine "$dev" 2>/dev/null | awk -F: '/^[ \t]*Events[ \t]*:/{gsub(/[ \t]/, "", $2); print $2; exit}')" || true
+	if [ -z "$line" ]; then
+		echo "FAIL: llbitmap_events_of: no Events field for $dev" >&2
+		return 1
+	fi
+	echo "$line"
+}
+
+# llbitmap_member_present MS_NAME MEMBER_BASENAME -> 0 if the member is
+# tracked by sysfs (state file exists and is non-empty), 1 otherwise.
+# After `kicking non-fresh`, the member's dev-<X> directory is gone.
+llbitmap_member_present() {
+	local ms_name="$1"
+	local member="$2"
+	local state_file="/sys/block/${ms_name}/ms/dev-${member}/state"
+	[ -r "$state_file" ] && [ -n "$(cat "$state_file" 2>/dev/null)" ]
+}
