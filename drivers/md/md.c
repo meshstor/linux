@@ -3927,8 +3927,32 @@ static int analyze_sbs(struct mddev *mddev)
 		if (rdev != freshest) {
 			if (super_types[mddev->major_version].
 			    validate_super(mddev, freshest, rdev)) {
-				pr_warn("md: kicking non-fresh %pg from array!\n",
-					rdev->bdev);
+				u64 rdev_events = 0;
+
+				/*
+				 * rdev->sb_events is only assigned when WRITING
+				 * a superblock, so during assemble it still
+				 * reads 0. Pull the events counter out of the
+				 * on-disk superblock so the warning shows the
+				 * delta that caused the kick.
+				 */
+				if (rdev->sb_page) {
+					if (mddev->major_version == 1) {
+						struct mdp_superblock_1 *sb =
+							page_address(rdev->sb_page);
+						rdev_events = le64_to_cpu(sb->events);
+					} else if (mddev->major_version == 0) {
+						mdp_super_t *sb =
+							page_address(rdev->sb_page);
+						rdev_events =
+							((u64)sb->events_hi << 32) |
+							sb->events_lo;
+					}
+				}
+				pr_warn("md: kicking non-fresh %pg from array! (events=%llu, freshest=%llu)\n",
+					rdev->bdev,
+					(unsigned long long)rdev_events,
+					(unsigned long long)mddev->events);
 				md_kick_rdev_from_array(rdev);
 				continue;
 			}
