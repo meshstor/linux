@@ -80,10 +80,14 @@ llbitmap_dmesg_clear
 "$MDADM" --assemble "$MS_DEV" "$LA" "$LB" --run --force >/dev/null 2>&1
 "$MDADM" --wait "$MS_DEV" >/dev/null 2>&1 || true
 
-if ! llbitmap_dmesg_contains "kicking non-fresh ${LB_BASE} from array"; then
+# After D2 (md: log events counter values when kicking non-fresh device)
+# the warning carries the actual events numbers. Require that format
+# here; on an unpatched kernel this assertion fails and the next task
+# (kernel patch) is the fix.
+if ! llbitmap_dmesg_contains "kicking non-fresh ${LB_BASE} from array.*events=.*freshest="; then
 	echo "INFO: recent dmesg tail:"
 	dmesg | tail -30 | sed 's/^/  /'
-	llbitmap_fail "expected 'kicking non-fresh ${LB_BASE} from array' in dmesg"
+	llbitmap_fail "expected 'kicking non-fresh ${LB_BASE} from array.*events=.*freshest=' in dmesg"
 fi
 
 if llbitmap_member_present "$MS_NAME" "$LB_BASE"; then
