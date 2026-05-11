@@ -178,6 +178,12 @@ stage2_filter_repo() {
     echo "rebuild-main: local clone -> $OUTPUT_DIR"
     git clone "$mirror" "$OUTPUT_DIR"
     cd "$OUTPUT_DIR"
+    # `git am` needs a committer identity. The clone inherits none, and CI/perf
+    # boxes often lack a global one (hostname like "*.(none)" breaks
+    # auto-detection). Pin a synthetic local identity so rebuilds work on any
+    # machine and `git log` clearly attributes the rewrite.
+    git config user.name "rebuild-main"
+    git config user.email "rebuild-main@meshstor.local"
     git checkout "$UPSTREAM_BRANCH"
     echo "rebuild-main: filter-repo (paths: ${FILTER_PATHS[*]})"
     local filter_args=()
