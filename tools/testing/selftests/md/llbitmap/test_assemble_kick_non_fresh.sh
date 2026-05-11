@@ -126,10 +126,12 @@ if [ "$eA2_0" != "$eB2_0" ]; then
 	llbitmap_fail "scenario 2: initial events differ (eA=$eA2_0 eB=$eB2_0)"
 fi
 
-# One re-assemble cycle with LA2 alone bumps events by exactly 1.
-"$MDADM" --assemble "$MS_DEV2" "$LA2" --run --force >/dev/null 2>&1
-dd if=/dev/urandom of="$MS_DEV2" bs=1M count=1 oflag=direct >/dev/null 2>&1
-"$MDADM" --wait "$MS_DEV2" || true
+# Bump LA2's events by exactly 1: assemble readonly (no events bump),
+# transition to read-write (one md_update_sb fires for the state
+# change), then stop. Avoids the +2 bump that comes from data writes
+# (which trigger both the clean->dirty and dirty->clean transitions).
+"$MDADM" --assemble "$MS_DEV2" "$LA2" --readonly --run --force >/dev/null 2>&1
+"$MDADM" --readwrite "$MS_DEV2" >/dev/null 2>&1
 "$MDADM" --stop "$MS_DEV2" >/dev/null 2>&1
 
 eA2_1=$(llbitmap_events_of "$LA2")
