@@ -1,9 +1,9 @@
 --- a/md.c
 +++ b/md.c
-@@ -8224,6 +8224,15 @@
+@@ -8237,6 +8237,15 @@
  	return 0;
  }
-
+ 
 +#ifndef HAVE_GETGEO_GENDISK
 +/* Older kernels' block_device_operations.getgeo takes (struct block_device *).
 + * Wrap our gendisk-taking md_getgeo to match. */
@@ -16,7 +16,7 @@
  static inline int md_ioctl_valid(unsigned int cmd)
  {
  	switch (cmd) {
-@@ -8612,7 +8621,11 @@
+@@ -8625,7 +8634,11 @@
  #ifdef CONFIG_COMPAT
  	.compat_ioctl	= md_compat_ioctl,
  #endif

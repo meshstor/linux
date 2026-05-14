@@ -10,7 +10,7 @@ helper keeps the bitmap-file path unchanged.
 
 --- a/md.c
 +++ b/md.c
-@@ -2645,7 +2645,7 @@ static void export_rdev(struct md_rdev *rdev)
+@@ -2657,7 +2657,7 @@
  	if (test_bit(AutoDetected, &rdev->flags))
  		md_autodetect_dev(rdev->bdev->bd_dev);
  #endif
@@ -19,9 +19,9 @@ helper keeps the bitmap-file path unchanged.
  	rdev->bdev = NULL;
  	kobject_put(&rdev->kobj);
  }
-@@ -3875,7 +3875,7 @@ static struct md_rdev *md_import_device(dev_t newdev, int super_format, int supe
+@@ -3887,7 +3887,7 @@
  	return rdev;
-
+ 
  out_blkdev_put:
 -	fput(rdev->bdev_file);
 +	ms_bdev_file_release(rdev->bdev_file);
