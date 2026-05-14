@@ -1,21 +1,21 @@
 --- a/md.c
 +++ b/md.c
-@@ -2024,8 +2024,10 @@
+@@ -2020,8 +2020,10 @@
  
  		mddev->max_disks =  (4096-256)/2;
  
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++#ifdef HAVE_MDP_SB1_LOGICAL_BLOCK_SIZE
  		if (!mddev->logical_block_size)
  			mddev->logical_block_size = le32_to_cpu(sb->logical_block_size);
 +#endif
  
  		if ((le32_to_cpu(sb->feature_map) & MD_FEATURE_BITMAP_OFFSET) &&
  		    mddev->bitmap_info.file == NULL) {
-@@ -2221,7 +2223,9 @@
+@@ -2217,7 +2219,9 @@
  	sb->chunksize = cpu_to_le32(mddev->chunk_sectors);
  	sb->level = cpu_to_le32(mddev->level);
  	sb->layout = cpu_to_le32(mddev->layout);
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++#ifdef HAVE_MDP_SB1_LOGICAL_BLOCK_SIZE
  	sb->logical_block_size = cpu_to_le32(mddev->logical_block_size);
 +#endif
  	if (test_bit(FailFast, &rdev->flags))

@@ -14,14 +14,14 @@ parameter is already const.
 
 --- a/md.c
 +++ b/md.c
-@@ -10665,7 +10665,9 @@ static int __init md_init(void)
+@@ -10692,7 +10692,9 @@
  	mdp_major = ret;
-
+ 
  	register_reboot_notifier(&md_notifier);
 -	raid_table_header = register_sysctl("dev/raid", raid_table);
 +	raid_table_header = register_sysctl_sz("dev/raid",
 +					       (struct ctl_table *)raid_table,
 +					       ARRAY_SIZE(raid_table));
-
+ 
  	md_geninit();
  	return 0;
