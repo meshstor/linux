@@ -116,6 +116,10 @@ feature_flags:
 	        "$(KDIR)/include/linux/blkdev.h" 2>/dev/null | grep -q found; then \
 	        echo "#define HAVE_QUEUE_LIMITS_FEATURES 1"; \
 	    fi; \
+	    if awk '/^struct[[:space:]]+mdp_superblock_1[[:space:]]*\{/{in_s=1; next} in_s && /^\};/{in_s=0; exit} in_s && /\<logical_block_size\>[[:space:]]*;/{print "found"; exit}' \
+	        "$(KDIR)/include/uapi/linux/raid/md_p.h" 2>/dev/null | grep -q found; then \
+	        echo "#define HAVE_MDP_SB1_LOGICAL_BLOCK_SIZE 1"; \
+	    fi; \
 	    if grep -qE "\\bBLK_STS_INVAL\\b" \
 	        "$(KDIR)/include/linux/blk_types.h" 2>/dev/null; then \
 	        echo "#define HAVE_BLK_STS_INVAL 1"; \

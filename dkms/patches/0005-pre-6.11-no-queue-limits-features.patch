@@ -15,7 +15,7 @@ when the running kernel's <linux/blkdev.h> defines `features` inside
 
 --- a/md.c
 +++ b/md.c
-@@ -6274,8 +6274,10 @@ EXPORT_SYMBOL_GPL(mddev_update_io_opt);
+@@ -6286,8 +6286,10 @@
  void md_init_stacking_limits(struct queue_limits *lim)
  {
  	blk_set_stacking_limits(lim);
@@ -25,25 +25,25 @@ when the running kernel's <linux/blkdev.h> defines `features` inside
 +#endif
  }
  EXPORT_SYMBOL_GPL(md_init_stacking_limits);
-
---- a/raid1.c
-+++ b/raid1.c
-@@ -3207,7 +3207,9 @@ static int raid1_set_limits(struct mddev *mddev)
- 	lim.max_write_zeroes_sectors = 0;
- 	lim.max_hw_wzeroes_unmap_sectors = 0;
- 	lim.logical_block_size = mddev->logical_block_size;
+ 
+--- a/raid10.c
++++ b/raid10.c
+@@ -3942,7 +3942,9 @@
+ 	lim.io_min = mddev->chunk_sectors << 9;
+ 	lim.chunk_sectors = mddev->chunk_sectors;
+ 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
 +#ifdef HAVE_QUEUE_LIMITS_FEATURES
  	lim.features |= BLK_FEAT_ATOMIC_WRITES;
 +#endif
  	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
  	if (err)
  		return err;
---- a/raid10.c
-+++ b/raid10.c
-@@ -3940,7 +3940,9 @@ static int raid10_set_queue_limits(struct mddev *mddev)
- 	lim.io_min = mddev->chunk_sectors << 9;
- 	lim.chunk_sectors = mddev->chunk_sectors;
- 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
+--- a/raid1.c
++++ b/raid1.c
+@@ -3209,7 +3209,9 @@
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
+ #endif
+ 	lim.logical_block_size = mddev->logical_block_size;
 +#ifdef HAVE_QUEUE_LIMITS_FEATURES
  	lim.features |= BLK_FEAT_ATOMIC_WRITES;
 +#endif
