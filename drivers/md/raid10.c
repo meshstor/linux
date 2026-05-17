@@ -939,9 +939,14 @@ static void raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
 	/* block any new IO from starting */
 	atomic_inc(&conf->barrier[idx]);
 
-	/* Now wait for all pending IO to complete */
+	/*
+	 * Now wait for all pending IO to complete.  Also block while the array
+	 * is frozen: freeze_array() sets array_freeze_pending and expects no
+	 * sync I/O to start until unfreeze_array() clears it.
+	 */
 	wait_event_barrier(conf, !atomic_read(&conf->nr_pending[idx]) &&
-				 atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH);
+				 atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH &&
+				 !conf->array_freeze_pending);
 
 	write_sequnlock_irq(&conf->resync_lock);
 }
@@ -1108,23 +1113,27 @@ static void freeze_array(struct r10conf *conf, int extra)
 {
 	/* stop syncio and normal IO and wait for everything to
 	 * go quiet.
-	 * We set array_freeze_pending, and then
-	 * wait until nr_pending match nr_queued+extra (summed
-	 * across all barrier buckets).
-	 * This is called in the context of one normal IO request
-	 * that has failed. Thus any sync request that might be pending
-	 * will be blocked by nr_pending, and we need to wait for
-	 * pending IO requests to complete or be queued for re-try.
-	 * Thus the number queued (nr_queued) plus this request (extra)
-	 * must match the number of pending IOs (nr_pending) before
-	 * we continue.
+	 * We set array_freeze_pending, and then wait until
+	 * get_unqueued_pending() matches extra (summed across all
+	 * barrier buckets).
+	 *
+	 * array_freeze_pending is kept set until the matching
+	 * unfreeze_array() call so the entire frozen interval blocks
+	 * new normal I/O (in wait_barrier_nolock and the wait_barrier
+	 * slow path) and new sync I/O (in raise_barrier).  In the
+	 * per-bucket design there is no single 'barrier' or 'nr_waiting'
+	 * scalar we can bump to stand in for the freeze, so the flag
+	 * itself has to persist.
+	 *
+	 * This is called in the context of one normal IO request that
+	 * has failed.  That request still holds an nr_pending reference
+	 * (it isn't queued), so the caller passes extra == 1 to account
+	 * for it.
 	 */
 	write_seqlock_irq(&conf->resync_lock);
 	conf->array_freeze_pending++;
-	atomic_inc(&conf->nr_waiting[0]);
 	wait_event_barrier_cmd(conf, get_unqueued_pending(conf) == extra,
 			       flush_pending_writes(conf));
-	conf->array_freeze_pending--;
 	write_sequnlock_irq(&conf->resync_lock);
 }
 
@@ -1132,9 +1141,9 @@ static void unfreeze_array(struct r10conf *conf)
 {
 	/* reverse the effect of the freeze */
 	write_seqlock_irq(&conf->resync_lock);
-	atomic_dec(&conf->nr_waiting[0]);
-	wake_up(&conf->wait_barrier);
+	conf->array_freeze_pending--;
 	write_sequnlock_irq(&conf->resync_lock);
+	wake_up(&conf->wait_barrier);
 }
 
 static sector_t choose_data_offset(struct r10bio *r10_bio,
