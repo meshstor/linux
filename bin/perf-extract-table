@@ -10,10 +10,14 @@
 # in both cases (occasional slow-leg routes), so mean is the headline.
 #
 # Usage:
-#   bin/perf-extract-table [--dot] <results-base-dir> [variant ...]
+#   bin/perf-extract-table [--dot] [--baseline <dir>] <results-base-dir> [variant ...]
 #
 # When variant args are omitted, walks every subdir of <results-base-dir>
 # that has a results/ child; baseline (if present) is placed first.
+#
+# --baseline <dir> reads the baseline from <dir> (which must contain a
+# results/ child) instead of the default <results-base-dir>/baseline.
+# Useful when sharing one baseline across multiple comparison trees.
 #
 # --dot replaces any percent-delta cell number whose absolute value is
 # below 1% with "." — visual noise reduction for runs that are within
@@ -26,33 +30,55 @@
 set -euo pipefail
 
 DOT=0
+BASELINE_OVERRIDE=""
 _args=()
-for _a in "$@"; do
-    case "$_a" in
-        --dot) DOT=1 ;;
-        *) _args+=("$_a") ;;
+while (($#)); do
+    case "$1" in
+        --dot) DOT=1; shift ;;
+        --baseline) BASELINE_OVERRIDE="${2:?--baseline requires a directory}"; shift 2 ;;
+        --baseline=*) BASELINE_OVERRIDE="${1#--baseline=}"; shift ;;
+        *) _args+=("$1"); shift ;;
     esac
 done
 set -- ${_args[@]+"${_args[@]}"}
-unset _args _a
+unset _args
 
 if (($# < 1)) || [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '2,20p' "$0" | sed 's/^# \?//'
+    sed -n '2,24p' "$0" | sed 's/^# \?//'
     exit 2
 fi
 
 BASE="$1"; shift
 [[ -d "$BASE" ]] || { echo "error: not a directory: $BASE" >&2; exit 1; }
 
+if [[ -n "$BASELINE_OVERRIDE" ]]; then
+    BASELINE_PATH="${BASELINE_OVERRIDE%/}"
+    [[ -d "$BASELINE_PATH/results" ]] || {
+        echo "error: --baseline dir has no results/ child: $BASELINE_PATH" >&2; exit 1; }
+    BASELINE_NAME="$(basename "$BASELINE_PATH")"
+else
+    BASELINE_PATH="$BASE/baseline"
+    BASELINE_NAME="baseline"
+fi
+
 # ---- variant + suite discovery ----
+# Resolve a variant name to the directory holding its results/ subdir.
+# The baseline row honors --baseline; everything else is relative to BASE.
+variant_dir() {
+    if [[ "$1" == "$BASELINE_NAME" ]]; then printf '%s\n' "$BASELINE_PATH"
+    else printf '%s\n' "$BASE/$1"; fi
+}
+
 if (($# > 0)); then
     VARIANTS=("$@")
 else
     VARIANTS=()
-    [[ -d "$BASE/baseline/results" ]] && VARIANTS+=(baseline)
+    [[ -d "$BASELINE_PATH/results" ]] && VARIANTS+=("$BASELINE_NAME")
     for d in "$BASE"/*/; do
         n="$(basename "${d%/}")"
-        [[ "$n" == "baseline" ]] && continue
+        # Skip the baseline (already first) and any $BASE/baseline that the
+        # --baseline override has displaced.
+        [[ "$n" == "$BASELINE_NAME" || "$n" == "baseline" ]] && continue
         [[ -d "$d/results" ]] && VARIANTS+=("$n")
     done
 fi
@@ -61,7 +87,7 @@ fi
 # Suite enumeration: from baseline if present, else from the first variant.
 discover_from=""
 for v in "${VARIANTS[@]}"; do
-    [[ -d "$BASE/$v/results" ]] && { discover_from="$v"; break; }
+    [[ -d "$(variant_dir "$v")/results" ]] && { discover_from="$v"; break; }
 done
 [[ -n "$discover_from" ]] || { echo "error: no results/ subdir found" >&2; exit 1; }
 
@@ -70,7 +96,7 @@ done
 # Unknown suites land at the end in lsblk-glob order.
 declare -A _seen
 DISCOVERED=()
-for d in "$BASE/$discover_from/results"/*/; do
+for d in "$(variant_dir "$discover_from")/results"/*/; do
     [[ -d "$d" ]] || continue
     DISCOVERED+=("$(basename "${d%/}")")
 done
@@ -96,7 +122,7 @@ for d in "${DISCOVERED[@]}"; do
     [[ -z "${_seen[$d]:-}" ]] && SUITES+=("$d")
 done
 unset _seen DISCOVERED
-(( ${#SUITES[@]} > 0 )) || { echo "error: no suites under $BASE/$discover_from/results/" >&2; exit 1; }
+(( ${#SUITES[@]} > 0 )) || { echo "error: no suites under $(variant_dir "$discover_from")/results/" >&2; exit 1; }
 
 # ---- extraction + formatting ----
 
@@ -176,9 +202,9 @@ done
 
 # Capture baseline values for delta calc.
 declare -A BASE_IOPS BASE_MEAN BASE_P99
-if [[ -d "$BASE/baseline/results" ]]; then
+if [[ -d "$BASELINE_PATH/results" ]]; then
     for s in "${SUITES[@]}"; do
-        read -r i m p < <(extract_raw "$BASE/baseline/results/$s/run.log")
+        read -r i m p < <(extract_raw "$BASELINE_PATH/results/$s/run.log")
         BASE_IOPS[$s]="$i"
         BASE_MEAN[$s]="$m"
         BASE_P99[$s]="$p"
@@ -189,9 +215,9 @@ fi
 declare -A CELL
 for v in "${VARIANTS[@]}"; do
     for s in "${SUITES[@]}"; do
-        f="$BASE/$v/results/$s/run.log"
+        f="$(variant_dir "$v")/results/$s/run.log"
         read -r iops mean p99 < <(extract_raw "$f")
-        if [[ "$v" == "baseline" ]]; then
+        if [[ "$v" == "$BASELINE_NAME" ]]; then
             if [[ "$iops" == "0" && "$p99" == "0" ]]; then
                 CELL[$v|$s]="-"
             else
