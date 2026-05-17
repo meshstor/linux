@@ -2,11 +2,23 @@
 # Shared helpers for raid10 selftests.
 #
 # These tests target the in-tree md/raid10 driver via stock /dev/mdN
-# devices.  They build small loop-backed arrays on tmpfs so the
-# underlying storage is fast enough that lock contention in the barrier
-# path becomes the dominant cost.
+# devices by default.  They can also target the out-of-tree meshstor-ms
+# variant (raid10_ms.ko under ms_mod.ko, major 252, devices /dev/msN)
+# by exporting:
+#   MDADM=/home/mykola/mdadm/mdadm   # patched mdadm that knows /dev/msN
+#   RAID10_DEV_PREFIX=ms             # device basename prefix (default md)
+#   RAID10_SYSFS_SUBDIR=ms           # /sys/block/<dev>/<subdir> (default md)
+#   RAID10_MDSTAT=/proc/msstat       # personality file (default /proc/mdstat)
+#
+# Loop devices on tmpfs back the array so storage is fast enough that
+# barrier-path lock contention is the dominant cost.
 
 set -u
+
+MDADM="${MDADM:-mdadm}"
+RAID10_DEV_PREFIX="${RAID10_DEV_PREFIX:-md}"
+RAID10_SYSFS_SUBDIR="${RAID10_SYSFS_SUBDIR:-md}"
+RAID10_MDSTAT="${RAID10_MDSTAT:-/proc/mdstat}"
 
 RAID10_TEST_LOOPS=()
 RAID10_TEST_FILES=()
@@ -21,24 +33,23 @@ raid10_require_root() {
 
 raid10_require_tools() {
 	local tool
-	for tool in mdadm losetup fio python3; do
+	for tool in losetup fio python3; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			echo "SKIP: missing tool: $tool" >&2
 			exit 4
 		fi
 	done
+	if ! command -v "$MDADM" >/dev/null 2>&1 && ! [ -x "$MDADM" ]; then
+		echo "SKIP: missing mdadm at: $MDADM" >&2
+		exit 4
+	fi
 }
 
 raid10_require_module() {
-	if ! grep -qw raid10 /proc/modules && ! grep -qw raid10 /proc/personalities; then
-		modprobe raid10 2>/dev/null || true
-	fi
-	if ! grep -qw raid10 /proc/mdstat 2>/dev/null && ! grep -qw raid10 /proc/personalities 2>/dev/null; then
-		# /proc/mdstat lists loaded personalities in its first line
-		if ! head -1 /proc/mdstat 2>/dev/null | grep -qw raid10; then
-			echo "SKIP: raid10 personality not available" >&2
-			exit 4
-		fi
+	# Personality file first line: "Personalities : [raid1] [raid10]"
+	if ! head -1 "$RAID10_MDSTAT" 2>/dev/null | grep -qw raid10; then
+		echo "SKIP: raid10 personality not registered in $RAID10_MDSTAT" >&2
+		exit 4
 	fi
 }
 
@@ -97,21 +108,37 @@ raid10_load_registry() {
 	done < "$RAID10_TEST_REGISTRY"
 }
 
-# raid10_alloc_md -> echoes a free /dev/mdN name (md240..md255).
-# Stops anything left over from a previous failed run.
+# raid10_alloc_md -> echoes a free /dev/<prefix>N name in the 240..255
+# range.  Stops anything left over from a previous failed run.
+# For the ms variant a stale device node may exist but be empty; we
+# accept it if array_state is "clear", matching llbitmap_alloc_ms_dev.
 raid10_alloc_md() {
 	local n
 	for n in $(seq 240 255); do
-		if [ -b "/dev/md${n}" ]; then
-			mdadm --stop "/dev/md${n}" >/dev/null 2>&1 || true
-			[ -b "/dev/md${n}" ] && continue
+		local dev="/dev/${RAID10_DEV_PREFIX}${n}"
+		local name="${RAID10_DEV_PREFIX}${n}"
+		if [ -b "$dev" ]; then
+			"$MDADM" --stop "$dev" >/dev/null 2>&1 || true
+			# After --stop the node may persist (ms variant); only
+			# reuse it if there's no live array.
+			local state
+			state=$(cat "/sys/block/${name}/${RAID10_SYSFS_SUBDIR}/array_state" 2>/dev/null || echo "")
+			case "$state" in
+				clear|"") : ;;   # acceptable
+				*)         continue ;;
+			esac
 		fi
-		RAID10_TEST_MD="md${n}"
-		echo "/dev/md${n}"
+		RAID10_TEST_MD="$name"
+		echo "$dev"
 		return 0
 	done
-	echo "FAIL: no free md device in md240..md255" >&2
+	echo "FAIL: no free /dev/${RAID10_DEV_PREFIX} device in 240..255" >&2
 	exit 1
+}
+
+# Sysfs base for an md/ms device (e.g. /sys/block/md240/md or .../ms).
+_raid10_sysfs() {
+	echo "/sys/block/$1/${RAID10_SYSFS_SUBDIR}"
 }
 
 # raid10_wait_idle MD_NAME [timeout_seconds]
@@ -119,31 +146,29 @@ raid10_wait_idle() {
 	local md="$1" timeout="${2:-30}"
 	local i
 	for i in $(seq 1 $((timeout * 2))); do
-		[ "$(cat "/sys/block/${md}/md/sync_action" 2>/dev/null)" = "idle" ] && return 0
+		[ "$(cat "$(_raid10_sysfs "$md")/sync_action" 2>/dev/null)" = "idle" ] && return 0
 		sleep 0.5
 	done
 	echo "FAIL: ${md} sync_action never went idle" >&2
-	cat /proc/mdstat >&2
+	cat "$RAID10_MDSTAT" >&2
 	return 1
 }
 
 # raid10_set_sync_speed MD_NAME KBPS  -- pin min and max to the same value.
 raid10_set_sync_speed() {
 	local md="$1" kbps="$2"
-	echo "$kbps" > "/sys/block/${md}/md/sync_speed_max"
-	echo "$kbps" > "/sys/block/${md}/md/sync_speed_min"
+	echo "$kbps" > "$(_raid10_sysfs "$md")/sync_speed_max"
+	echo "$kbps" > "$(_raid10_sysfs "$md")/sync_speed_min"
 }
 
 # raid10_start_check MD_NAME -- start a 'check' resync.
 raid10_start_check() {
-	local md="$1"
-	echo check > "/sys/block/${md}/md/sync_action"
+	echo check > "$(_raid10_sysfs "$1")/sync_action"
 }
 
 # raid10_stop_sync MD_NAME -- best-effort.
 raid10_stop_sync() {
-	local md="$1"
-	echo idle > "/sys/block/${md}/md/sync_action" 2>/dev/null || true
+	echo idle > "$(_raid10_sysfs "$1")/sync_action" 2>/dev/null || true
 }
 
 # raid10_fio_p99_iops DEV SECONDS NJOBS -- echoes "<iops> <p99_us>".
@@ -175,7 +200,7 @@ raid10_cleanup() {
 	raid10_load_registry
 	if [ -n "$RAID10_TEST_MD" ] && [ -b "/dev/${RAID10_TEST_MD}" ]; then
 		raid10_stop_sync "$RAID10_TEST_MD"
-		mdadm --stop "/dev/${RAID10_TEST_MD}" >/dev/null 2>&1
+		"$MDADM" --stop "/dev/${RAID10_TEST_MD}" >/dev/null 2>&1
 	fi
 	udevadm settle >/dev/null 2>&1
 	local loop f

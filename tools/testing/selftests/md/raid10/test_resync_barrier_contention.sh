@@ -80,7 +80,7 @@ for i in 0 1 2 3; do
 done
 raid10_load_registry
 
-mdadm --create --run --force --assume-clean "$DEV" --level=10 \
+"$MDADM" --create --run --force --assume-clean "$DEV" --level=10 \
 	--raid-devices=4 --layout=n2 "${LOOPS[@]}" >/dev/null 2>&1
 sleep 1
 raid10_wait_idle "$MD"
