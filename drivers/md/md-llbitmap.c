@@ -981,7 +981,20 @@ static int llbitmap_read_sb(struct llbitmap *llbitmap)
 		else
 			mddev->bitmap_info.space = mddev->bitmap_info.default_space;
 	}
-	llbitmap->flags = le32_to_cpu(sb->state);
+	/*
+	 * Mask sb->state on load to the set of bits that are meaningful
+	 * to persist. BITMAP_WRITE_ERROR (bit 2) and BITMAP_DAEMON_BUSY
+	 * (bit 5) are runtime-only signals; trusting them from disk turns
+	 * a single torn write of sb->state into a silent denial-of-bitmap.
+	 * A torn write that plants BITMAP_WRITE_ERROR makes llbitmap_enabled()
+	 * return false for the array's entire lifetime with no log line
+	 * attributing the cause; bits_show shows "bitmap io error" and the
+	 * on-disk super stops advancing. Mask defensively at load.
+	 * BITMAP_HOSTENDIAN (bit 15) is md-bitmap-only and never set by llbitmap.
+	 */
+	llbitmap->flags = le32_to_cpu(sb->state) &
+			  (BIT(BITMAP_STALE) | BIT(BITMAP_FIRST_USE) |
+			   BIT(BITMAP_CLEAN));
 	if (test_and_clear_bit(BITMAP_FIRST_USE, &llbitmap->flags)) {
 		ret = llbitmap_init(llbitmap);
 		goto out_put_page;
