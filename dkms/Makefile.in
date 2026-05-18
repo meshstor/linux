@@ -37,7 +37,7 @@ ifeq ($(KBUILD_EXTMOD),)
 
 .PHONY: all feature_flags clean modules_install
 
-all: feature_flags
+all: feature_flags version.h
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
 # Feature-detect the target kernel's headers at module-build time. DKMS
@@ -130,9 +130,34 @@ feature_flags:
 	@echo "Detected:"
 	@grep "^#define HAVE" compat/feature_flags.h | sed 's/^/  /' || echo "  (none — kernel matches in-tree API)"
 
+# version.h supplies MS_VERSION (PACKAGE_VERSION from dkms.conf) for the
+# MODULE_VERSION() declaration injected into ms.c by bin/build-tarball.
+# Regenerated when dkms.conf is newer than version.h — so a developer
+# bumping PACKAGE_VERSION mid-iteration sees the new value on the next
+# make, and customer DKMS rebuilds against a new kernel produce the same
+# string deterministically from the same dkms.conf.
+version.h: dkms.conf
+	@ver=$$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$$/\1/p' $<); \
+	if [ -z "$$ver" ]; then \
+	    echo "version.h: PACKAGE_VERSION missing or empty in $<" >&2; \
+	    exit 1; \
+	fi; \
+	case "$$ver" in *[\"\\\$$\`]*) \
+	    echo "version.h: PACKAGE_VERSION contains shell/C special chars: $$ver" >&2; \
+	    exit 1;; esac; \
+	{ \
+	    echo '/* SPDX-License-Identifier: GPL-2.0-or-later */'; \
+	    echo '/* Auto-generated from dkms.conf PACKAGE_VERSION. Do not edit. */'; \
+	    echo '#ifndef MS_VERSION_H'; \
+	    echo '#define MS_VERSION_H'; \
+	    echo "#define MS_VERSION \"$$ver\""; \
+	    echo '#endif'; \
+	} > $@
+	@echo "Generated version.h: MS_VERSION = $$(sed -n 's/.*MS_VERSION \"\(.*\)\".*/\1/p' $@)"
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
-	@rm -f compat/feature_flags.h
+	@rm -f compat/feature_flags.h version.h
 
 modules_install:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
