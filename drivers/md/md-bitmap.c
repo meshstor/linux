@@ -930,8 +930,24 @@ re_read:
 		}
 	}
 
-	/* assign fields using values from superblock */
-	bitmap->flags |= le32_to_cpu(sb->state);
+	/*
+	 * Assign fields using values from superblock, masking out the
+	 * runtime-only bits.  BITMAP_WRITE_ERROR (bit 2) and
+	 * BITMAP_DAEMON_BUSY (bit 5) are kernel-only signals that have
+	 * no business persisting across assemble; a torn write that
+	 * plants them into sb->state would otherwise be picked up here
+	 * via |=.  In particular, BITMAP_WRITE_ERROR forged on disk
+	 * makes md_bitmap_create() fail with -EIO, leaving the array
+	 * unbootable until the bitmap super is rewritten.
+	 *
+	 * BITMAP_HOSTENDIAN (bit 15) is the only non-{STALE,FIRST_USE,
+	 * CLEAN} bit md-bitmap genuinely uses, and it is derived from
+	 * sb->version below rather than the state field; mask it out
+	 * here regardless.
+	 */
+	bitmap->flags |= le32_to_cpu(sb->state) &
+			 (BIT(BITMAP_STALE) | BIT(BITMAP_FIRST_USE) |
+			  BIT(BITMAP_CLEAN));
 	if (le32_to_cpu(sb->version) == BITMAP_MAJOR_HOSTENDIAN)
 		set_bit(BITMAP_HOSTENDIAN, &bitmap->flags);
 	bitmap->events_cleared = le64_to_cpu(sb->events_cleared);
