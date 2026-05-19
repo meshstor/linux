@@ -108,7 +108,7 @@ PREFERRED_ORDER=(
     kp-asym-read
     kp-hot-region-write
     kp-hot-region-largeio-write
-    kp-bucket-contention-write
+    kp-resync-overlap-write
 )
 SUITES=()
 for s in "${PREFERRED_ORDER[@]}"; do
