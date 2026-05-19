@@ -414,6 +414,8 @@ static char state_machine[BitStateCount][BitmapActionCount] = {
 };
 
 static void __llbitmap_flush(struct mddev *mddev);
+static void llbitmap_update_sb(void *data);
+static void llbitmap_destroy(struct mddev *mddev);
 
 static enum llbitmap_state llbitmap_read(struct llbitmap *llbitmap, loff_t pos)
 {
@@ -926,6 +928,27 @@ static int llbitmap_init(struct llbitmap *llbitmap)
 
 	llbitmap_state_machine(llbitmap, 0, llbitmap->chunks - 1,
 			       BitmapActionInit);
+
+	/*
+	 * Persist BITMAP_FIRST_USE clear (and the llbitmap-chosen
+	 * chunksize, daemon_sleep, sectors_reserved) before the bulk
+	 * page flush. Without this, a crash between RUN_ARRAY and the
+	 * first md_update_sb leaves FIRST_USE set on disk and the next
+	 * assemble re-runs llbitmap_init, clobbering sync state.
+	 *
+	 * llbitmap_update_sb() is void; failure is signaled via
+	 * BITMAP_WRITE_ERROR on llbitmap->flags.  The acct-based detector
+	 * inside llbitmap_write_sb() catches total write failure even
+	 * when md_error()'s personality chain is dormant (during
+	 * do_md_run() mddev->pers is not yet assigned).
+	 */
+	llbitmap_update_sb(llbitmap);
+	if (test_bit(BITMAP_WRITE_ERROR, &llbitmap->flags)) {
+		pr_err("md/llbitmap: %s: failed to persist initial bitmap super\n",
+		       mdname(mddev));
+		return -EIO;
+	}
+
 	/* flush initial llbitmap to disk */
 	__llbitmap_flush(mddev);
 
@@ -1140,10 +1163,8 @@ static int llbitmap_create(struct mddev *mddev)
 	mddev->bitmap = llbitmap;
 	ret = llbitmap_read_sb(llbitmap);
 	mutex_unlock(&mddev->bitmap_info.mutex);
-	if (ret) {
-		kfree(llbitmap);
-		mddev->bitmap = NULL;
-	}
+	if (ret)
+		llbitmap_destroy(mddev);
 
 	return ret;
 }
@@ -1498,13 +1519,69 @@ static void llbitmap_dirty_bits(struct mddev *mddev, unsigned long s,
 	llbitmap_state_machine(mddev->bitmap, s, e, BitmapActionStartwrite);
 }
 
-static void llbitmap_write_sb(struct llbitmap *llbitmap)
+/*
+ * Per-rdev mirror of llbitmap_write_page(0) that routes through
+ * md_write_super_acct() instead of md_write_metadata(), so the caller
+ * can detect total-write-failure independent of the personality's
+ * error-handler chain.
+ *
+ * The chain dependency matters at one specific point in the array
+ * lifecycle: md_bitmap_create() runs inside do_md_run() before
+ * mddev->pers is assigned.  super_written() -> md_error()
+ * early-returns when !mddev->pers, so no personality error handler
+ * ever fires for failed metadata writes during llbitmap_init().
+ * Counting bi_status directly via the acct sidesteps the lifecycle
+ * issue.
+ *
+ * Partial-failure tolerance is intentional: if N-1 rdevs got the new
+ * on-disk super, llbitmap_read_page() walks rdevs and returns the
+ * first successful read on the next assemble.  Only
+ * md_super_acct_all_failed() flips BITMAP_WRITE_ERROR.
+ */
+static void llbitmap_write_super_with_acct(struct llbitmap *llbitmap,
+					   struct md_super_acct *acct)
 {
+	struct mddev *mddev = llbitmap->mddev;
+	struct page *page = llbitmap->pctl[0]->page;
 	int nr_blocks = DIV_ROUND_UP(BITMAP_DATA_OFFSET, llbitmap->io_size);
+	struct md_rdev *rdev;
+	int block;
 
 	bitmap_fill(llbitmap->pctl[0]->dirty, nr_blocks);
-	llbitmap_write_page(llbitmap, 0);
-	md_super_wait(llbitmap->mddev);
+
+	for (block = 0; block < llbitmap->blocks_per_page; block++) {
+		struct llbitmap_page_ctl *pctl = llbitmap->pctl[0];
+
+		if (!test_and_clear_bit(block, pctl->dirty))
+			continue;
+
+		rdev_for_each(rdev, mddev) {
+			sector_t sector;
+			sector_t bit_sector = llbitmap->io_size >> SECTOR_SHIFT;
+
+			if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
+				continue;
+
+			sector = mddev->bitmap_info.offset + rdev->sb_start +
+				 block * bit_sector;
+			md_write_super_acct(mddev, rdev, sector,
+					    llbitmap->io_size, page,
+					    block * llbitmap->io_size, acct);
+		}
+	}
+}
+
+static void llbitmap_write_sb(struct llbitmap *llbitmap)
+{
+	struct mddev *mddev = llbitmap->mddev;
+	struct md_super_acct acct;
+
+	md_super_acct_init(&acct);
+	llbitmap_write_super_with_acct(llbitmap, &acct);
+	md_super_wait(mddev);
+
+	if (md_super_acct_all_failed(&acct))
+		set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
 }
 
 static void llbitmap_update_sb(void *data)
