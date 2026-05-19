@@ -42,12 +42,20 @@ SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
 #                                 8 × 64 MiB pre-dirtied regions; every IO
 #                                 spans 16 bitmap chunks so only the per-bit
 #                                 loop fast-path can fire.
-#   kp-bucket-contention-write    per-bucket-arrays headline (steady-state).
-#                                 16 randwrite sub-jobs each pinned to its own
-#                                 64 MiB region — exercises the seqlock
-#                                 fast-path on raid10. Dormant (flat) on raid1
-#                                 by design; included in defaults so a single
-#                                 raid10 invocation covers it.
+#   kp-resync-overlap-write       per-bucket-arrays headline (during-resync).
+#                                 256 sync-engine 4 KiB randwriters while a
+#                                 throttled `check` resync is active — the
+#                                 regression: stock raid10 forces every IO
+#                                 through wait_barrier()'s seqlock slow path
+#                                 whenever a resync runs, inflating p99 by
+#                                 20–40 %. Per-bucket arrays let random writes
+#                                 short-circuit. Raid10-only.
+#                                 (Steady-state has no signal here: barrier
+#                                 == 0, both kernels take the lock-free
+#                                 wait_barrier_nolock() path, so the only
+#                                 residual difference is cache-line traffic
+#                                 on a single atomic_t nr_pending — buried
+#                                 under NVMe-tcp latency at iodepth=32.)
 #
 # Branches without a kp-* default suite:
 #   takeover  — no-regression-only per design. Steady-state raid1 paths are
@@ -62,7 +70,7 @@ DEFAULT_SUITES=(
     kp-asym-read
     kp-hot-region-write
     kp-hot-region-largeio-write
-    kp-bucket-contention-write
+    kp-resync-overlap-write
 )
 read -r -a _suite_names <<< "${SUITES:-${DEFAULT_SUITES[*]}}"
 SUITES=()
