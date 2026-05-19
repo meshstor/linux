@@ -1171,6 +1171,97 @@ int md_super_wait(struct mddev *mddev)
 	return 0;
 }
 
+/*
+ * Per-bio context for md_write_super_acct(). Carries both the rdev and
+ * the acct pointer so the end_io callback can look up both without
+ * walking the rdev list.
+ */
+struct md_super_acct_bio {
+	struct md_rdev *rdev;
+	struct md_super_acct *acct;
+};
+
+static void super_written_acct(struct bio *bio)
+{
+	struct md_super_acct_bio *ctx = bio->bi_private;
+	struct md_super_acct *acct = ctx->acct;
+	struct md_rdev *rdev = ctx->rdev;
+	struct mddev *mddev = rdev->mddev;
+
+	if (bio->bi_status) {
+		pr_err("md: %s gets error=%d\n", __func__,
+		       blk_status_to_errno(bio->bi_status));
+		/*
+		 * Still call md_error() for backwards-compatible side effects
+		 * (sets Faulty, signals recovery thread). Will no-op if
+		 * mddev->pers is unset, which is the case we're working around.
+		 */
+		md_error(mddev, rdev);
+		atomic_inc(&acct->errors);
+	}
+
+	kfree(ctx);
+	bio_put(bio);
+
+	rdev_dec_pending(rdev, mddev);
+
+	if (atomic_dec_and_test(&mddev->pending_writes))
+		wake_up(&mddev->sb_wait);
+}
+
+/**
+ * md_write_super_acct - issue a metadata write tracked by a caller-owned
+ *			 success/failure counter
+ *
+ * Same semantics as md_write_metadata() except per-bio failure is also
+ * counted in @acct->errors. Caller waits via the usual md_super_wait()
+ * (still uses mddev->pending_writes) and then reads
+ * md_super_acct_errors(acct) to learn whether any of its submitted
+ * writes failed.
+ *
+ * Use this from contexts where mddev->pers may not be set yet (e.g.,
+ * md_bitmap_create() during do_md_run()), making the personality's
+ * Faulty/MD_BROKEN-based signalling unreliable.
+ */
+void md_write_super_acct(struct mddev *mddev, struct md_rdev *rdev,
+			 sector_t sector, int size, struct page *page,
+			 unsigned int offset, struct md_super_acct *acct)
+{
+	struct bio *bio;
+	struct md_super_acct_bio *ctx;
+
+	if (!page)
+		return;
+
+	if (test_bit(Faulty, &rdev->flags))
+		return;
+
+	ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
+	if (!ctx) {
+		atomic_inc(&acct->errors);
+		return;
+	}
+	ctx->rdev = rdev;
+	ctx->acct = acct;
+
+	bio = bio_alloc_bioset(rdev->meta_bdev ? rdev->meta_bdev : rdev->bdev,
+			      1,
+			      REQ_OP_WRITE | REQ_SYNC | REQ_IDLE | REQ_META
+				  | REQ_PREFLUSH | REQ_FUA,
+			      GFP_NOIO, &mddev->sync_set);
+
+	atomic_inc(&rdev->nr_pending);
+
+	bio->bi_iter.bi_sector = sector;
+	__bio_add_page(bio, page, size, offset);
+	bio->bi_private = ctx;
+	bio->bi_end_io = super_written_acct;
+
+	atomic_inc(&acct->submitted);
+	atomic_inc(&mddev->pending_writes);
+	submit_bio(bio);
+}
+
 int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
 		 struct page *page, blk_opf_t opf, bool metadata_op)
 {

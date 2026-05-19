@@ -926,6 +926,63 @@ void md_write_metadata(struct mddev *mddev, struct md_rdev *rdev,
 		       sector_t sector, int size, struct page *page,
 		       unsigned int offset);
 extern int md_super_wait(struct mddev *mddev);
+
+/**
+ * struct md_super_acct - per-call accounting for batched metadata writes
+ * @errors: bios that completed with error
+ *
+ * Used by md_write_super_acct() callers that need to know whether a
+ * batch of metadata writes succeeded as a whole, independent of the
+ * personality's error-handler chain. The motivating case is
+ * md_bitmap_create() during do_md_run(): at that point mddev->pers is
+ * not yet assigned, so md_error() early-returns and Faulty/MD_BROKEN
+ * are never set on failing rdevs -- making any detector based on rdev
+ * state dormant. Counting bi_status directly avoids that.
+ *
+ * Completion is still tracked via mddev->pending_writes (so the caller
+ * waits via md_super_wait()); only the error count is private to acct.
+ */
+struct md_super_acct {
+	atomic_t submitted;
+	atomic_t errors;
+};
+
+static inline void md_super_acct_init(struct md_super_acct *acct)
+{
+	atomic_set(&acct->submitted, 0);
+	atomic_set(&acct->errors, 0);
+}
+
+static inline int md_super_acct_submitted(struct md_super_acct *acct)
+{
+	return atomic_read(&acct->submitted);
+}
+
+static inline int md_super_acct_errors(struct md_super_acct *acct)
+{
+	return atomic_read(&acct->errors);
+}
+
+/*
+ * md_super_acct_all_failed - true iff at least one write was submitted
+ * AND every submitted write came back with an error.
+ *
+ * This is the predicate llbitmap callers use to decide whether to flag
+ * BITMAP_WRITE_ERROR: partial failure is intentionally tolerated (any
+ * one rdev with the new on-disk super is enough for the next assemble's
+ * read-side recovery).
+ */
+static inline bool md_super_acct_all_failed(struct md_super_acct *acct)
+{
+	int submitted = md_super_acct_submitted(acct);
+
+	return submitted > 0 && md_super_acct_errors(acct) == submitted;
+}
+
+void md_write_super_acct(struct mddev *mddev, struct md_rdev *rdev,
+			 sector_t sector, int size, struct page *page,
+			 unsigned int offset, struct md_super_acct *acct);
+
 extern int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
 		struct page *page, blk_opf_t opf, bool metadata_op);
 extern void md_do_sync(struct md_thread *thread);
