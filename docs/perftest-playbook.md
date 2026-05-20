@@ -10,8 +10,9 @@ Two comparison tools live in `bin/`:
   different code variants (baseline + per-bucket-arrays + takeover +
   latency-ewma + llbitmap-fastpath). Five DKMS rebuilds per run.
 - **`perf-bitmap-compare`** — bitmap-mode comparison on the same code:
-  three modes (kernel-md-internal, ms-internal, ms-lockless). One DKMS
-  rebuild per run.
+  four modes (md-internal, md-lockless, ms-internal, ms-lockless);
+  md-lockless is auto-skipped when the kernel lacks md llbitmap
+  (CONFIG_MD_LLBITMAP, upstream since 7.0). One DKMS rebuild per run.
 
 Both share the same Phase 1 host setup, the same partition layout (Phase
 2), the same cooldown gate, and the same `bin/perf-extract-table` output
@@ -169,7 +170,7 @@ Pick the tool, then the topology.
 | Tool                  | Comparison axis                                    | Default modes/variants run       | Build cycle      |
 |-----------------------|----------------------------------------------------|----------------------------------|------------------|
 | `perf-compare`        | Code variant (feature branches; same bitmap)       | 5 (baseline + 4 features)        | rebuild per var  |
-| `perf-bitmap-compare` | Bitmap implementation on the same code             | 3 (kernel-md-internal, ms-internal, ms-lockless) | one rebuild |
+| `perf-bitmap-compare` | Bitmap implementation on the same code             | 4 (md-internal, md-lockless, ms-internal, ms-lockless) | one rebuild |
 
 ### 3.1 — `perf-compare` (feature-branch comparison)
 
@@ -341,11 +342,11 @@ does NOT — known bug on hosts with `nvme_core.multipath=Y`).
 
 For `perf-compare`, if a `baseline/` subdir exists, that row shows
 absolutes and others show percent delta. For `perf-bitmap-compare`, no
-mode is named `baseline`, so all 3 rows show absolutes (compare visually).
+mode is named `baseline`, so all rows show absolutes (compare visually).
 To get deltas, symlink one mode as the baseline first:
 
 ```bash
-( cd "$OUT_BASE" && ln -sfn kernel-md-internal baseline )
+( cd "$OUT_BASE" && ln -sfn md-internal baseline )
 ~/linux-meshstor/bin/perf-extract-table "$OUT_BASE"
 ```
 
