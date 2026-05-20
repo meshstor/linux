@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# perf-bitmap-compare — orchestrate a 3-mode bitmap perf comparison
-# (kernel-md-internal, ms-internal, ms-lockless) on the same code base.
+# perf-bitmap-compare — orchestrate a 4-mode bitmap perf comparison
+# (md-internal, md-lockless, ms-internal, ms-lockless) on the same code base.
+# md-lockless uses the kernel md lockless bitmap (llbitmap, CONFIG_MD_LLBITMAP,
+# upstream since 7.0). Support is detected from the kernel config when readable,
+# else by version; when unsupported, md-lockless is auto-skipped in the default
+# mode set unless named explicitly in --modes=.
 #
 # Spec: docs/superpowers/specs/2026-05-10-perf-bitmap-compare-design.md
 # Plan: docs/superpowers/plans/2026-05-10-perf-bitmap-compare.md
@@ -32,21 +36,24 @@ DEFAULT_SUITES=(
 
 # ---- mode tables ----
 declare -A MODE_ENGINE=(
-    [kernel-md-internal]=md
+    [md-internal]=md
+    [md-lockless]=md
     [ms-internal]=ms
     [ms-lockless]=ms
 )
 declare -A MODE_BITMAP=(
-    [kernel-md-internal]=internal
+    [md-internal]=internal
+    [md-lockless]=lockless
     [ms-internal]=internal
     [ms-lockless]=lockless
 )
 declare -A MODE_NEEDS_MS=(
-    [kernel-md-internal]=0
+    [md-internal]=0
+    [md-lockless]=0
     [ms-internal]=1
     [ms-lockless]=1
 )
-DEFAULT_MODE_ORDER=(kernel-md-internal ms-internal ms-lockless)
+DEFAULT_MODE_ORDER=(md-internal md-lockless ms-internal ms-lockless)
 
 # ---- globals ----
 LEVEL="raid1"
@@ -57,6 +64,7 @@ NO_CACHE=0
 LOCALS=()
 REMOTES=()
 SELECTED_MODES=()
+MODES_EXPLICIT=0
 SUITES_POS=()
 # Lib contract: SELECTED_VARIANTS/VARIANT_LABELS/VARIANT_ARGS/VARIANT_VER are
 # read by resolve_shas/cache_key_for/obtain_tarball/restore_system in
@@ -106,6 +114,59 @@ derive_variant_ver() {
     VARIANT_ARGS[meshstor]="${BRANCH:-}"
 }
 
+# Echo a readable kernel-config source for release $1, or nothing if none.
+# md llbitmap is built into md-mod under CONFIG_MD_LLBITMAP (not a separate
+# module), so the kernel config is the authoritative compile-time signal.
+# KCONFIG_OVERRIDE is a test seam: a path to use, or "NONE" to force "no config".
+_llbitmap_config_src() {
+    local rel="$1"
+    if [[ -n "${KCONFIG_OVERRIDE:-}" ]]; then
+        [[ "$KCONFIG_OVERRIDE" == "NONE" ]] && return 0   # echo nothing
+        printf '%s' "$KCONFIG_OVERRIDE"
+        return 0
+    fi
+    if [[ -r "/boot/config-$rel" ]]; then
+        printf '%s' "/boot/config-$rel"
+    elif [[ -r /proc/config.gz ]]; then
+        printf '%s' "/proc/config.gz"
+    fi
+}
+
+# True (0) if the kernel ships md llbitmap. Prefers the build config
+# (CONFIG_MD_LLBITMAP=y, authoritative); when no config is readable, falls back
+# to the kernel version (md llbitmap is upstream since 7.0). KVER_OVERRIDE and
+# KCONFIG_OVERRIDE are unit-test seams, not documented flags.
+kernel_supports_llbitmap() {
+    local rel src major
+    rel="${KVER_OVERRIDE:-$(uname -r)}"
+
+    src="$(_llbitmap_config_src "$rel")"
+    if [[ -n "$src" ]]; then
+        if [[ "$src" == *.gz ]]; then
+            zcat "$src" 2>/dev/null | grep -q '^CONFIG_MD_LLBITMAP=y'
+        else
+            grep -q '^CONFIG_MD_LLBITMAP=y' "$src"
+        fi
+        return   # a readable config is authoritative
+    fi
+
+    # No config exposed (some distros) — fall back to the kernel version.
+    IFS=. read -r major _ <<<"$rel"
+    (( major >= 7 ))
+}
+
+# True (0) if MODE must be skipped: it needs md llbitmap that the running
+# kernel lacks AND it was not requested explicitly via --modes=. Reads the
+# MODES_EXPLICIT global. Keyed off the mode's engine/bitmap, not its label.
+mode_gated_out() {
+    local mode="$1"
+    [[ "${MODE_ENGINE[$mode]}" == "md" && "${MODE_BITMAP[$mode]}" == "lockless" ]] \
+        || return 1
+    (( ${MODES_EXPLICIT:-0} )) && return 1   # explicit request: never skip
+    kernel_supports_llbitmap && return 1     # kernel supports it: never skip
+    return 0
+}
+
 usage() {
     cat <<EOF
 Usage:
@@ -113,17 +174,23 @@ Usage:
   sudo $(basename "$0") --level=raid10 --local=A --local=B \\
                         --remote=C --remote=D [SUITE...]
 
-Compare bitmap performance across kernel-md-internal, ms-internal, and
-ms-lockless on the same code base. Builds and installs meshstor-ms
+Compare bitmap performance across md-internal, md-lockless, ms-internal,
+and ms-lockless on the same code base. Builds and installs meshstor-ms
 once (or merges \$BRANCH atop meshstor-main), runs each mode, then
 restores the prior system meshstor-ms package.
+
+md-lockless uses the kernel md lockless bitmap (llbitmap), upstream since
+7.0. Support is detected from the kernel config (CONFIG_MD_LLBITMAP) when
+readable, else from the kernel version. In the default mode set md-lockless
+is auto-skipped (status=SKIPPED) when unsupported; naming it in --modes=
+runs it regardless (fails loudly if the kernel lacks llbitmap).
 
 Flags:
   --level=raid1|raid10   raid level (default: raid1)
   --branch=NAME          feature branch to merge atop meshstor-main
                          (default: empty = pure meshstor-main)
-  --modes=M1,M2,M3       comma-separated mode labels (default: all 3 in
-                         fixed order: kernel-md-internal,ms-internal,ms-lockless)
+  --modes=M1,M2,M3       comma-separated mode labels (default: all 4 in fixed
+                         order: md-internal,md-lockless,ms-internal,ms-lockless)
   --port=N               nvmet-tcp port (default: 7720)
   --cool-thresh-k=N      max sensor temp Kelvin before next mode runs
                          (default: 348 = 75 °C; 0 disables)
@@ -229,6 +296,22 @@ run_mode() {
     log "=== $mode done: $(cat "$out/status") ==="
 }
 
+# Apply the kernel-version gate, then run the mode (with cooling) or skip it.
+# Skipping writes a SKIPPED status and creates no results/ child, so
+# perf-extract-table omits the mode entirely.
+run_or_skip_mode() {
+    local mode="$1"
+    if mode_gated_out "$mode"; then
+        local out="$OUT_BASE/$mode"
+        mkdir -p "$out"
+        echo "SKIPPED" > "$out/status"
+        warn "skip $mode: kernel $(uname -r) lacks md llbitmap (need >= 7.0); pass --modes=...,$mode to force"
+        return 0
+    fi
+    wait_cool
+    run_mode "$mode"
+}
+
 main() {
     if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
         usage; exit 0
@@ -274,6 +357,7 @@ main() {
 
     # Resolve modes + suites.
     parse_modes "$raw_modes" || exit 2
+    [[ -n "$raw_modes" ]] && MODES_EXPLICIT=1
     derive_variant_ver
 
     # SUITES: from positional args, or SUITES env, or DEFAULT_SUITES.
@@ -325,8 +409,7 @@ main() {
     # ---- mode loop ----
     local mode
     for mode in "${SELECTED_MODES[@]}"; do
-        wait_cool
-        run_mode "$mode"
+        run_or_skip_mode "$mode"
     done
 
     # ---- view hint ----
