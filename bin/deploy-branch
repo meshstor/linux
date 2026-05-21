@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# deploy-branch — build a meshstor-ms fixes branch into a DKMS source package
+# and load the ms_* modules on a heterogeneous fleet of hosts.
+#
+# DKMS rebuilds ms_mod + raid1_ms + raid10_ms against each host's *running*
+# kernel, so one architecture-independent source tarball serves every kernel
+# version. The only per-host variation is the package manager (dnf vs apt),
+# detected from /etc/os-release on the host.
+#
+# Pipeline:
+#   Local (once):  bin/rebuild-main <branch>  ->  bin/build-tarball <version>
+#   Per host:      ssh detect (skip if Secure Boot on) -> scp tarball ->
+#                  install kernel headers -> dkms ldtarball + install ->
+#                  modprobe ms_mod raid1_ms raid10_ms -> verify /proc/msstat
+#
+# Cleanup mode (--cleanup): the inverse. No build. Per host: unload the modules
+# (raid10_ms, raid1_ms, ms_mod) and dkms-remove every meshstor-ms version,
+# returning the host to a no-meshstor state. The <branch> arg is still accepted
+# (and ignored) so you can re-run a finished deploy command with --cleanup
+# appended.
+#
+# Hosts with Secure Boot ENABLED are skipped: enrolling the DKMS signing key
+# needs an interactive reboot (MokManager) that can't be automated. Use
+# bin/mok-enroll on those hosts first. Privileged remote commands run via sudo
+# (passwordless sudo assumed).
+#
+# Usage: bin/deploy-branch [options] <branch> <host> [host...]
+#        bin/deploy-branch <branch> <host> [host...] --cleanup
+set -euo pipefail
+
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+REBUILD_MAIN="$REPO_ROOT/bin/rebuild-main"
+BUILD_TARBALL="$REPO_ROOT/bin/build-tarball"
+
+SSH_USER="$(id -un)"
+VERSION=""
+NO_REBUILD=0
+CLEANUP=0
+BRANCH=""
+HOSTS=()
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] <branch> <host> [host...]
+
+Build a fixes branch into a meshstor-ms DKMS package and load the ms_*
+modules on each host. Hosts are IPs or hostnames, optionally user@host.
+Options may appear anywhere, including after the hosts.
+
+Options:
+  -u, --user USER     SSH user (default: \$(id -un) = $SSH_USER); a user@host
+                      argument overrides this for that host
+  -V, --version VER   override the derived DKMS version string
+      --no-rebuild    skip rebuild-main + build-tarball; reuse an existing
+                      build/meshstor-ms-<version>.dkms.tar.gz
+      --cleanup       purge instead of deploy: unload the modules and
+                      dkms-remove every meshstor-ms version on each host.
+                      No build; <branch> is accepted but ignored.
+  -h, --help          show this help
+
+Examples:
+  $(basename "$0") llbitmap-fixes 10.0.0.11 10.0.0.12
+  $(basename "$0") -u admin llbitmap-fixes 10.0.0.11 root@10.0.0.13
+  $(basename "$0") llbitmap-fixes 10.0.0.11 10.0.0.12 --cleanup
+EOF
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# ---- argument parsing ----
+# Options may be interspersed with or follow positionals, so we scan every arg
+# rather than stopping at the first non-option — this lets `--cleanup` (and any
+# other flag) be appended to an already-typed deploy command.
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--user)    SSH_USER="${2:?--user needs a value}"; shift 2 ;;
+        -V|--version) VERSION="${2:?--version needs a value}"; shift 2 ;;
+        --no-rebuild) NO_REBUILD=1; shift ;;
+        --cleanup)    CLEANUP=1; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        --)           shift; ARGS+=("$@"); break ;;
+        -*)           die "unknown option: $1 (see --help)" ;;
+        *)            ARGS+=("$1"); shift ;;
+    esac
+done
+[[ ${#ARGS[@]} -lt 2 ]] && { usage >&2; die "need a <branch> and at least one <host>"; }
+BRANCH="${ARGS[0]}"
+HOSTS=("${ARGS[@]:1}")
+
+command -v ssh >/dev/null || die "ssh not found"
+command -v scp >/dev/null || die "scp not found"
+
+# ---- mode banner + (deploy) version string ----
+if [[ "$CLEANUP" -eq 1 ]]; then
+    echo "==> mode:    CLEANUP (purge meshstor-ms; no build)"
+    echo "==> branch:  $BRANCH (ignored in cleanup)"
+else
+    # Branch name with non-[A-Za-z0-9._-] chars (e.g. '/') replaced by '-'.
+    [[ -z "$VERSION" ]] && VERSION="0.1.0-${BRANCH//[^A-Za-z0-9._-]/-}"
+    TARBALL="$REPO_ROOT/build/meshstor-ms-${VERSION}.dkms.tar.gz"
+    REMOTE_TAR="/tmp/meshstor-ms-${VERSION}.dkms.tar.gz"
+    echo "==> mode:    DEPLOY"
+    echo "==> branch:  $BRANCH"
+    echo "==> version: $VERSION"
+fi
+echo "==> hosts:   ${HOSTS[*]}"
+echo "==> ssh user (default): $SSH_USER"
+echo
+
+# ---- local build phase (deploy only) ----
+if [[ "$CLEANUP" -eq 0 ]]; then
+    if [[ "$NO_REBUILD" -eq 1 ]]; then
+        [[ -f "$TARBALL" ]] || die "--no-rebuild but $TARBALL does not exist"
+        echo "==> reusing existing tarball: $TARBALL"
+    else
+        echo "==> building source tree from branch '$BRANCH'"
+        "$REBUILD_MAIN" "$BRANCH"
+        echo "==> building DKMS tarball $VERSION"
+        "$BUILD_TARBALL" "$VERSION"
+        [[ -f "$TARBALL" ]] || die "build-tarball did not produce $TARBALL"
+    fi
+    echo
+fi
+
+# ---- remote scripts ----
+# Detection (runs as the login user; uses sudo only to read the SecureBoot
+# efivar when mokutil is absent). Emits one line: ID|VERSION_ID|KERNEL|SB
+# where SB is on/off/unknown.
+read -r -d '' DETECT_SCRIPT <<'EOS' || true
+set -u
+ID="?"; VERSION_ID="?"
+[ -r /etc/os-release ] && . /etc/os-release
+KVER="$(uname -r)"
+sb="off"
+if [ -d /sys/firmware/efi ]; then
+    if command -v mokutil >/dev/null 2>&1; then
+        # "SecureBoot enabled" + "validation is disabled in shim" (i.e.
+        # mokutil --disable-validation) means shim is NOT enforcing module
+        # signatures — unsigned/DKMS-signed modules load, so it's deployable.
+        sbout="$(mokutil --sb-state 2>/dev/null || true)"
+        case "$sbout" in
+            *"SecureBoot enabled"*)
+                case "$sbout" in
+                    *"validation is disabled"*) sb="unenforced" ;;
+                    *)                          sb="on" ;;
+                esac ;;
+            *) sb="off" ;;
+        esac
+    else
+        # efivar fallback can read firmware SB state but not shim's validation
+        # toggle, so it can only report on/off (never "unenforced").
+        f="$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1)"
+        if [ -n "$f" ]; then
+            v="$(sudo od -An -tu1 "$f" 2>/dev/null | awk '{print $NF}')"
+            [ "$v" = "1" ] && sb="on" || sb="off"
+        else
+            sb="unknown"
+        fi
+    fi
+fi
+echo "${ID}|${VERSION_ID}|${KVER}|${sb}"
+EOS
+
+# Install (runs under sudo bash -s -- <version> <tarball>).
+# NB: the arg vars are PKG_* on purpose — /etc/os-release defines VERSION
+# (e.g. "10.1 (Red Quartz)"), which would clobber a plain $VERSION when sourced.
+read -r -d '' INSTALL_SCRIPT <<'EOS' || true
+set -euo pipefail
+PKG_VERSION="$1"; PKG_TARBALL="$2"
+ID="?"
+[ -r /etc/os-release ] && . /etc/os-release
+KVER="$(uname -r)"
+
+echo ">> installing kernel headers + dkms for $KVER ($ID)"
+case "$ID" in
+    rhel|rocky|almalinux|centos|fedora|ol)
+        dnf install -y dkms "kernel-devel-${KVER}" "kernel-headers-${KVER}" mokutil
+        ;;
+    ubuntu|debian)
+        export DEBIAN_FRONTEND=noninteractive
+        # A broken third-party apt source (unsigned PPA, dead mirror) makes
+        # `apt-get update` exit non-zero even when the Ubuntu archive — which
+        # carries our packages — refreshed fine. Don't let that abort the
+        # deploy; `apt-get install` below is the authoritative gate.
+        apt-get update || echo "   warning: apt-get update reported errors; continuing" >&2
+        apt-get install -y dkms "linux-headers-${KVER}" mokutil
+        ;;
+    *)
+        echo "unsupported distro ID='$ID'" >&2; exit 1 ;;
+esac
+
+# Remove any stale meshstor-ms DKMS versions (idempotent re-runs). Version dir
+# names under /var/lib/dkms/meshstor-ms/ are the registered versions.
+if [ -d /var/lib/dkms/meshstor-ms ]; then
+    for d in /var/lib/dkms/meshstor-ms/*/; do
+        [ -d "$d" ] || continue
+        v="$(basename "$d")"
+        echo ">> removing stale meshstor-ms/$v"
+        dkms remove "meshstor-ms/$v" --all 2>/dev/null || true
+    done
+fi
+# Clear any leftover source trees so ldtarball re-extracts cleanly.
+rm -rf /usr/src/meshstor-ms-* 2>/dev/null || true
+
+echo ">> dkms ldtarball + install meshstor-ms/$PKG_VERSION"
+dkms ldtarball --archive="$PKG_TARBALL" --force
+dkms install -m meshstor-ms -v "$PKG_VERSION" --force
+
+echo ">> loading modules"
+# Load each separately: `modprobe ms_mod raid1_ms raid10_ms` would treat the
+# trailing names as PARAMETERS to ms_mod, loading only ms_mod.
+for m in ms_mod raid1_ms raid10_ms; do modprobe "$m"; done
+# Require all three present — a partial load is a failure. Test via
+# /sys/module/<name> (a plain dir check): `lsmod | grep -q` would short-circuit
+# the pipe and, under `set -o pipefail`, surface lsmod's SIGPIPE as a failure.
+for m in ms_mod raid1_ms raid10_ms; do
+    [ -d "/sys/module/$m" ] || { echo "module $m not loaded" >&2; exit 1; }
+done
+lsmod | grep -E '^(ms_mod|raid1_ms|raid10_ms) ' || true
+echo ">> /proc/msstat:"
+cat /proc/msstat
+EOS
+
+# Cleanup (runs under sudo bash -s). Unload in dependency order (personalities
+# before the core), then dkms-remove every meshstor-ms version and clear its
+# sources. modprobe -r failing (e.g. a module still in use by an active array)
+# aborts via set -e, so the host is reported FAILED rather than half-purged.
+read -r -d '' CLEANUP_SCRIPT <<'EOS' || true
+set -euo pipefail
+echo ">> unloading modules"
+for m in raid10_ms raid1_ms ms_mod; do
+    if [ -d "/sys/module/$m" ]; then echo "   modprobe -r $m"; modprobe -r "$m"; fi
+done
+echo ">> removing meshstor-ms DKMS versions"
+if [ -d /var/lib/dkms/meshstor-ms ]; then
+    for d in /var/lib/dkms/meshstor-ms/*/; do
+        [ -d "$d" ] || continue
+        v="$(basename "$d")"; echo "   dkms remove meshstor-ms/$v"
+        dkms remove "meshstor-ms/$v" --all 2>/dev/null || true
+    done
+fi
+rm -rf /usr/src/meshstor-ms-* 2>/dev/null || true
+echo ">> purged. ms_mod loaded=$([ -d /sys/module/ms_mod ] && echo yes || echo no)"
+EOS
+
+# ---- per-host loop ----
+declare -a SUMMARY=()
+FAILURES=0
+
+for host in "${HOSTS[@]}"; do
+    # Per-host user override: user@host beats the global default.
+    if [[ "$host" == *@* ]]; then target="$host"; else target="${SSH_USER}@${host}"; fi
+    echo "============================================================"
+    echo ">>> $target"
+    echo "============================================================"
+
+    os="?"; ver="?"; kver="?"; result=""
+
+    # 1. Detect (also acts as reachability check).
+    if ! info="$(ssh "${SSH_OPTS[@]}" "$target" 'bash -s' <<<"$DETECT_SCRIPT" 2>/dev/null)"; then
+        result="FAILED (unreachable / ssh)"
+        echo "!! cannot reach $target"
+        SUMMARY+=("$host|$os|$ver|$result"); FAILURES=$((FAILURES+1)); echo; continue
+    fi
+    IFS='|' read -r os ver kver sb <<<"$info"
+    echo "   os=$os ver=$ver kernel=$kver secureboot=$sb"
+
+    if [[ "$sb" == "on" ]]; then
+        result="SKIPPED (Secure Boot enforcing)"
+        echo "   skipping: Secure Boot enabled and shim is validating (run bin/mok-enroll first)"
+        SUMMARY+=("$host|$os $ver|$kver|$result"); echo; continue
+    fi
+    [[ "$sb" == "unenforced" ]] && echo "   note: Secure Boot enabled but shim validation disabled — modules will load"
+    [[ "$sb" == "unknown" ]] && echo "   warning: could not determine Secure Boot state; proceeding"
+
+    # ---- cleanup path: purge and move on, no build/scp ----
+    if [[ "$CLEANUP" -eq 1 ]]; then
+        if ssh "${SSH_OPTS[@]}" "$target" 'sudo bash -s' <<<"$CLEANUP_SCRIPT"; then
+            result="PURGED"
+        else
+            result="FAILED (cleanup)"; FAILURES=$((FAILURES+1))
+        fi
+        SUMMARY+=("$host|$os $ver|$kver|$result"); echo; continue
+    fi
+
+    # 2. Copy tarball.
+    if ! scp "${SSH_OPTS[@]}" "$TARBALL" "$target:$REMOTE_TAR" >/dev/null; then
+        result="FAILED (scp)"
+        echo "!! scp to $target failed"
+        SUMMARY+=("$host|$os $ver|$kver|$result"); FAILURES=$((FAILURES+1)); echo; continue
+    fi
+
+    # 3. Install + load. $VERSION/$REMOTE_TAR expand client-side on purpose,
+    #    then arrive single-quoted as literal remote args.
+    # shellcheck disable=SC2029
+    if ssh "${SSH_OPTS[@]}" "$target" "sudo bash -s -- '$VERSION' '$REMOTE_TAR'" <<<"$INSTALL_SCRIPT"; then
+        result="OK"
+    else
+        result="FAILED (dkms/modprobe)"
+        FAILURES=$((FAILURES+1))
+    fi
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTS[@]}" "$target" "rm -f '$REMOTE_TAR'" 2>/dev/null || true
+    SUMMARY+=("$host|$os $ver|$kver|$result")
+    echo
+done
+
+# ---- summary ----
+echo "============================================================"
+if [[ "$CLEANUP" -eq 1 ]]; then
+    echo "Summary  (CLEANUP  branch=$BRANCH)"
+else
+    echo "Summary  (DEPLOY  branch=$BRANCH  version=$VERSION)"
+fi
+echo "============================================================"
+{
+    echo "HOST|OS|KERNEL|RESULT"
+    printf '%s\n' "${SUMMARY[@]}"
+} | column -t -s '|'
+
+exit $(( FAILURES > 0 ? 1 : 0 ))
