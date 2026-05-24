@@ -30,9 +30,6 @@ rebases `meshstor-main` onto the new `master`. Conflicts surface in
 the cherry-picked feature commits or in the pre-rename patches; the
 rest is side-by-side files that don't collide.
 
-The original branching decision is in
-[`docs/superpowers/specs/2026-05-01-meshstor-md-dkms-design.md`](superpowers/specs/2026-05-01-meshstor-md-dkms-design.md).
-
 ## Upstream rebase workflow
 
 ### Routine cadence
@@ -455,10 +452,9 @@ ssh mykola@192.168.200.32 'bash /tmp/ms-perf.sh' > /tmp/perf-r10.log
 ssh mykola@192.168.200.35 'bash /tmp/ms-perf.sh' > /tmp/perf-r9.log
 ```
 
-Compare to the prior baseline in
-[`notes/perf-baremetal-r10-2026-05-02.log`](../notes/perf-baremetal-r10-2026-05-02.log)
-and [`notes/perf-baremetal-r9-2026-05-02.log`](../notes/perf-baremetal-r9-2026-05-02.log).
-Look for >5% regressions on any line; investigate before merging.
+Compare against the published baseline tables in
+[performance.md](performance.md) (RHEL 10 / RHEL 9, 2026-05-02). Look for
+>5% regressions on any line; investigate before merging.
 
 If criteria 1–4 pass, the change is safe to merge into `meshstor-main`.
 

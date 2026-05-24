@@ -10,10 +10,6 @@ This page establishes the vocabulary that the rest of the doc set uses. It
 does not cover installation (see [install.md](install.md)), operation
 (see [admin.md](admin.md)), or release engineering (see [build.md](build.md)).
 
-For the original architectural decision history — including the alternatives
-considered and why they were rejected — see
-[`docs/superpowers/specs/2026-05-01-meshstor-md-dkms-design.md`](superpowers/specs/2026-05-01-meshstor-md-dkms-design.md).
-
 ## Why a parallel subsystem
 
 Every supported distro builds the kernel with `CONFIG_MD=y` — md core is
@@ -25,8 +21,6 @@ permanently linked into `vmlinux`. Empirically verified on each target:
 | RHEL 10.1 / Rocky 10 (6.12) | `=y` |
 | Ubuntu 24.04 LTS HWE (6.14) | `=y` |
 | Ubuntu 26.04 LTS (6.17) | `=y` |
-
-(Verification details in [`notes/phase0b-cross-distro-findings.md`](../notes/phase0b-cross-distro-findings.md).)
 
 The original design assumed we could ship a replacement `md_mod.ko` that
 displaces the kernel's built-in version via `/extra/` precedence. That
@@ -98,7 +92,7 @@ we don't need to manually track them.
 
 ## What is renamed and what is not
 
-Reproduced from [`docs/superpowers/specs/2026-05-01-meshstor-md-dkms-design.md`](superpowers/specs/2026-05-01-meshstor-md-dkms-design.md) §4.2:
+The full rename map, layer by layer:
 
 | Layer | Kernel `md` | Our `ms` | Mechanism |
 |---|---|---|---|
@@ -205,14 +199,15 @@ linux-meshstor/                     # kernel-fork repo
 │   ├── Makefile, Kconfig           # upstream's in-tree build files (verbatim)
 │   └── (raid0.c, raid5.*, md-cluster.c — present for upstream rebase
 │        completeness, but NOT shipped via dkms/manifest.txt)
-├── bin/                            # invokable helpers (build / perf / MOK)
-│   ├── build-tarball               # assembles meshstor-ms-X.Y.Z.dkms.tar.gz
-│   ├── build-rpm, build-deb, build-deb-direct
-│   ├── build-vendor-key            # vendor-signing key generation
-│   ├── mok-enroll, detect-secureboot
-│   ├── perf-bench, perf-bench-tcp  # benchmark drivers
-│   ├── perf-compare, perf-extract-table, perf-make-test-partitions
-│   └── rebuild-main                # rebuild feature branches off torvalds master
+├── bin/                            # invokable helpers (build / perf / deploy / MOK)
+│   ├── rebuild-main                # compose upstream + feature branches → build/linux-meshstor-rebuilt
+│   ├── build-tarball               # assembles meshstor-ms-X.Y.Z.dkms.tar.gz (runs the rename pass)
+│   ├── build-rpm, build-deb, build-deb-direct   # package the tarball
+│   ├── deploy-branch               # build + DKMS-install + modprobe across a host fleet
+│   ├── mok-enroll                  # Secure Boot MOK key generation + enrollment
+│   ├── perf-bench-tcp              # nvme-tcp loopback raid1 perf harness
+│   ├── perf-compare, perf-bitmap-compare        # feature / bitmap-mode comparisons
+│   └── perf-extract-table, perf-make-test-partitions, perf-compare-lib.sh
 ├── dkms/                           # DKMS packaging — ours alone
 │   ├── dkms.conf.in                # template, version-substituted
 │   ├── Makefile.in                 # out-of-tree wrapper template
@@ -228,9 +223,9 @@ linux-meshstor/                     # kernel-fork repo
 │   └── rpm/                        # .rpm spec
 ├── docs/                           # this documentation set
 │   ├── index.md, install.md, admin.md, architecture.md (this file),
-│   ├── build.md, maintainer.md, compat.md, performance.md
-│   ├── findings/                   # curated post-mortems and analyses
-│   └── superpowers/                # specs and plans for the dev workflow
+│   ├── build.md, maintainer.md, compat.md, performance.md,
+│   ├── perftest-playbook.md        # copy-paste perf-run recipe
+│   └── superpowers/                # specs and plans (gitignored — local dev archive)
 └── results/                        # gitignored — perf/test run outputs
 ```
 

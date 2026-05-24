@@ -1,5 +1,5 @@
 # meshstor-ms DKMS out-of-tree wrapper Makefile (post-rename layout).
-# Source files are ms_*.c / raid*_ms.c after dkms/scripts/build-tarball.sh
+# Source files are ms_*.c / raid*_ms.c after bin/build-tarball
 # ran the rename pass.
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
