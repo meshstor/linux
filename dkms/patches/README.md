@@ -1,7 +1,7 @@
 # meshstor-md compat patches
 
 Patches in this directory are applied (in glob-sorted order) by
-`dkms/scripts/build-tarball.sh` to the unpacked DKMS source tree
+`bin/build-tarball` to the unpacked DKMS source tree
 *after* copying from `drivers/md/` and *before* the `tar czf` step.
 
 ## When to use a patch vs `dkms/compat/compat.h`

@@ -16,10 +16,6 @@ this matrix, see [performance.md](performance.md).
 | Ubuntu 26.04 LTS | 6.17.0-28-generic | ✅ | ✅ via vng | ✅ raid1, EWMA tracking | 6 shims compiled out — kernel has them natively |
 | Ubuntu 24.04 LTS GA | 6.8.0-116-generic | ⚠️ | — | — | Out of scope — see below |
 
-Per-host and per-test details are in
-[`notes/phase0b-cross-distro-findings.md`](../notes/phase0b-cross-distro-findings.md)
-and [`notes/phase1-packaging-validation.md`](../notes/phase1-packaging-validation.md).
-
 ## Per-shim API drift
 
 The compat layer in [`dkms/compat/compat.h`](../dkms/compat/compat.h)
@@ -108,7 +104,7 @@ default get the right behavior on every platform.
 
 | Item | Disposition | Reason |
 |---|---|---|
-| Ubuntu 24.04 LTS GA (kernel 6.8) | Declined | Pre-dates upstream's 6.10 transactional `queue_limits` redesign and 6.10 `bdev_file_open_by_dev`. Estimated 3–5 engineer-days to write the missing shims. Customer base on 24.04 GA is small; HWE 6.14+ is the supported path. Details in [`notes/phase0b-cross-distro-findings.md`](../notes/phase0b-cross-distro-findings.md) "GA 6.8 architectural gap". |
+| Ubuntu 24.04 LTS GA (kernel 6.8) | Declined | Pre-dates upstream's 6.10 transactional `queue_limits` redesign and 6.10 `bdev_file_open_by_dev`. Estimated 3–5 engineer-days to write the missing shims. Customer base on 24.04 GA is small; HWE 6.14+ is the supported path. |
 | RAID0 personality | Use kernel md | Out of project scope; meshstor-ms targets mirror-based redundancy. |
 | RAID4/5/6 (raid456) | Use kernel md | Same as RAID0. raid5.* sources kept in `drivers/md/` for upstream-rebase completeness but not shipped via [`dkms/manifest.txt`](../dkms/manifest.txt). |
 | Cluster MD (`md-cluster`) | Out of scope | Niche use case, large surface area, requires DLM/corosync userspace. |

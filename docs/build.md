@@ -125,10 +125,6 @@ verify with `dpkg-deb --info`. The trade-off: no debhelper magic, so
 any future changes to `debian/control` field semantics need manual
 updates in this script.
 
-The end-to-end flow is documented in
-[`notes/phase1-packaging-validation.md`](../notes/phase1-packaging-validation.md)
-("Ubuntu .deb build" section).
-
 ## Signing infrastructure
 
 Three signing paths, in increasing order of operational cleanliness:
@@ -159,14 +155,25 @@ This is what [install.md](install.md#path-1-dkms-rebuild--auto-mok-default)
 ### Vendor key (recommended for production)
 
 We generate a long-lived keypair once at build-infrastructure setup
-time using
-[`bin/build-vendor-key`](../bin/build-vendor-key):
+time. This is plain `openssl` (kept inline rather than wrapped in a
+helper script):
 
 ```bash
-bin/build-vendor-key /vault/meshstor-keys
-# Generates:
+OUT=/vault/meshstor-keys
+mkdir -p "$OUT"
+# Private key + self-signed PEM cert, 10-year validity.
+openssl req -new -x509 -newkey rsa:4096 -nodes \
+    -keyout "$OUT/meshstor-vendor.priv" \
+    -outform PEM -out "$OUT/meshstor-vendor.pem" \
+    -days 3650 \
+    -subj "/CN=meshstor-ms vendor signing key/O=Meshstor/"
+# DER form is what the customer enrolls via mokutil.
+openssl x509 -in "$OUT/meshstor-vendor.pem" \
+    -outform DER -out "$OUT/meshstor-vendor.der"
+chmod 400 "$OUT/meshstor-vendor.priv"
+# Produces:
 #   meshstor-vendor.priv  — KEEP SECRET, build-server only
-#   meshstor-vendor.pem   — internal use
+#   meshstor-vendor.pem   — internal use (signing operations)
 #   meshstor-vendor.der   — ships to customers in meshstor-ms-keys package
 ```
 

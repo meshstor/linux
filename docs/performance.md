@@ -58,12 +58,12 @@ issued (`echo 3 > /proc/sys/vm/drop_caches`) between every run so the
 page cache doesn't carry state between configurations. 5-second ramp,
 20-second measurement window.
 
-The full bench script is committed at
-[`bin/perf-bench`](../bin/perf-bench).
-Raw output for the runs in this doc is in
-[`notes/perf-baremetal-r10-2026-05-02.log`](../notes/perf-baremetal-r10-2026-05-02.log)
-and
-[`notes/perf-baremetal-r9-2026-05-02.log`](../notes/perf-baremetal-r9-2026-05-02.log).
+The 2026-05-02 numbers above were captured with a standalone bench script
+(since removed; the raw per-host logs are no longer kept in-tree). The
+current tooling that reproduces the same md-vs-ms and bitmap-mode tables is
+[`bin/perf-bitmap-compare`](../bin/perf-bitmap-compare) — see
+[perftest-playbook.md](perftest-playbook.md) and the
+[Reproducing](#reproducing) section below.
 
 ## raid1 multi-thread (4 jobs, qd=32, 4k random)
 
@@ -219,9 +219,8 @@ it probes kernel-side LBS support and picks `internal` on RHEL 9,
 
 ## Comparing to the spec's earlier estimate
 
-The original [design spec](superpowers/specs/2026-05-01-meshstor-md-dkms-design.md)
-mentioned 3-5% ms-vs-md overhead, based on VM testing. Baremetal
-results are different:
+The original design spec mentioned 3-5% ms-vs-md overhead, based on VM
+testing. Baremetal results are different:
 
 - VM tests measured ms in a CONFIG_MD=m kernel where md_mod was
   unloaded. ms there was *replacing* md_mod, sharing the device
@@ -244,30 +243,33 @@ The honest restatement:
 
 ## Reproducing
 
+Full host setup (packages, the meshstor-patched mdadm, suites) is in
+[perftest-playbook.md](perftest-playbook.md). The short version that
+reproduces the md-vs-ms and bitmap-mode comparisons above:
+
 ```bash
-# 1. Partition the test NVMe (5 × 20 GiB partitions in unallocated space).
-sudo sgdisk \
-    --new=4:0:+20G --change-name=4:meshstor-test-0 \
-    --new=5:0:+20G --change-name=5:meshstor-test-1 \
-    --new=6:0:+20G --change-name=6:meshstor-test-2 \
-    --new=7:0:+20G --change-name=7:meshstor-test-3 \
-    --new=8:0:+20G --change-name=8:meshstor-test-4 \
-    /dev/nvme0n1
-sudo partprobe /dev/nvme0n1
+# 1. Create test partitions (idempotent; 4 × 25 GiB in trailing free space).
+sudo COUNT=4 bin/perf-make-test-partitions /dev/nvme0n1
 
-# 2. Install the meshstor-ms-dkms package (per docs/install.md)
-#    and an ms-aware mdadm fork at build/msadm.
+# 2. Install the meshstor-ms-dkms package (per docs/install.md) and build the
+#    ms-aware mdadm fork (the perf tools wrap it as build/msadm at run time).
 
-# 3. Run the bench.
-sudo bash bin/perf-bench
+# 3. Run the bitmap-mode comparison (md-internal vs ms-internal vs ms-lockless).
+sudo bin/perf-bitmap-compare /dev/nvme0n1p4 /dev/nvme0n1p5
+
+# 4. Render the comparison table from the latest results dir.
+bin/perf-extract-table "$(ls -dt results/perf-bitmap-* | head -1)"
 ```
 
-The full bench takes ~6 minutes and produces the three tables above
-in textual form.
+Wall-clock estimates per run are in
+[perftest-playbook.md](perftest-playbook.md#phase-3--run-a-comparison).
+For the per-feature-branch comparison (latency-EWMA, per-bucket-arrays,
+takeover, llbitmap-fastpath) use [`bin/perf-compare`](../bin/perf-compare)
+instead.
 
 ## See also
 
 - [compat.md](compat.md) — llbitmap-on-RHEL-9 limitation in detail
 - [admin.md](admin.md) — reading EWMA at runtime
 - [architecture.md](architecture.md) — design context
-- Raw fio logs: [r10](../notes/perf-baremetal-r10-2026-05-02.log) and [r9](../notes/perf-baremetal-r9-2026-05-02.log)
+- [perftest-playbook.md](perftest-playbook.md) — copy-paste perf-run recipe

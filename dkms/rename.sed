@@ -32,17 +32,17 @@ s|<linux/raid/md_u\.h>|<__KEEP_INC_RAID_U__>|g
 # === Step 0b: protect kernel UAPI struct fields and helpers (DYNAMIC) ===
 # Lowercase md_* identifiers from <linux/raid/md_p.h> and <linux/raid/md_u.h>:
 # struct field names (md_magic, md_minor) and helper functions (md_event).
-# build-tarball.sh prepends auto-generated rules here from a similar grep.
+# bin/build-tarball prepends auto-generated rules here from a similar grep.
 
 # === Step 1: protect kernel UAPI names from rename (DYNAMIC) ===
-# build-tarball.sh prepends auto-generated rules at this position by reading
+# bin/build-tarball prepends auto-generated rules at this position by reading
 # /lib/modules/$(uname -r)/build/include/uapi/linux/raid/{md_p,md_u}.h and
 # emitting a `s/\bNAME\b/__KEEP_NAME/g` line for every MD_*/md_* identifier
 # defined there. This file (rename.sed) intentionally contains no UAPI
 # enumeration — that would require constant maintenance as kernel headers
 # add new symbols. The build-time generation makes it self-updating.
 #
-# See dkms/scripts/build-tarball.sh near the rename pass for the generator.
+# See bin/build-tarball near the rename pass for the generator.
 #
 # Static keep entries that aren't auto-extractable from headers go here:
 #   MD_MAJOR — defined in <linux/major.h>, not the raid/ headers
@@ -66,7 +66,7 @@ s|<__KEEP_INC_RAID_P__>|<linux/raid/md_p.h>|g
 s|<__KEEP_INC_RAID_U__>|<linux/raid/md_u.h>|g
 
 # === Step 6: rename local-include strings to match renamed header files ===
-# build-tarball.sh renames md.h -> ms.h, md-bitmap.h -> ms-bitmap.h, etc.
+# bin/build-tarball renames md.h -> ms.h, md-bitmap.h -> ms-bitmap.h, etc.
 # Update #include "md*.h" lines to match the new on-disk filenames.
 s|"md\.h"|"ms.h"|g
 s|"md-bitmap\.h"|"ms-bitmap.h"|g
@@ -113,7 +113,7 @@ s/strncmp(buf, "md", 2)/strncmp(buf, "ms", 2)/g
 
 # Insert `int ms_major;` definition near the top of ms.c, before its first use
 # at file scope. Non-static so other TUs in the module (ms-autodetect.c, etc.)
-# can reference it via the extern declaration in ms.h (added by build-tarball.sh
+# can reference it via the extern declaration in ms.h (added by bin/build-tarball
 # step 5b after the rename).
 # Anchor on the first existing `static const char` line.
 s|^static const char \*action_name|int ms_major;\

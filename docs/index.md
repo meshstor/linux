@@ -56,9 +56,3 @@ Reading order:
 | [maintainer.md](maintainer.md) | Rebase + shim authoring | Maintainer |
 | [performance.md](performance.md) | Perf characteristics + benchmarks | Operator/Maintainer |
 | [index.md](index.md) | This page | All |
-
-## See also
-
-- [`docs/superpowers/specs/2026-05-01-meshstor-md-dkms-design.md`](superpowers/specs/2026-05-01-meshstor-md-dkms-design.md) — the original architectural design spec, including alternatives considered and why they were rejected.
-- [`docs/superpowers/specs/2026-05-02-meshstor-ms-documentation-design.md`](superpowers/specs/2026-05-02-meshstor-ms-documentation-design.md) — the design spec for this documentation set.
-- [`notes/`](../notes/) — engineering journal entries (cross-distro build findings, packaging validation, raw perf logs); cited from `architecture.md`, `compat.md`, and `performance.md` as primary sources.
