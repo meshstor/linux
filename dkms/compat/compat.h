@@ -313,6 +313,20 @@ static inline int ms_badblocks_check_compat(struct badblocks *bb, sector_t s,
 #endif
 
 /*
+ * BLK_FEAT_ATOMIC_WRITES queue_limits feature flag (~6.13+). 6.11 already has
+ * struct queue_limits.features and the BLK_FEAT_* enum (so
+ * HAVE_QUEUE_LIMITS_FEATURES is set), but this value was added later — that
+ * flag is too coarse to gate it. It is an enum value, not a macro, so #ifndef
+ * can't see it; gate on the HAVE_ flag that dkms/Makefile.in probes from
+ * <linux/blkdev.h>. Defining it to 0 makes `lim.features |= BLK_FEAT_ATOMIC_WRITES`
+ * a no-op, mirroring REQ_ATOMIC above (raid1/raid10 don't advertise atomic
+ * writes on kernels that lack the flag).
+ */
+#ifndef HAVE_BLK_FEAT_ATOMIC_WRITES
+#define BLK_FEAT_ATOMIC_WRITES 0
+#endif
+
+/*
  * BLK_STS_INVAL (added in 6.10, commit 7ba150834b04).
  *
  * Used by raid1_should_handle_error to skip retry/badblocks when the bio

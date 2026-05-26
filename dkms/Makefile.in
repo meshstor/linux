@@ -124,6 +124,10 @@ feature_flags:
 	        "$(KDIR)/include/linux/blk_types.h" 2>/dev/null; then \
 	        echo "#define HAVE_BLK_STS_INVAL 1"; \
 	    fi; \
+	    if grep -qE "\\bBLK_FEAT_ATOMIC_WRITES\\b" \
+	        "$(KDIR)/include/linux/blkdev.h" 2>/dev/null; then \
+	        echo "#define HAVE_BLK_FEAT_ATOMIC_WRITES 1"; \
+	    fi; \
 	    echo ''; \
 	    echo '#endif /* MESHSTOR_MS_FEATURE_FLAGS_H */'; \
 	} > compat/feature_flags.h
