@@ -194,26 +194,88 @@ resolve_imported() {
         nsid=$(( i + 1 ))
         dev="/dev/${ctl}n${nsid}"
         if [[ "${PBT_PRESUME_BLOCK:-0}" != "1" ]] && ! wait_for_block_device "$dev"; then
-            die_setup "expected block device $dev but not found (waited 10s)"
+            die_setup "$dev did not become usable within 10s (absent, or still held by a stale array)"
         fi
         IMPORTEDS+=("$dev")
     done
     log "imported devices: ${IMPORTEDS[*]} (ctl=$ctl, ${#IMPORTEDS[@]} ns)"
 }
 
+# True (0) if $1 currently has one or more holders under sysfs — e.g. an mdX
+# that udev incremental-assembled from a stale superblock on the device.
+device_has_holders() {
+    local g="/sys/class/block/$(basename "$1")/holders" h
+    [[ -d "$g" ]] || return 1
+    for h in "$g"/*; do
+        [[ -e "$h" ]] && return 0
+    done
+    return 1
+}
+
+# Space-separated basenames of $1's holders ("" if none) — for diagnostics.
+holder_names() {
+    local g="/sys/class/block/$(basename "$1")/holders" h out=()
+    [[ -d "$g" ]] || return 0
+    for h in "$g"/*; do
+        [[ -e "$h" ]] && out+=("$(basename "$h")")
+    done
+    printf '%s' "${out[*]}"
+}
+
+# Stop any md/ms array that holds $1 (a leg/member device). The imported
+# nvme-tcp namespace carries a v1.2 superblock from a prior run; udev
+# incremental assembly (mdadm -I) can latch onto it and build a stale /dev/mdX
+# that holds the device, which then makes the next --create fail with "Device
+# or resource busy". Kernel md does the auto-assembly (built-in md_mod) even in
+# ms-engine mode, so md* holders are stopped with the system mdadm; ms* holders
+# (left by a prior ms run) with $MSADM. Best-effort and idempotent.
+release_holders() {
+    local dev="$1" g h holder
+    g="/sys/class/block/$(basename "$dev")/holders"
+    [[ -d "$g" ]] || return 0
+    for h in "$g"/*; do
+        [[ -e "$h" ]] || continue
+        holder="$(basename "$h")"
+        case "$holder" in
+            md*)
+                log "release: stop stale /dev/$holder (held $dev)"
+                mdadm --stop "/dev/$holder" >/dev/null 2>&1 || true
+                ;;
+            ms*)
+                if [[ -x "$MSADM" ]]; then
+                    log "release: stop stale /dev/$holder (held $dev)"
+                    "$MSADM" --stop "/dev/$holder" >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+    done
+}
+
 # nvme-tcp namespace enumeration is async: nvme connect returns and udevadm
 # settle drains, but the kernel may not yet have probed the namespace and
-# created /dev/nvmeXnY. Poll for up to ~10s.
+# created /dev/nvmeXnY. And once the node appears, udev incremental assembly
+# can auto-build a stale /dev/mdX from the v1.2 superblock the imported leg
+# still carries — that array would hold the device and make array_assemble's
+# --create fail with "Device or resource busy". Poll for up to ~10s until the
+# node exists AND nothing holds it, settling udev and stopping any holder we
+# find on each pass.
 wait_for_block_device() {
     local dev="$1" i=0
     while (( i < 100 )); do
         if [[ -b "$dev" ]]; then
-            (( i > 0 )) && log "waited $(( i * 100 ))ms for $dev"
-            return 0
+            udevadm settle >/dev/null 2>&1 || true
+            if ! device_has_holders "$dev"; then
+                (( i > 0 )) && log "waited $(( i * 100 ))ms for $dev"
+                return 0
+            fi
+            release_holders "$dev"
         fi
         sleep 0.1
         (( i++ ))
     done
+    if [[ -b "$dev" ]] && device_has_holders "$dev"; then
+        warn "$dev still held after 10s by: $(holder_names "$dev")"
+    fi
     return 1
 }
 
@@ -374,27 +436,10 @@ wipe_array_state() {
     if [[ -n "$ARRAY_DEV" ]]; then
         "$adm" --stop "$ARRAY_DEV" >/dev/null 2>&1 || true
     fi
-    local m h holder name
+    local m
     for m in "${LOCALS[@]}" "${IMPORTEDS[@]}"; do
         [[ -b "$m" ]] || continue
-        name="$(basename "$m")"
-        [[ -d "/sys/class/block/$name/holders" ]] || continue
-        for h in /sys/class/block/"$name"/holders/*; do
-            [[ -e "$h" ]] || continue
-            holder="$(basename "$h")"
-            case "$holder" in
-                md*)
-                    log "wipe: stop stale /dev/$holder (held $m)"
-                    mdadm --stop "/dev/$holder" >/dev/null 2>&1 || true
-                    ;;
-                ms*)
-                    if [[ -x "$MSADM" ]]; then
-                        log "wipe: stop stale /dev/$holder (held $m)"
-                        "$MSADM" --stop "/dev/$holder" >/dev/null 2>&1 || true
-                    fi
-                    ;;
-            esac
-        done
+        release_holders "$m"
     done
     udevadm settle >/dev/null 2>&1 || true
     for m in "${LOCALS[@]}" "${IMPORTEDS[@]}"; do
