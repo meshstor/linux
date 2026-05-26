@@ -249,12 +249,6 @@ then re-run this script."
     PHY_SEC="$(blockdev --getpbsz "$DEV")"      # 4096 on both 4Kn and 512e
     OPT_IO="$(cat "/sys/class/block/$(basename "$DEV")/queue/optimal_io_size" 2>/dev/null || echo 0)"
 
-    [[ "$PHY_SEC" == "4096" ]] || die \
-        "drive is not 4K-physical (physical_block_size=${PHY_SEC}B); refusing
-       (4Kn drives have logical=4096 physical=4096; 512e drives have
-        logical=512 physical=4096; both are accepted; only true 512n
-        drives are rejected)"
-
     DEV_NAME="$(basename "$DEV")"
 
     if [[ $REMOVE -eq 1 ]]; then
