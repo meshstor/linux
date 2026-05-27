@@ -49,6 +49,7 @@ MSADM=""
 OUT_DIR=""
 FAIL_FAST=0
 KEEP=0
+PIN_GOV=1
 ENGINE="$DEFAULT_ENGINE"
 
 die() { echo "error: $*" >&2; exit "$EXIT_USAGE"; }
@@ -550,6 +551,8 @@ write_manifest() {
         --argjson raid_devs  "$RAID_DEVICES" \
         --arg cmdline        "$cmdline" \
         --arg ms_params      "$ms_params" \
+        --arg gov_orig       "${ORIG_GOVERNOR:-unknown}" \
+        --arg gov_pinned     "$([[ "$GOV_PINNED" -eq 1 ]] && echo performance || echo none)" \
         --argjson suites     "$(printf '%s\n' "${SUITES[@]}" | jq -R . | jq -s .)" \
         '{
           schema: 3,
@@ -568,6 +571,7 @@ write_manifest() {
           array: { device: $array_dev, engine: $engine, bitmap: $bitmap, level: $level, raid_devices: $raid_devs },
           kernel_cmdline: $cmdline,
           ms_module_params: $ms_params,
+          cpu_governor: { original: $gov_orig, pinned: $gov_pinned },
           suites: $suites
         }' > "$f"
 
@@ -693,10 +697,54 @@ run_suite() {
     return "$run_rc"
 }
 
+# ---- cpu governor pinning ----
+# These nvme-tcp loopback benchmarks are latency-bound with low CPU utilization,
+# so a demand governor (intel_pstate/powersave) parks the clock low and makes
+# throughput bistable — which previously masqueraded as a cross-kernel md/raid1
+# regression. Pin all CPUs to `performance` for the run and restore on teardown.
+# Override the cpu base dir for tests via PBT_CPU_BASE. --no-pin skips it.
+GOV_PINNED=0
+ORIG_GOVERNOR=""
+GOV_SAVE_FILE=""
+
+pin_governor() {
+    local base="${PBT_CPU_BASE:-/sys/devices/system/cpu}"
+    GOV_PINNED=0
+    ORIG_GOVERNOR=""
+    GOV_SAVE_FILE="$(mktemp "${TMPDIR:-/tmp}/pbt-gov.XXXXXX")"
+    local g cur n=0
+    for g in "$base"/cpu[0-9]*/cpufreq/scaling_governor; do
+        [ -e "$g" ] || continue
+        cur="$(cat "$g" 2>/dev/null)" || continue
+        [ -n "$ORIG_GOVERNOR" ] || ORIG_GOVERNOR="$cur"
+        printf '%s\t%s\n' "$g" "$cur" >> "$GOV_SAVE_FILE"
+        if echo performance > "$g" 2>/dev/null; then n=$((n + 1)); fi
+    done
+    if [[ "$n" -gt 0 ]]; then
+        GOV_PINNED=1
+        log "cpu governor: pinned $n cpus to performance (was ${ORIG_GOVERNOR:-?})"
+    else
+        warn "cpu governor: could not pin (no writable scaling_governor); throughput may be governor-dependent"
+        rm -f "$GOV_SAVE_FILE"; GOV_SAVE_FILE=""
+    fi
+}
+
+restore_governor() {
+    [[ "$GOV_PINNED" -eq 1 ]] || return 0
+    [[ -n "$GOV_SAVE_FILE" && -f "$GOV_SAVE_FILE" ]] || { GOV_PINNED=0; return 0; }
+    local path gov
+    while IFS=$'\t' read -r path gov; do
+        [[ -n "$path" ]] && echo "$gov" > "$path" 2>/dev/null || true
+    done < "$GOV_SAVE_FILE"
+    log "cpu governor: restored to ${ORIG_GOVERNOR:-prior}"
+    rm -f "$GOV_SAVE_FILE"; GOV_SAVE_FILE=""; GOV_PINNED=0
+}
+
 # ---- cleanup + trap ----
 SCRIPT_RC=0  # set by on_exit from $? before cleanup runs
 
 cleanup() {
+    restore_governor  # always restore CPU governor, even under --keep
     local keep_active=0
     if [[ "$KEEP" -eq 1 ]] && [[ "$SCRIPT_RC" -eq 0 ]] && [[ "$SUITE_FAILURES" -eq 0 ]]; then
         keep_active=1
@@ -839,6 +887,7 @@ parse_args() {
     OUT_DIR=""
     FAIL_FAST=0
     KEEP=0
+    PIN_GOV=1
     ENGINE="$DEFAULT_ENGINE"
 
     local pos=()
@@ -855,6 +904,7 @@ parse_args() {
             --msadm=*)    MSADM="${1#--msadm=}" ;;
             --fail-fast)  FAIL_FAST=1 ;;
             --keep)       KEEP=1 ;;
+            --no-pin)     PIN_GOV=0 ;;
             -h|--help)    usage; exit 0 ;;
             --) shift; pos+=("$@"); break ;;
             -*) die "unknown flag: $1" ;;
@@ -988,6 +1038,7 @@ main() {
     resolve_imported
     array_assemble
     array_verify
+    [[ "$PIN_GOV" -eq 1 ]] && pin_governor
     write_manifest
 
     local suite
