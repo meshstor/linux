@@ -244,6 +244,45 @@ for v in "${VARIANTS[@]}"; do
     done
 done
 
+# ---- context header ----
+
+# Read one field from a run manifest.json via jq. Echoes the value, or
+# nothing on any failure (missing file, absent jq, null/empty field) so the
+# header can fall back per-field without aborting under set -euo pipefail.
+manifest_field() {
+    local manifest="$1" filter="$2" val
+    [[ -f "$manifest" ]] || return 0
+    val="$(jq -r "$filter // empty" "$manifest" 2>/dev/null)" || return 0
+    [[ "$val" == "null" ]] && return 0
+    printf '%s' "$val"
+}
+
+# Primary manifest for date/kernel: the first rendered variant that has one
+# (baseline first, per VARIANTS ordering / discover_from).
+PRIMARY_MANIFEST="$(variant_dir "$discover_from")/results/manifest.json"
+HDR_DATE="$(manifest_field "$PRIMARY_MANIFEST" '.started_utc')"
+HDR_KERNEL="$(manifest_field "$PRIMARY_MANIFEST" '.uname_r')"
+
+# Bitmap: scan every rendered variant's manifest. A single value if they all
+# agree (the perf-compare case); "varies" when they differ (perf-bitmap-compare
+# runs internal vs lockless side by side); "?" when none is readable.
+HDR_BITMAP=""
+_bitmap_varies=0
+for v in "${VARIANTS[@]}"; do
+    _bm="$(manifest_field "$(variant_dir "$v")/results/manifest.json" '.array.bitmap')"
+    [[ -z "$_bm" ]] && continue
+    if [[ -z "$HDR_BITMAP" ]]; then HDR_BITMAP="$_bm"
+    elif [[ "$HDR_BITMAP" != "$_bm" ]]; then _bitmap_varies=1; fi
+done
+if (( _bitmap_varies )); then HDR_BITMAP="varies"
+elif [[ -z "$HDR_BITMAP" ]]; then HDR_BITMAP="?"; fi
+unset _bm _bitmap_varies
+
+printf 'Directory: %s\n' "$(basename "$BASE")"
+printf 'Date:      %s\n' "${HDR_DATE:-?}"
+printf 'Kernel:    %s\n' "${HDR_KERNEL:-?}"
+printf 'Bitmap:    %s\n' "$HDR_BITMAP"
+
 # ---- rendering (unicode box) ----
 
 # Column widths (col 0 = variant name, then 1 per suite).
