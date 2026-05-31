@@ -6,9 +6,10 @@ paste one at a time.
 
 Two comparison tools live in `bin/`:
 
-- **`perf-compare`** — feature-branch comparison: same bitmap (lockless),
-  different code variants (baseline + per-bucket-arrays + takeover +
-  latency-ewma + llbitmap-fastpath). Five DKMS rebuilds per run.
+- **`perf-compare`** — feature-branch comparison: same bitmap mode across
+  variants (`--bitmap`, default lockless), different code variants
+  (baseline + per-bucket-arrays + takeover + latency-ewma +
+  llbitmap-fastpath). Five DKMS rebuilds per run.
 - **`perf-bitmap-compare`** — bitmap-mode comparison on the same code:
   four modes (md-internal, md-lockless, ms-internal, ms-lockless);
   md-lockless is auto-skipped when the kernel lacks md llbitmap
@@ -169,7 +170,7 @@ Pick the tool, then the topology.
 
 | Tool                  | Comparison axis                                    | Default modes/variants run       | Build cycle      |
 |-----------------------|----------------------------------------------------|----------------------------------|------------------|
-| `perf-compare`        | Code variant (feature branches; same bitmap)       | 5 (baseline + 4 features)        | rebuild per var  |
+| `perf-compare`        | Code variant (feature branches; bitmap via --bitmap, default lockless) | 5 (baseline + 4 features)        | rebuild per var  |
 | `perf-bitmap-compare` | Bitmap implementation on the same code             | 4 (md-internal, md-lockless, ms-internal, ms-lockless) | one rebuild |
 
 ### 3.1 — `perf-compare` (feature-branch comparison)

@@ -115,6 +115,9 @@ Flags:
   --level=raid1|raid10  raid level (default: raid1)
   --local=PATH          local-leg partition (repeatable)
   --remote=PATH         tcp-leg partition (repeatable; same count as --local)
+  --bitmap=VAL          bitmap mode passed to each bench run, then to
+                        mdadm/msadm --bitmap; recorded in each run's
+                        manifest.json (default: lockless)
   --port=N              nvmet-tcp listen port (default: bench script's 4420)
   --cool-thresh-k=N     wait between variants until max sensor temp on every
                         leg's parent NVMe drops below N Kelvin (default:
@@ -147,6 +150,9 @@ SYSTEM_DKMS_VER=""
 SUMMARY_ONLY=0
 PORT="7720"
 NO_CACHE=0
+# Bitmap mode passed verbatim to each perf-bench-tcp run (and thence to
+# mdadm/msadm --bitmap). Recorded per run in that bench's manifest.json.
+BITMAP="lockless"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
@@ -161,6 +167,7 @@ while (($#)); do
         --level=*)      LEVEL="${1#--level=}"; shift ;;
         --local=*)      LOCALS+=("${1#--local=}"); shift ;;
         --remote=*)     REMOTES+=("${1#--remote=}"); shift ;;
+        --bitmap=*)     BITMAP="${1#--bitmap=}"; shift ;;
         --port=*)       PORT="${1#--port=}"; shift ;;
         --cool-thresh-k=*) COOL_THRESH_K="${1#--cool-thresh-k=}"; shift ;;
         --) shift; _pos+=("$@"); break ;;
@@ -313,7 +320,7 @@ write_summary() {
         echo ""
         echo "Host: $(hostname)  Kernel: $(uname -r)"
         echo "Level: $LEVEL  Local legs: ${LOCALS[*]:-(none)}  TCP legs: ${REMOTES[*]:-(none)}"
-        echo "Bench: bin/perf-bench-tcp --bitmap=lockless --level=$LEVEL"
+        echo "Bench: bin/perf-bench-tcp --bitmap=$BITMAP --level=$LEVEL"
         echo ""
         local suite_dir suite_name label out status run_log iops lat
         for suite_dir in "${SUITES[@]}"; do
@@ -399,7 +406,7 @@ run_variant() {
     # 5. bench
     log "run-perf-bench-tcp ($LEVEL, ${#LOCALS[@]}+${#REMOTES[@]} legs) -> $bench_dir"
     local -a bench_args
-    bench_args=(--bitmap=lockless --out-dir="$bench_dir" --msadm="$MSADM_WRAPPER" \
+    bench_args=(--bitmap="$BITMAP" --out-dir="$bench_dir" --msadm="$MSADM_WRAPPER" \
                 --level="$LEVEL")
     [[ -n "$PORT" ]] && bench_args+=(--port="$PORT")
     for p in "${LOCALS[@]}";  do bench_args+=(--local="$p");  done
