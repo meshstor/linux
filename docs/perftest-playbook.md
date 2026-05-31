@@ -337,9 +337,13 @@ OUT_BASE=$(ls -dt $HOME/linux-meshstor/results/perf-bitmap-* | head -1)
 ```
 
 The helper auto-discovers variants/modes and suites and emits a unicode-box
-table with `iops / mean_us / p99_us` per cell. It tolerates fio output
-with leading non-JSON lines (which `perf-compare`'s own SUMMARY.md parser
-does NOT — known bug on hosts with `nvme_core.multipath=Y`).
+table with `iops / mean_us / p99_us` per cell, preceded by a context header
+(results directory, run date and kernel version from the run's
+`manifest.json`, and the bitmap mode — a single value when all variants
+agree, or `varies` for a `perf-bitmap-compare` matrix that mixes modes). It
+tolerates fio output with leading non-JSON lines (which `perf-compare`'s own
+SUMMARY.md parser does NOT — known bug on hosts with
+`nvme_core.multipath=Y`).
 
 For `perf-compare`, if a `baseline/` subdir exists, that row shows
 absolutes and others show percent delta. For `perf-bitmap-compare`, no
