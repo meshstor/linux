@@ -347,12 +347,12 @@ SUMMARY.md parser does NOT — known bug on hosts with
 
 For `perf-compare`, if a `baseline/` subdir exists, that row shows
 absolutes and others show percent delta. For `perf-bitmap-compare`, no
-mode is named `baseline`, so all rows show absolutes (compare visually).
-To get deltas, symlink one mode as the baseline first:
+mode is named `baseline`, so `md-internal` is used as the implicit
+baseline: kernel-md shows absolutes and the other modes show percent
+delta vs it. To diff against a different mode, point `--baseline` at it:
 
 ```bash
-( cd "$OUT_BASE" && ln -sfn md-internal baseline )
-~/linux-meshstor/bin/perf-extract-table "$OUT_BASE"
+~/linux-meshstor/bin/perf-extract-table --baseline "$OUT_BASE/ms-lockless" "$OUT_BASE"
 ```
 
 To redirect to a file:
