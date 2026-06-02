@@ -28,7 +28,7 @@ OUT_BASE="$REPO_ROOT/results/perf-bitmap-$DATE_TAG"
 # Default suites — same set perf-compare uses.
 SUITES_BASE="${SUITES_BASE:-/home/${SUDO_USER:-$USER}/csi-perf-test/suites}"
 DEFAULT_SUITES=(
-    snia-randread-iops snia-randwrite-iops
+    peak-randread-iops snia-randwrite-iops
     snia-randread-lat  snia-randwrite-lat
     kp-asym-read kp-hot-region-write
     kp-hot-region-largeio-write kp-resync-overlap-write
@@ -197,7 +197,7 @@ Flags:
   --no-cache             bypass build/cache/
 
 Defaults:
-  Suites: same 8 as perf-compare (4 SNIA + 4 kp-*).
+  Suites: same 8 as perf-compare (peak-randread-iops + 3 SNIA + 4 kp-*).
   Override via positional args or the SUITES env var.
 
 Output:

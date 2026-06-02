@@ -24,8 +24,12 @@ DATE_TAG="${DATE_TAG:-$(date -u +%s)}"
 OUT_BASE="$REPO_ROOT/results/perf-$DATE_TAG"
 
 SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
-# Default suite set: 4 SNIA corners as a no-regression band, plus every kp-*
-# suite that targets a per-branch claim:
+# Default suite set: a no-regression band (peak-randread-iops + 3 SNIA
+# corners), plus every kp-* suite that targets a per-branch claim. The
+# random-read corner is peak-randread-iops (saturating QD), not the SNIA
+# QD=128 corner: on the nvme-tcp loopback rig QD=128 sits below saturation,
+# so its IOPS reflects per-IO latency rather than peak throughput and shows
+# spurious cross-variant deltas. peak-randread-iops measures past the knee.
 #
 #   kp-asym-read                  latency-ewma headline. 5 ms netem on lo +
 #                                 qd=8 single-thread randread — the only
@@ -63,7 +67,7 @@ SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
 #
 # Override the list with the SUITES env var (space-separated suite names).
 DEFAULT_SUITES=(
-    snia-randread-iops
+    peak-randread-iops
     snia-randwrite-iops
     snia-randread-lat
     snia-randwrite-lat
@@ -132,7 +136,7 @@ Environment overrides:
   REBUILT_TREE   Path for rebuild-main output (default: build/linux-meshstor-rebuilt)
   MDADM_BIN      Path to mdadm-fork binary (default: /home/$SUDO_USER/mdadm/mdadm)
   SUITES_BASE    csi-perf-test suites directory (default: /home/$SUDO_USER/csi-perf-test/suites)
-  SUITES         space-separated suite names override (default: 4 SNIA + all kp-* suites)
+  SUITES         space-separated suite names override (default: peak-randread-iops + 3 SNIA + all kp-* suites)
 
 Output: $OUT_BASE/<variant>/results/...
         $OUT_BASE/SUMMARY.md
