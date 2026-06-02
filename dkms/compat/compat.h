@@ -234,13 +234,22 @@ static inline void bio_init_inline(struct bio *bio, struct block_device *bdev,
 /*
  * bio_submit_split_bioset()
  *
- * Upstream introduces this helper around v6.18. Semantics: split off
- * `sectors` from the front of `bio` using bioset `bs`, chain remainder,
- * submit the split via submit_bio_noacct, and return the original bio
- * (now representing the remainder) so the caller can continue.
+ * Upstream introduces this helper around v6.18 (block/blk-merge.c). Semantics:
+ * split off the first `sectors` of `bio` into a new bio using bioset `bs`,
+ * chain it, then submit the *remainder* (the original bio, now advanced past
+ * `sectors`) via submit_bio_noacct and return the *head* split so the caller
+ * keeps processing the front part. On failure the original bio is failed with
+ * bio_endio() and NULL is returned.
  *
- * Backport via existing bio_split + bio_chain + submit_bio_noacct,
- * all of which exist in 6.12.
+ * NOTE: the head/remainder direction matters. md callers (raid1/raid10)
+ * continue with the returned bio as the head and rely on the helper to
+ * resubmit the tail; getting it backwards mislabels the per-bucket barrier
+ * sector and clones member I/O for the wrong region. Likewise the error path
+ * MUST bio_endio() the bio: callers set R10BIO_Returned on a NULL return,
+ * which makes raid_end_bio_io() skip the completion, so the helper owns it.
+ *
+ * Backport via existing bio_split + bio_chain + submit_bio_noacct, all of
+ * which exist on the target kernels (5.14/6.12/6.14/6.17, all < 6.18).
  */
 #ifndef HAVE_BIO_SUBMIT_SPLIT_BIOSET
 static inline struct bio *bio_submit_split_bioset(struct bio *bio,
@@ -250,11 +259,14 @@ static inline struct bio *bio_submit_split_bioset(struct bio *bio,
     struct bio *split;
 
     split = bio_split(bio, sectors, GFP_NOIO, bs);
-    if (IS_ERR(split))
+    if (IS_ERR(split)) {
+        bio->bi_status = errno_to_blk_status(PTR_ERR(split));
+        bio_endio(bio);
         return NULL;
+    }
     bio_chain(split, bio);
-    submit_bio_noacct(split);
-    return bio;
+    submit_bio_noacct(bio);
+    return split;
 }
 #endif
 
