@@ -212,7 +212,7 @@ Wall-clock estimate per full run:
 
 | Variants | Suites | Estimate |
 |---|---|---|
-| 5 | 5 (default: 4 SNIA + ewma-asymmetric-read) | ~80–95 min (cool-down may add more) |
+| 5 | 5 (default: peak-randread-iops + 3 SNIA + ewma-asymmetric-read) | ~80–95 min (cool-down may add more) |
 | 1 | 5 | ~16–22 min |
 | 5 | 1 (single suite via `SUITES=name`) | ~30 min |
 
@@ -273,7 +273,7 @@ Wall-clock estimate per full run (3 modes):
 
 | Suites | Estimate |
 |---|---|
-| 8 (default: 4 SNIA + 4 kp-*)  | ~35–50 min (incl. one DKMS build + 2 cool-downs) |
+| 8 (default: peak-randread-iops + 3 SNIA + 4 kp-*)  | ~35–50 min (incl. one DKMS build + 2 cool-downs) |
 | 1 (e.g., kp-asym-read)        | ~5–10 min (~2 min build + 3×~1 min suite + cool-downs) |
 
 ### 3.3 — Tuning the thermal gate (applies to both tools)

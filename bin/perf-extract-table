@@ -118,6 +118,7 @@ for d in "$(variant_dir "$discover_from")/results"/*/; do
     DISCOVERED+=("$(basename "${d%/}")")
 done
 PREFERRED_ORDER=(
+    peak-randread-iops
     snia-randread-iops
     snia-randwrite-iops
     snia-randread-lat
