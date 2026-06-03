@@ -469,6 +469,27 @@ resolve_out_dir() {
 # Best-effort property fetcher; returns "" on any failure.
 safe() { "$@" 2>/dev/null || true; }
 
+# Resolve the /sys block queue dir backing a device path. Partitions
+# (e.g. nvme0n1p1) carry no queue of their own, so fall back to the
+# parent disk's queue. Prints nothing if it can't be resolved.
+queue_dir_for() {
+    local b; b="$(basename "$1")"
+    if [[ -d "/sys/class/block/$b/queue" ]]; then
+        echo "/sys/class/block/$b/queue"; return 0
+    fi
+    local pk; pk="$(safe lsblk -ndo PKNAME "$1" | head -1)"
+    [[ -n "$pk" && -d "/sys/class/block/$pk/queue" ]] && echo "/sys/class/block/$pk/queue"
+}
+
+# Device basenames to hand iostat: every array member plus the array
+# device itself, so the per-suite samples show the read/write split
+# across the local NVMe leg and the nvme-tcp leg.
+iostat_devs() {
+    local d
+    for d in "${ARRAY_MEMBERS[@]}"; do basename "$d"; done
+    basename "$ARRAY_DEV"
+}
+
 write_manifest() {
     resolve_out_dir
     local f="$OUT_DIR/manifest.json"
@@ -528,6 +549,32 @@ write_manifest() {
         )"
     fi
 
+    # System tunables that explain cross-kernel deltas (CPU speculation
+    # mitigations, per-member I/O scheduler) but are otherwise uncaptured.
+    # A 4k-randread IOPS swing with flat writes between two kernels on the
+    # same hardware usually lives here or in the per-suite iostat split.
+    local vulns_json queue_json
+    vulns_json="$(
+        for vf in /sys/devices/system/cpu/vulnerabilities/*; do
+            [[ -r "$vf" ]] || continue
+            printf '%s\t%s\n' "$(basename "$vf")" "$(safe cat "$vf")"
+        done | jq -R 'split("\t") | {(.[0]): (.[1] // "")}' | jq -s 'add // {}'
+    )"
+    queue_json='[]'
+    for p in "${ARRAY_MEMBERS[@]}"; do
+        local qd; qd="$(queue_dir_for "$p")"
+        [[ -n "$qd" ]] || continue
+        queue_json="$(jq \
+            --arg dev   "$p" \
+            --arg sched "$(safe cat "$qd/scheduler"      | tr -d '\n')" \
+            --arg rqaff "$(safe cat "$qd/rq_affinity"    | tr -d '\n')" \
+            --arg nomrg "$(safe cat "$qd/nomerges"       | tr -d '\n')" \
+            --arg maxkb "$(safe cat "$qd/max_sectors_kb" | tr -d '\n')" \
+            --arg rakb  "$(safe cat "$qd/read_ahead_kb"  | tr -d '\n')" \
+            '. += [{dev:$dev, scheduler:$sched, rq_affinity:$rqaff, nomerges:$nomrg, max_sectors_kb:$maxkb, read_ahead_kb:$rakb}]' \
+            <<<"$queue_json")"
+    done
+
     jq -n \
         --arg started        "$started" \
         --arg host           "$host" \
@@ -554,6 +601,8 @@ write_manifest() {
         --arg gov_orig       "${ORIG_GOVERNOR:-unknown}" \
         --arg gov_pinned     "$([[ "$GOV_PINNED" -eq 1 ]] && echo performance || echo none)" \
         --argjson suites     "$(printf '%s\n' "${SUITES[@]}" | jq -R . | jq -s .)" \
+        --argjson vulns      "$vulns_json" \
+        --argjson queues     "$queue_json" \
         '{
           schema: 3,
           started_utc: $started,
@@ -572,6 +621,7 @@ write_manifest() {
           kernel_cmdline: $cmdline,
           ms_module_params: $ms_params,
           cpu_governor: { original: $gov_orig, pinned: $gov_pinned },
+          system_tunables: { cpu_vulnerabilities: $vulns, block_queues: $queues },
           suites: $suites
         }' > "$f"
 
@@ -602,11 +652,58 @@ write_manifest() {
         echo
         echo "--- /proc/mdstat ---"
         safe cat /proc/mdstat
+        echo
+        echo "--- cpu vulnerabilities ---"
+        safe grep -r . /sys/devices/system/cpu/vulnerabilities/ \
+            | sed 's#/sys/devices/system/cpu/vulnerabilities/##'
+        echo
+        echo "--- block queue tunables (array members) ---"
+        local m qd
+        for m in "${ARRAY_MEMBERS[@]}"; do
+            qd="$(queue_dir_for "$m")"
+            [[ -n "$qd" ]] || { printf '%-26s (no queue dir)\n' "$m"; continue; }
+            printf '%-26s sched=%s rq_affinity=%s nomerges=%s max_sectors_kb=%s read_ahead_kb=%s\n' \
+                "$m" \
+                "$(safe cat "$qd/scheduler"      | tr -d '\n')" \
+                "$(safe cat "$qd/rq_affinity"    | tr -d '\n')" \
+                "$(safe cat "$qd/nomerges"       | tr -d '\n')" \
+                "$(safe cat "$qd/max_sectors_kb" | tr -d '\n')" \
+                "$(safe cat "$qd/read_ahead_kb"  | tr -d '\n')"
+        done
     } > "$OUT_DIR/start.txt"
 }
 
 # ---- suite runner ----
 SUITE_FAILURES=0
+
+# Per-suite per-device iostat sampling. Captures the read/write IOPS
+# split across array members (local NVMe leg vs nvme-tcp leg) for the
+# duration of run.sh — the signal that distinguishes a read-balancer or
+# transport change from a per-IO CPU-path change across kernels.
+# Optional: needs sysstat's iostat; skipped (with a note in iostat.log)
+# if absent or PBT_NO_IOSTAT=1. Sample interval: PBT_IOSTAT_INTERVAL (2s).
+IOSTAT_PID=""
+start_iostat() {
+    local dir="$1"
+    IOSTAT_PID=""
+    [[ "${PBT_NO_IOSTAT:-0}" == "1" ]] && return 0
+    if ! command -v iostat >/dev/null 2>&1; then
+        echo "iostat not installed (sysstat); per-device read/write split not captured" \
+            > "$dir/iostat.log"
+        return 0
+    fi
+    local devs; mapfile -t devs < <(iostat_devs)
+    iostat -x -d -y -t "${PBT_IOSTAT_INTERVAL:-2}" "${devs[@]}" \
+        > "$dir/iostat.log" 2>&1 &
+    IOSTAT_PID=$!
+}
+
+stop_iostat() {
+    [[ -n "$IOSTAT_PID" ]] || return 0
+    kill "$IOSTAT_PID" 2>/dev/null || true
+    wait "$IOSTAT_PID" 2>/dev/null || true
+    IOSTAT_PID=""
+}
 
 drop_caches() {
     if [[ "${PBT_FAKE_DROP_CACHES:-0}" == "1" ]]; then
@@ -650,9 +747,11 @@ run_suite() {
         || prepare_rc=$?
 
     if [[ "$prepare_rc" -eq 0 ]]; then
+        start_iostat "$dir"
         BLOCKDEV="$ARRAY_DEV" VOLUME_MODE=block OUT_DIR="$OUT_DIR" \
             bash "$suite/run.sh" >"$dir/run.log" 2>&1 \
             || run_rc=$?
+        stop_iostat
     else
         run_rc=255
         echo "skipped: prepare failed (rc=$prepare_rc)" > "$dir/run.log"
@@ -744,6 +843,7 @@ restore_governor() {
 SCRIPT_RC=0  # set by on_exit from $? before cleanup runs
 
 cleanup() {
+    stop_iostat       # kill any per-suite iostat sampler still running
     restore_governor  # always restore CPU governor, even under --keep
     local keep_active=0
     if [[ "$KEEP" -eq 1 ]] && [[ "$SCRIPT_RC" -eq 0 ]] && [[ "$SUITE_FAILURES" -eq 0 ]]; then
