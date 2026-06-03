@@ -177,7 +177,15 @@ KVER="$(uname -r)"
 echo ">> installing kernel headers + dkms for $KVER ($ID)"
 case "$ID" in
     rhel|rocky|almalinux|centos|fedora|ol)
-        dnf install -y dkms "kernel-devel-${KVER}" "kernel-headers-${KVER}" mokutil
+        # Oracle UEK kernels (uname -r ends in "uek") ship their build tree in
+        # kernel-uek-devel; there is no per-release kernel-devel/kernel-headers
+        # for them. Match on the kernel string, not $ID — UEK boots under
+        # ID=ol *and* ID=rocky (UEK-on-Rocky), and a stock kernel can run under
+        # ID=ol, so only the running kernel's name is authoritative.
+        case "$KVER" in
+            *uek*) dnf install -y dkms "kernel-uek-devel-${KVER}" mokutil ;;
+            *)     dnf install -y dkms "kernel-devel-${KVER}" "kernel-headers-${KVER}" mokutil ;;
+        esac
         ;;
     ubuntu|debian)
         export DEBIAN_FRONTEND=noninteractive
