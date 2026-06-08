@@ -414,6 +414,7 @@ static char state_machine[BitStateCount][BitmapActionCount] = {
 };
 
 static void __llbitmap_flush(struct mddev *mddev);
+static void llbitmap_destroy(struct mddev *mddev);
 
 static enum llbitmap_state llbitmap_read(struct llbitmap *llbitmap, loff_t pos)
 {
@@ -624,6 +625,7 @@ static int llbitmap_cache_pages(struct llbitmap *llbitmap)
 	pctl = kmalloc_array(nr_pages, size, GFP_KERNEL | __GFP_ZERO);
 	if (!pctl) {
 		kfree(llbitmap->pctl);
+		llbitmap->pctl = NULL;
 		return -ENOMEM;
 	}
 
@@ -900,6 +902,117 @@ static int llbitmap_check_support(struct mddev *mddev)
 	return 0;
 }
 
+/*
+ * Refresh page 0 (the on-disk bitmap super) from in-core state and the
+ * current event count.  Returns 0, or -EIO if the on-disk super could not
+ * be read back (which also latches BITMAP_WRITE_ERROR).  Shared by the
+ * runtime .update_sb hook and the init-time persist below; the caller
+ * chooses how to write the refreshed page out.
+ */
+static int llbitmap_refresh_sb(struct llbitmap *llbitmap)
+{
+	struct mddev *mddev = llbitmap->mddev;
+	struct page *sb_page;
+	bitmap_super_t *sb;
+
+	sb_page = llbitmap_read_page(llbitmap, 0);
+	if (IS_ERR(sb_page)) {
+		pr_err("%s: %s: read super block failed", __func__,
+		       mdname(mddev));
+		set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+		return -EIO;
+	}
+
+	if (mddev->events < llbitmap->events_cleared)
+		llbitmap->events_cleared = mddev->events;
+
+	sb = kmap_local_page(sb_page);
+	sb->events = cpu_to_le64(mddev->events);
+	sb->state = cpu_to_le32(llbitmap->flags);
+	sb->chunksize = cpu_to_le32(llbitmap->chunksize);
+	sb->sync_size = cpu_to_le64(mddev->resync_max_sectors);
+	sb->events_cleared = cpu_to_le64(llbitmap->events_cleared);
+	sb->sectors_reserved = cpu_to_le32(mddev->bitmap_info.space);
+	sb->daemon_sleep = cpu_to_le32(mddev->bitmap_info.daemon_sleep);
+	kunmap_local(sb);
+
+	return 0;
+}
+
+/*
+ * Init-only synchronous write of `size` bytes of `page` to the bitmap
+ * `sector` on every eligible rdev.  Returns true iff every attempted write
+ * failed, i.e. there is no surviving on-disk copy.
+ *
+ * This exists for exactly one window: md_bitmap_create() runs inside
+ * do_md_run() before mddev->pers is assigned, so the asynchronous
+ * md_write_metadata() path's super_written() -> md_error() chain is dormant
+ * and silently swallows write failures (md_super_wait() only waits for
+ * completion).  sync_page_io() returns the per-rdev verdict inline instead.
+ *
+ * Partial failure is tolerated: llbitmap_read_page() recovers each page
+ * independently from the first rdev that reads it back, so one surviving copy
+ * suffices.  sync_page_io(metadata_op=true) adds rdev->sb_start, so pass the
+ * bitmap offset alone; flags match md_write_metadata().
+ */
+static bool llbitmap_sync_write(struct llbitmap *llbitmap, struct page *page,
+				sector_t sector, int size)
+{
+	struct mddev *mddev = llbitmap->mddev;
+	struct md_rdev *rdev;
+	int submitted = 0, errors = 0;
+
+	rdev_for_each(rdev, mddev) {
+		if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
+			continue;
+		submitted++;
+		if (!sync_page_io(rdev, sector, size, page,
+				  REQ_OP_WRITE | REQ_SYNC | REQ_IDLE | REQ_META |
+				  REQ_PREFLUSH | REQ_FUA, true))
+			errors++;
+	}
+
+	return submitted > 0 && errors == submitted;
+}
+
+/*
+ * Phase 1 of the init persist: write every bitmap page in full.  Page 0's
+ * super still carries BITMAP_FIRST_USE here (see llbitmap_init()), so a
+ * failure leaves the array re-initialising on the next assemble.  Returns
+ * true iff any page has no surviving on-disk copy.
+ */
+static bool llbitmap_init_flush_sync(struct llbitmap *llbitmap)
+{
+	struct mddev *mddev = llbitmap->mddev;
+	unsigned int idx;
+
+	for (idx = 0; idx < llbitmap->nr_pages; idx++) {
+		sector_t sector = mddev->bitmap_info.offset +
+				  ((sector_t)idx << PAGE_SECTORS_SHIFT);
+
+		if (llbitmap_sync_write(llbitmap, llbitmap->pctl[idx]->page,
+					sector, PAGE_SIZE))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Phase 2 of the init persist: rewrite page 0's bitmap super alone (the first
+ * BITMAP_DATA_OFFSET bytes, rounded up to io_size) with BITMAP_FIRST_USE now
+ * cleared, as the commit once the data pages are durable.  Returns true iff
+ * every attempted write failed.
+ */
+static bool llbitmap_write_sb_sync(struct llbitmap *llbitmap)
+{
+	int size = DIV_ROUND_UP(BITMAP_DATA_OFFSET, llbitmap->io_size) *
+		   llbitmap->io_size;
+
+	return llbitmap_sync_write(llbitmap, llbitmap->pctl[0]->page,
+				   llbitmap->mddev->bitmap_info.offset, size);
+}
+
 static int llbitmap_init(struct llbitmap *llbitmap)
 {
 	struct mddev *mddev = llbitmap->mddev;
@@ -926,10 +1039,59 @@ static int llbitmap_init(struct llbitmap *llbitmap)
 
 	llbitmap_state_machine(llbitmap, 0, llbitmap->chunks - 1,
 			       BitmapActionInit);
-	/* flush initial llbitmap to disk */
-	__llbitmap_flush(mddev);
+
+	/*
+	 * Persist the freshly initialised bitmap before do_md_run() assigns
+	 * mddev->pers, in two phases so BITMAP_FIRST_USE is cleared on disk only
+	 * after every bitmap page is durable.  Without the FIRST_USE-clear
+	 * persist, a crash between RUN_ARRAY and the first md_update_sb leaves
+	 * FIRST_USE set on disk and the next assemble re-runs llbitmap_init(),
+	 * clobbering sync state.  But the data must reach disk *before* that
+	 * marker, or a crash with the super committed but the data pages not
+	 * would let the next assemble skip re-init and trust stale data.
+	 *
+	 *  Phase 1 writes every page, page 0's super still carrying FIRST_USE
+	 *  (it is set on disk, which is why init runs).
+	 *  Phase 2 rewrites page 0's super alone with FIRST_USE cleared.
+	 *
+	 * A write failure or crash in either phase leaves FIRST_USE set on disk
+	 * -- including across the page-0 data that shares the super's page, which
+	 * phase 1 makes durable before phase 2 commits -- so the next assemble
+	 * re-runs llbitmap_init() rather than trusting half-written data.
+	 *
+	 * Both phases are synchronous because mddev->pers is not yet assigned:
+	 * the async super_written() -> md_error() chain is dormant and cannot
+	 * report a write failure (md_super_wait() only waits for completion), so
+	 * sync_page_io() returns the verdict inline.  Each write also carries
+	 * REQ_PREFLUSH | REQ_FUA, so sync_page_io() returns only once the data is
+	 * on stable storage; phase 1 thus completes -- every page durable -- before
+	 * phase 2's FIRST_USE-clear super is even submitted, which is what makes
+	 * that super a valid commit.  A page with no surviving on-disk copy latches
+	 * BITMAP_WRITE_ERROR and aborts the array start.
+	 * The runtime .update_sb hook, by contrast, leaves device failure to the
+	 * personality's error_handler and does not latch.
+	 */
+	set_bit(BITMAP_FIRST_USE, &llbitmap->flags);
+	ret = llbitmap_refresh_sb(llbitmap);
+	if (ret)
+		return ret;
+	if (llbitmap_init_flush_sync(llbitmap))
+		goto write_error;
+
+	clear_bit(BITMAP_FIRST_USE, &llbitmap->flags);
+	ret = llbitmap_refresh_sb(llbitmap);
+	if (ret)
+		return ret;
+	if (llbitmap_write_sb_sync(llbitmap))
+		goto write_error;
 
 	return 0;
+
+write_error:
+	set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+	pr_err("md/llbitmap: %s: failed to persist initial bitmap\n",
+	       mdname(mddev));
+	return -EIO;
 }
 
 static int llbitmap_read_sb(struct llbitmap *llbitmap)
@@ -1140,10 +1302,8 @@ static int llbitmap_create(struct mddev *mddev)
 	mddev->bitmap = llbitmap;
 	ret = llbitmap_read_sb(llbitmap);
 	mutex_unlock(&mddev->bitmap_info.mutex);
-	if (ret) {
-		kfree(llbitmap);
-		mddev->bitmap = NULL;
-	}
+	if (ret)
+		llbitmap_destroy(mddev);
 
 	return ret;
 }
@@ -1507,37 +1667,23 @@ static void llbitmap_write_sb(struct llbitmap *llbitmap)
 	md_super_wait(llbitmap->mddev);
 }
 
+/*
+ * Runtime .update_sb hook: refresh the on-disk bitmap super from in-core
+ * state and write it to every rdev via md_write_metadata().  Once
+ * mddev->pers is set, the personality's error_handler owns device
+ * failure, so a write failure here is deliberately not latched -- only a
+ * read-back failure latches BITMAP_WRITE_ERROR (see llbitmap_refresh_sb()).
+ * The init-time persist that must detect total write failure before
+ * mddev->pers exists is handled separately (see llbitmap_init()).
+ */
 static void llbitmap_update_sb(void *data)
 {
 	struct llbitmap *llbitmap = data;
-	struct mddev *mddev = llbitmap->mddev;
-	struct page *sb_page;
-	bitmap_super_t *sb;
 
 	if (test_bit(BITMAP_WRITE_ERROR, &llbitmap->flags))
 		return;
-
-	sb_page = llbitmap_read_page(llbitmap, 0);
-	if (IS_ERR(sb_page)) {
-		pr_err("%s: %s: read super block failed", __func__,
-		       mdname(mddev));
-		set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+	if (llbitmap_refresh_sb(llbitmap))
 		return;
-	}
-
-	if (mddev->events < llbitmap->events_cleared)
-		llbitmap->events_cleared = mddev->events;
-
-	sb = kmap_local_page(sb_page);
-	sb->events = cpu_to_le64(mddev->events);
-	sb->state = cpu_to_le32(llbitmap->flags);
-	sb->chunksize = cpu_to_le32(llbitmap->chunksize);
-	sb->sync_size = cpu_to_le64(mddev->resync_max_sectors);
-	sb->events_cleared = cpu_to_le64(llbitmap->events_cleared);
-	sb->sectors_reserved = cpu_to_le32(mddev->bitmap_info.space);
-	sb->daemon_sleep = cpu_to_le32(mddev->bitmap_info.daemon_sleep);
-
-	kunmap_local(sb);
 	llbitmap_write_sb(llbitmap);
 }
 
