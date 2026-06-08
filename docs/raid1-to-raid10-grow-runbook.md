@@ -350,7 +350,7 @@ This procedure was validated on:
 
 * Kernel 6.12.0-124.49.1.el10_1.x86_64 (RHEL 10.1)
 * `ms_mod` + `raid1_ms` + `raid10_ms` from the
-  `wip/md-raid1-to-raid10-takeover` branch (commits including the
+  `takeover` branch (commits including the
   `narrow takeover recovery check to MD_RECOVERY_RUNNING` fix —
   without it, `msadm --grow --level=10` in Step 5 fails with
   "recovery state not clean").

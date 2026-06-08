@@ -70,7 +70,7 @@ the two personalities. RAID0/5/6 and md-cluster are intentionally out of scope
   tooling, docs, and selftests — everything that is *not* a kernel md feature.
 - **Feature branches** carry one md feature each, rebased on a torvalds master
   snapshot: `md-latency-ewma`, `per-bucket-arrays`,
-  `wip/md-llbitmap-hot-write-fast-path`, `wip/md-raid1-to-raid10-takeover`,
+  `wip/md-llbitmap-hot-write-fast-path`, `takeover`,
   `llbitmap-fixes`, etc.
 - `bin/rebuild-main` **composes** these into a working tree; it is the bridge
   between the branch model and the build pipeline.
