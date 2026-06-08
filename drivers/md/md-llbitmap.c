@@ -276,6 +276,26 @@ struct llbitmap_page_ctl {
 struct llbitmap {
 	struct mddev *mddev;
 	struct llbitmap_page_ctl **pctl;
+	/*
+	 * Base address of each kmalloc'd control-struct block.  pctl[i]
+	 * points into one of these.  cache_pages allocates block 0; resize
+	 * appends one block per grow.  free_pages frees every block.
+	 */
+	void **pctl_blocks;
+	unsigned int nr_pctl_blocks;
+	/*
+	 * Old pctl[] pointer arrays superseded by a grow.  A lockless data-path
+	 * reader (e.g. a raid456 write that updated the bitmap before reaching
+	 * the stripe-quiesce gate) may still hold a base pointer to one of these
+	 * after the swap, so the array cannot be freed synchronously.  Only the
+	 * cheap pointer array is retained: the ref-counted control blocks it
+	 * points at are shared with the live pctl[] and freed once via
+	 * pctl_blocks[].  This keeps one array (old nr_pages pointers) per grow
+	 * for the bitmap's lifetime -- O(number of online grows), not a fixed
+	 * cost.  free_pages() frees them all at destroy.
+	 */
+	void **retired_pctl;
+	unsigned int nr_retired_pctl;
 
 	unsigned int nr_pages;
 	unsigned int io_size;
@@ -414,6 +434,8 @@ static char state_machine[BitStateCount][BitmapActionCount] = {
 };
 
 static void __llbitmap_flush(struct mddev *mddev);
+static void __llbitmap_flush_range(struct mddev *mddev, unsigned int start,
+				   unsigned int end);
 static void llbitmap_destroy(struct mddev *mddev);
 
 static enum llbitmap_state llbitmap_read(struct llbitmap *llbitmap, loff_t pos)
@@ -425,7 +447,17 @@ static enum llbitmap_state llbitmap_read(struct llbitmap *llbitmap, loff_t pos)
 	idx = pos >> PAGE_SHIFT;
 	offset = offset_in_page(pos);
 
-	return llbitmap->pctl[idx]->state[offset];
+	/*
+	 * Lockless read of the pctl[] base: a concurrent llbitmap_resize() may
+	 * be publishing a new base (smp_store_release()); the address dependency
+	 * from this load orders the dereference below.  The old base is retired,
+	 * not freed (see struct llbitmap::retired_pctl), so a stale load stays
+	 * valid.  Such a stale reader was admitted against the old dev_sectors --
+	 * pers->resize(), hence llbitmap_resize(), runs before update_size()
+	 * advances mddev->dev_sectors -- so its idx is below the old nr_pages and
+	 * therefore in range for either base.
+	 */
+	return READ_ONCE(llbitmap->pctl)[idx]->state[offset];
 }
 
 /* set all the bits in the subpage as dirty */
@@ -453,7 +485,7 @@ static void llbitmap_infect_dirty_bits(struct llbitmap *llbitmap,
 static void llbitmap_set_page_dirty(struct llbitmap *llbitmap, int idx,
 				    int offset, bool infect)
 {
-	struct llbitmap_page_ctl *pctl = llbitmap->pctl[idx];
+	struct llbitmap_page_ctl *pctl = READ_ONCE(llbitmap->pctl)[idx];
 	unsigned int io_size = llbitmap->io_size;
 	int block = offset / io_size;
 	int pos;
@@ -504,7 +536,8 @@ static void llbitmap_write(struct llbitmap *llbitmap, enum llbitmap_state state,
 	idx = pos >> PAGE_SHIFT;
 	bit = offset_in_page(pos);
 
-	llbitmap->pctl[idx]->state[bit] = state;
+	/* Lockless write; see the READ_ONCE() note in llbitmap_read(). */
+	READ_ONCE(llbitmap->pctl)[idx]->state[bit] = state;
 	if (state == BitDirty || state == BitNeedSync)
 		llbitmap_set_page_dirty(llbitmap, idx, bit, true);
 	else if (state == BitNeedSyncUnwritten)
@@ -587,7 +620,7 @@ static void active_release(struct percpu_ref *ref)
 
 static void llbitmap_free_pages(struct llbitmap *llbitmap)
 {
-	int i;
+	unsigned int i;
 
 	if (!llbitmap->pctl)
 		return;
@@ -595,14 +628,27 @@ static void llbitmap_free_pages(struct llbitmap *llbitmap)
 	for (i = 0; i < llbitmap->nr_pages; i++) {
 		struct llbitmap_page_ctl *pctl = llbitmap->pctl[i];
 
+		/* skip, don't stop: a grown pctl[] may span multiple blocks */
 		if (!pctl || !pctl->page)
-			break;
+			continue;
 
 		__free_page(pctl->page);
 		percpu_ref_exit(&pctl->active);
 	}
 
-	kfree(llbitmap->pctl[0]);
+	for (i = 0; i < llbitmap->nr_pctl_blocks; i++)
+		kfree(llbitmap->pctl_blocks[i]);
+	kfree(llbitmap->pctl_blocks);
+	llbitmap->pctl_blocks = NULL;
+	llbitmap->nr_pctl_blocks = 0;
+
+	/* Old pointer arrays retired by grows; entries alias live blocks. */
+	for (i = 0; i < llbitmap->nr_retired_pctl; i++)
+		kfree(llbitmap->retired_pctl[i]);
+	kfree(llbitmap->retired_pctl);
+	llbitmap->retired_pctl = NULL;
+	llbitmap->nr_retired_pctl = 0;
+
 	kfree(llbitmap->pctl);
 	llbitmap->pctl = NULL;
 }
@@ -630,6 +676,16 @@ static int llbitmap_cache_pages(struct llbitmap *llbitmap)
 	}
 
 	llbitmap->nr_pages = nr_pages;
+
+	llbitmap->pctl_blocks = kmalloc_array(1, sizeof(void *), GFP_KERNEL);
+	if (!llbitmap->pctl_blocks) {
+		kfree(pctl);
+		kfree(llbitmap->pctl);
+		llbitmap->pctl = NULL;
+		return -ENOMEM;
+	}
+	llbitmap->pctl_blocks[0] = pctl;
+	llbitmap->nr_pctl_blocks = 1;
 
 	for (i = 0; i < nr_pages; i++, pctl = (void *)pctl + size) {
 		struct page *page = llbitmap_read_page(llbitmap, i);
@@ -816,7 +872,7 @@ write_bitmap:
 
 static void llbitmap_raise_barrier(struct llbitmap *llbitmap, int page_idx)
 {
-	struct llbitmap_page_ctl *pctl = llbitmap->pctl[page_idx];
+	struct llbitmap_page_ctl *pctl = READ_ONCE(llbitmap->pctl)[page_idx];
 
 retry:
 	if (likely(percpu_ref_tryget_live(&pctl->active))) {
@@ -830,7 +886,7 @@ retry:
 
 static void llbitmap_release_barrier(struct llbitmap *llbitmap, int page_idx)
 {
-	struct llbitmap_page_ctl *pctl = llbitmap->pctl[page_idx];
+	struct llbitmap_page_ctl *pctl = READ_ONCE(llbitmap->pctl)[page_idx];
 
 	percpu_ref_put(&pctl->active);
 }
@@ -1212,6 +1268,15 @@ static void llbitmap_pending_timer_fn(struct timer_list *pending_timer)
 	struct llbitmap *llbitmap =
 		container_of(pending_timer, struct llbitmap, pending_timer);
 
+	/*
+	 * A resize is rewriting pctl[]/nr_pages with the daemon stopped.  Do
+	 * not re-queue work: a daemon run the resize cannot drain (the timer
+	 * may have been re-armed by the daemon's own restart path) would walk
+	 * pctl[] concurrently with the swap.
+	 */
+	if (test_bit(BITMAP_RESIZING, &llbitmap->flags))
+		return;
+
 	if (work_busy(&llbitmap->daemon_work)) {
 		pr_warn("md/llbitmap: %s daemon_work not finished in %lu seconds\n",
 			mdname(llbitmap->mddev),
@@ -1231,6 +1296,10 @@ static void md_llbitmap_daemon_fn(struct work_struct *work)
 	unsigned long end;
 	bool restart;
 	int idx;
+
+	/* Defence in depth: never walk pctl[] while a resize owns it. */
+	if (test_bit(BITMAP_RESIZING, &llbitmap->flags))
+		return;
 
 	if (llbitmap->mddev->degraded)
 		return;
@@ -1311,7 +1380,15 @@ static int llbitmap_create(struct mddev *mddev)
 static int llbitmap_resize(struct mddev *mddev, sector_t blocks, int chunksize)
 {
 	struct llbitmap *llbitmap = mddev->bitmap;
-	unsigned long chunks;
+	struct llbitmap_page_ctl **new_pctl = NULL;
+	struct llbitmap_page_ctl *tmp;
+	void **new_blocks = NULL;
+	void **new_retired = NULL;
+	void *newblock = NULL;
+	unsigned long chunks, old_chunks;
+	unsigned int new_nr_pages, add = 0, size = 0, i = 0;
+	bool grow;
+	int ret = 0;
 
 	if (chunksize == 0)
 		chunksize = llbitmap->chunksize;
@@ -1323,11 +1400,228 @@ static int llbitmap_resize(struct mddev *mddev, sector_t blocks, int chunksize)
 		chunks = DIV_ROUND_UP_SECTOR_T(blocks, chunksize);
 	}
 
+	/*
+	 * A changed chunksize would require remapping every existing on-disk
+	 * bit (each chunk now covers a different sector range) -- a separate,
+	 * pre-existing correctness problem.  Refuse rather than corrupt.
+	 */
+	if (chunksize != llbitmap->chunksize) {
+		pr_warn("md/llbitmap: %s: cannot grow to %llu sectors: bitmap reserved space (%lu sectors) too small at chunksize %lu, would need chunksize %u; remapping existing on-disk bits is unsupported\n",
+			mdname(mddev), (unsigned long long)blocks,
+			mddev->bitmap_info.space, llbitmap->chunksize,
+			(unsigned int)chunksize);
+		return -EINVAL;
+	}
+
+	old_chunks = llbitmap->chunks;
+	new_nr_pages = DIV_ROUND_UP(chunks + BITMAP_DATA_OFFSET, PAGE_SIZE);
+	grow = new_nr_pages > llbitmap->nr_pages;
+
+	/*
+	 * Crossing a bitmap page boundary: append a control block covering the
+	 * new pages.  The existing block (and its live percpu_refs, pages and
+	 * dirty state) is never touched.  On a shrink or grow-within-page this
+	 * block is skipped; pctl[]/nr_pages stay as-is.
+	 *
+	 * Allocate and initialise everything up front, while the data path is
+	 * still live: these allocations may sleep and may fail, and on failure
+	 * the existing bitmap must be left completely untouched.  Only the
+	 * pointer swap below is performed under the locks.
+	 */
+	if (grow) {
+		add = new_nr_pages - llbitmap->nr_pages;
+		size = round_up(struct_size(tmp, dirty,
+					    BITS_TO_LONGS(llbitmap->blocks_per_page)),
+				cache_line_size());
+
+		new_pctl = kmalloc_array(new_nr_pages, sizeof(void *),
+					 GFP_KERNEL | __GFP_ZERO);
+		if (!new_pctl) {
+			ret = -ENOMEM;
+			goto out_free_new;
+		}
+
+		newblock = kmalloc_array(add, size, GFP_KERNEL | __GFP_ZERO);
+		if (!newblock) {
+			ret = -ENOMEM;
+			goto out_free_new;
+		}
+
+		/* Grow the small block-base array by one entry. */
+		new_blocks = kmalloc_array(llbitmap->nr_pctl_blocks + 1,
+					   sizeof(void *), GFP_KERNEL);
+		if (!new_blocks) {
+			ret = -ENOMEM;
+			goto out_free_new;
+		}
+		memcpy(new_blocks, llbitmap->pctl_blocks,
+		       llbitmap->nr_pctl_blocks * sizeof(void *));
+
+		/* Grow the retired-array registry by one entry. */
+		new_retired = kmalloc_array(llbitmap->nr_retired_pctl + 1,
+					    sizeof(void *), GFP_KERNEL);
+		if (!new_retired) {
+			ret = -ENOMEM;
+			goto out_free_new;
+		}
+		memcpy(new_retired, llbitmap->retired_pctl,
+		       llbitmap->nr_retired_pctl * sizeof(void *));
+
+		/* Old entries carried over verbatim -- never moved/re-inited. */
+		memcpy(new_pctl, llbitmap->pctl,
+		       llbitmap->nr_pages * sizeof(void *));
+
+		for (i = 0; i < add; i++) {
+			struct llbitmap_page_ctl *pctl =
+				(void *)newblock + (size_t)i * size;
+			struct page *page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+
+			if (!page) {
+				ret = -ENOMEM;
+				goto out_free_new;
+			}
+			if (percpu_ref_init(&pctl->active, active_release,
+					    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
+				__free_page(page);
+				ret = -ENOMEM;
+				goto out_free_new;
+			}
+			pctl->page = page;
+			pctl->state = page_address(page);	/* zeroed => BitUnwritten */
+			init_waitqueue_head(&pctl->wait);
+			new_pctl[llbitmap->nr_pages + i] = pctl;
+		}
+	}
+
+	/*
+	 * Exclude every concurrent reader of pctl[]/nr_pages/chunks/state before
+	 * publishing the grown geometry.  resize() runs under reconfig_mutex with
+	 * the data path live: the component_size sysfs attribute (size_store)
+	 * takes only reconfig_mutex and does NOT suspend the array, unlike the
+	 * SET_ARRAY_INFO ioctl.  Safety does not depend on the caller having
+	 * drained the data path: resize() issues its own pers->quiesce() below.
+	 * Most callers arrive via update_size(), which -EBUSY-gates a running
+	 * resync/reshape, but raid10_start_reshape() calls bitmap_ops->resize()
+	 * directly (outside update_size()), so this quiesce -- not the caller --
+	 * is the load-bearing one.
+	 *
+	 *  - BITMAP_RESIZING + timer_delete_sync()/flush_work() stop the daemon,
+	 *    which walks pctl[] locklessly and can re-arm its own timer; the flag
+	 *    keeps a re-armed timer from re-queuing the daemon during the swap.
+	 *  - flush_workqueue(md_llbitmap_unplug_wq) drains the unplug worker,
+	 *    another lockless pctl[] walker.
+	 *  - pers->quiesce() gates and drains the IO data path.  On raid456 a
+	 *    write updates the bitmap before the stripe-quiesce gate, so the old
+	 *    pctl[] base is retired (freed only at destroy), not freed here, and
+	 *    every lockless base read uses READ_ONCE().
+	 *  - bitmap_info.mutex excludes the sysfs readers bits_show(),
+	 *    metadata_show() and proactive_sync_store().
+	 *
+	 * Lock order reconfig_mutex -> bitmap_info.mutex matches create/destroy.
+	 */
+	set_bit(BITMAP_RESIZING, &llbitmap->flags);
+	mddev->pers->quiesce(mddev, 1);
+	timer_delete_sync(&llbitmap->pending_timer);
+	flush_work(&llbitmap->daemon_work);
+	flush_workqueue(md_llbitmap_unplug_wq);
+	mutex_lock(&mddev->bitmap_info.mutex);
+
+	if (grow) {
+		struct llbitmap_page_ctl **old_pctl = llbitmap->pctl;
+
+		/* Register the new control block (not read on the data path). */
+		new_blocks[llbitmap->nr_pctl_blocks] = newblock;
+		kfree(llbitmap->pctl_blocks);
+		llbitmap->pctl_blocks = new_blocks;
+		llbitmap->nr_pctl_blocks++;
+
+		/*
+		 * Publish the new base with release semantics so a lockless
+		 * reader that observes it also observes the carried-over and
+		 * freshly-initialised entries; then advance nr_pages.
+		 */
+		smp_store_release(&llbitmap->pctl, new_pctl);
+		WRITE_ONCE(llbitmap->nr_pages, new_nr_pages);
+
+		/*
+		 * Retire (do NOT free) the old base: a data-path reader racing
+		 * the swap may still hold it.  It is released only by
+		 * llbitmap_free_pages() at destroy.
+		 */
+		new_retired[llbitmap->nr_retired_pctl] = old_pctl;
+		kfree(llbitmap->retired_pctl);
+		llbitmap->retired_pctl = new_retired;
+		llbitmap->nr_retired_pctl++;
+	}
+
 	llbitmap->chunkshift = ffz(~chunksize);
 	llbitmap->chunksize = chunksize;
 	llbitmap->chunks = chunks;
 
+	/*
+	 * Initialise the newly-grown chunks to BitUnwritten.  Freshly added
+	 * pages come from alloc_page(__GFP_ZERO) and BitUnwritten == 0, so they
+	 * are already correct; only the tail of the previous last page needs
+	 * clearing -- its bytes beyond the old chunk count are stale on disk and
+	 * would otherwise read back as an invalid state and force a spurious
+	 * resync.  Existing chunks [0, old_chunks) are never touched, preserving
+	 * written-data state.  This is a single sub-page memset rather than an
+	 * O(grow-chunks) loop under the quiesce window.  On shrink the range is
+	 * empty.  Unwritten is correct: grown space has no user data and must
+	 * not be resynced (skip_sync_blocks skips Unwritten).
+	 */
+	if (chunks > old_chunks) {
+		unsigned long first = old_chunks + BITMAP_DATA_OFFSET;
+		unsigned long last = chunks + BITMAP_DATA_OFFSET;
+		unsigned int idx = first >> PAGE_SHIFT;
+		unsigned int off = offset_in_page(first);
+		unsigned long page_end = ((unsigned long)idx + 1) << PAGE_SHIFT;
+
+		memset(llbitmap->pctl[idx]->state + off, BitUnwritten,
+		       min(last, page_end) - first);
+	}
+	mutex_unlock(&mddev->bitmap_info.mutex);
+
+	/*
+	 * Persist only the grown region: the tail page of the old bitmap (whose
+	 * bytes beyond old_chunks are stale on disk) through the last new page.
+	 * O(grow), not O(array) -- a handful of pages in the common case.
+	 * Metadata IO, so keep it outside the mutex but still inside the
+	 * quiesce/daemon-stopped window.
+	 */
+	if (chunks > old_chunks) {
+		unsigned int first = (old_chunks + BITMAP_DATA_OFFSET) >>
+				     PAGE_SHIFT;
+
+		__llbitmap_flush_range(mddev, first, new_nr_pages - 1);
+	}
+
+	/* Re-arm the daemon and resume the data path. */
+	clear_bit(BITMAP_RESIZING, &llbitmap->flags);
+	mod_timer(&llbitmap->pending_timer,
+		  jiffies + mddev->bitmap_info.daemon_sleep * HZ);
+	mddev->pers->quiesce(mddev, 0);
 	return 0;
+
+out_free_new:
+	/*
+	 * Reached on any grow allocation failure, before the data path was
+	 * quiesced; the live bitmap is still untouched (nothing published).
+	 * Free the fully-initialised new entries [0, i) and the staging
+	 * allocations.  Every staging pointer is NULL until assigned and i is 0
+	 * until the page loop runs, so an early failure frees only what it got.
+	 */
+	while (i--) {
+		struct llbitmap_page_ctl *pctl =
+			(void *)newblock + (size_t)i * size;
+		__free_page(pctl->page);
+		percpu_ref_exit(&pctl->active);
+	}
+	kfree(new_retired);
+	kfree(new_blocks);
+	kfree(newblock);
+	kfree(new_pctl);
+	return ret;
 }
 
 static int llbitmap_load(struct mddev *mddev)
@@ -1435,6 +1729,11 @@ static void llbitmap_unplug_fn(struct work_struct *work)
 
 	blk_start_plug(&plug);
 
+	/*
+	 * Raw pctl[]/nr_pages walk (no READ_ONCE): the unplug worker is drained
+	 * by flush_workqueue(md_llbitmap_unplug_wq) before llbitmap_resize()
+	 * swaps the base, so it never observes a torn base/nr_pages pair.
+	 */
 	for (i = 0; i < llbitmap->nr_pages; i++) {
 		if (!test_bit(LLPageDirty, &llbitmap->pctl[i]->flags) ||
 		    !test_and_clear_bit(LLPageDirty, &llbitmap->pctl[i]->flags))
@@ -1452,6 +1751,11 @@ static bool llbitmap_dirty(struct llbitmap *llbitmap)
 {
 	int i;
 
+	/*
+	 * Raw pctl[]/nr_pages walk; runs on the data path that
+	 * llbitmap_resize() quiesces before swapping the base, so no
+	 * concurrent resize and no READ_ONCE needed.
+	 */
 	for (i = 0; i < llbitmap->nr_pages; i++)
 		if (test_bit(LLPageDirty, &llbitmap->pctl[i]->flags))
 			return true;
@@ -1485,17 +1789,21 @@ static void llbitmap_unplug(struct mddev *mddev, bool sync)
 }
 
 /*
- * Force to write all bitmap pages to disk, called when stopping the array, or
- * every daemon_sleep seconds when sync_thread is running.
+ * Force-write bitmap pages [start, end] to disk regardless of their dirty
+ * state.  __llbitmap_flush() covers every page (array stop, or every
+ * daemon_sleep seconds while a sync_thread runs); llbitmap_resize() persists
+ * only the grown region.  Every caller runs with the data path quiesced and
+ * no concurrent resize, so the raw pctl[]/nr_pages walk needs no READ_ONCE.
  */
-static void __llbitmap_flush(struct mddev *mddev)
+static void __llbitmap_flush_range(struct mddev *mddev, unsigned int start,
+				   unsigned int end)
 {
 	struct llbitmap *llbitmap = mddev->bitmap;
 	struct blk_plug plug;
-	int i;
+	unsigned int i;
 
 	blk_start_plug(&plug);
-	for (i = 0; i < llbitmap->nr_pages; i++) {
+	for (i = start; i <= end; i++) {
 		struct llbitmap_page_ctl *pctl = llbitmap->pctl[i];
 
 		/* mark all blocks as dirty */
@@ -1505,6 +1813,14 @@ static void __llbitmap_flush(struct mddev *mddev)
 	}
 	blk_finish_plug(&plug);
 	md_super_wait(llbitmap->mddev);
+}
+
+static void __llbitmap_flush(struct mddev *mddev)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+
+	if (llbitmap->nr_pages)
+		__llbitmap_flush_range(mddev, 0, llbitmap->nr_pages - 1);
 }
 
 static void llbitmap_flush(struct mddev *mddev)
