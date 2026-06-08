@@ -2,3 +2,5 @@
 /build
 /results
 /docs/superpowers
+/.claude
+/.checkpatch-camelcase.git.

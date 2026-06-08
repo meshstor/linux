@@ -85,7 +85,7 @@ declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma llbi
 declare -A VARIANT_ARGS=(
     [baseline]=""
     [per-bucket-arrays]="per-bucket-arrays"
-    [takeover]="wip/md-raid1-to-raid10-takeover"
+    [takeover]="takeover"
     [latency-ewma]="md-latency-ewma"
     [llbitmap-fastpath]="wip/md-llbitmap-hot-write-fast-path"
 )
