@@ -9870,7 +9870,21 @@ void md_do_sync(struct md_thread *thread)
 		if (test_bit(MD_RECOVERY_INTR, &mddev->recovery))
 			break;
 
-		if (mddev->bitmap_ops && mddev->bitmap_ops->skip_sync_blocks) {
+		/*
+		 * The bitmap may be consulted with 'j' for a plain resync,
+		 * but for recovery only when the personality declares that
+		 * its recovery cursor addresses the bitmap's space (raid1,
+		 * raid456).  raid10 recovery walks per-device offsets, so
+		 * the bitmap must not be consulted with 'j': doing so
+		 * skipped whole rebuilds whenever the (wrongly) consulted
+		 * chunks were unwritten, leaving stale data on the rebuilt
+		 * member.  Reshape must relocate every stripe regardless of
+		 * bitmap state, so never skip there either.
+		 */
+		if (mddev->bitmap_ops && mddev->bitmap_ops->skip_sync_blocks &&
+		    !test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
+		    (!test_bit(MD_RECOVERY_RECOVER, &mddev->recovery) ||
+		     mddev->pers->recovery_in_bitmap_space)) {
 			sectors = mddev->bitmap_ops->skip_sync_blocks(mddev, j);
 			if (sectors)
 				goto update;
