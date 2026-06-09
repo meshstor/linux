@@ -110,9 +110,24 @@ _UPSTREAM_MASTER_SHA=""
 _HARNESS_SHA=""
 _CACHE_SHAS_RESOLVED=0
 
+# Resolve a branch SHA the same way rebuild-main sources branches: a local
+# head in this repo (even un-pushed) wins, else the meshstor remote. Keeping
+# the two in lockstep is what makes the cache key honest — it must hash the
+# SHA of whatever rebuild-main will actually build.
+# Stdout: the SHA, or empty if the branch exists in neither place.
+branch_sha() {
+    local branch="$1" sha
+    if sha="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$branch")"; then
+        echo "$sha"
+        return 0
+    fi
+    git ls-remote "$MESHSTOR_URL_FOR_REBUILD" "refs/heads/$branch" 2>/dev/null \
+        | awk 'NR==1{print $1}'
+}
+
 # Resolve and memoize upstream master + meshstor branch SHAs needed for cache
 # keys across all SELECTED_VARIANTS. Idempotent. Fails the run if any required
-# remote ref cannot be resolved (the same network would fail rebuild-main).
+# branch cannot be resolved (rebuild-main would fail on the same lookup).
 resolve_shas() {
     (( _CACHE_SHAS_RESOLVED == 1 )) && return 0
     # When this script runs under sudo, $HOME is /root — but the upstream
@@ -131,20 +146,18 @@ resolve_shas() {
     _UPSTREAM_MASTER_SHA="$(git -C "$mirror" rev-parse master 2>/dev/null)" \
         || die "cannot read master from $mirror"
 
-    _HARNESS_SHA="$(git ls-remote "$MESHSTOR_URL_FOR_REBUILD" refs/heads/meshstor-harness 2>/dev/null \
-                      | awk 'NR==1{print $1}')"
+    _HARNESS_SHA="$(branch_sha meshstor-harness)"
     [[ -n "$_HARNESS_SHA" ]] \
-        || die "git ls-remote $MESHSTOR_URL_FOR_REBUILD refs/heads/meshstor-harness failed"
+        || die "branch meshstor-harness not found locally in $REPO_ROOT or on $MESHSTOR_URL_FOR_REBUILD"
 
     local label feature sha
     for label in "${SELECTED_VARIANTS[@]}"; do
         feature="${VARIANT_ARGS[$label]}"
         [[ -z "$feature" ]] && continue
         [[ -n "${_SHA_CACHE[$feature]:-}" ]] && continue
-        sha="$(git ls-remote "$MESHSTOR_URL_FOR_REBUILD" "refs/heads/$feature" 2>/dev/null \
-                  | awk 'NR==1{print $1}')"
+        sha="$(branch_sha "$feature")"
         [[ -n "$sha" ]] \
-            || die "git ls-remote $MESHSTOR_URL_FOR_REBUILD refs/heads/$feature failed"
+            || die "branch $feature not found locally in $REPO_ROOT or on $MESHSTOR_URL_FOR_REBUILD"
         _SHA_CACHE[$feature]="$sha"
     done
 

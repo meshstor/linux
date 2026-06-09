@@ -3,6 +3,10 @@
 # torvalds/linux clone, slim it via git filter-repo, then apply the
 # meshstor-harness branch and zero or more feature branches as patches.
 #
+# Branches are sourced local-first: a branch that exists as a local head in
+# this repo (even un-pushed) is used as-is; otherwise it is fetched from the
+# meshstor remote. An all-local run needs no access to the remote.
+#
 # See docs/superpowers/specs/2026-05-04-rebuild-main-script-design.md
 #
 # Usage: bin/rebuild-main [options] [feature ...]
@@ -17,6 +21,7 @@ HARNESS_BRANCH="meshstor-harness"
 FILTER_PATHS=(drivers/md tools/testing/selftests/md)
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 CACHE_DIR="${MESHSTOR_UPSTREAM_MIRROR_DIR:-$REPO_ROOT/build}"
+MIRROR="$CACHE_DIR/torvalds-linux.git"
 DEFAULT_OUTPUT="$REPO_ROOT/build/linux-meshstor-rebuilt"
 
 usage() {
@@ -30,6 +35,9 @@ By default produces a kernel-tree-only output (filtered upstream + features);
 pass --with-harness to also bake in $HARNESS_BRANCH (selftests, dkms scripts,
 docs, bin helpers). Packaging (bin/build-rpm etc.) reads drivers/md/ from
 this output by default — run from this repo regardless of --with-harness.
+
+Branches are sourced from this repo's local heads first (so un-pushed local
+work builds as-is), falling back to the meshstor remote ($MESHSTOR_URL).
 
 Options:
   -o, --output DIR     Output directory (default: $DEFAULT_OUTPUT)
@@ -98,14 +106,26 @@ require_remote_reachable() {
     fi
 }
 
-require_branch_on_remote() {
+# A branch present as a local head in this repo (even un-pushed) wins;
+# otherwise it must exist on the meshstor remote.
+branch_is_local() {
+    git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$1"
+}
+
+REMOTE_CHECKED=
+require_branch_available() {
     local branch="$1" label="$2"
+    branch_is_local "$branch" && return 0
+    if [[ -z "$REMOTE_CHECKED" ]]; then
+        require_remote_reachable
+        REMOTE_CHECKED=1
+    fi
     if ! git ls-remote --exit-code "$MESHSTOR_URL" "refs/heads/$branch" >/dev/null 2>&1; then
         if [[ "$label" == harness ]]; then
-            echo "error: branch '$branch' not found on $MESHSTOR_URL — bootstrap it first" >&2
+            echo "error: branch '$branch' not found locally in $REPO_ROOT or on $MESHSTOR_URL — bootstrap it first" >&2
             echo "       (see docs/superpowers/specs/2026-05-04-rebuild-main-script-design.md, Bootstrap section)" >&2
         else
-            echo "error: feature branch '$branch' not found on $MESHSTOR_URL" >&2
+            echo "error: feature branch '$branch' not found locally in $REPO_ROOT or on $MESHSTOR_URL" >&2
         fi
         exit 1
     fi
@@ -146,36 +166,33 @@ prepare_output_dir() {
 
 prepare_output_dir
 
-require_remote_reachable
-[[ -n "$WITH_HARNESS" ]] && require_branch_on_remote "$HARNESS_BRANCH" harness
+[[ -n "$WITH_HARNESS" ]] && require_branch_available "$HARNESS_BRANCH" harness
 for f in "${FEATURES[@]}"; do
-    require_branch_on_remote "$f" feature
+    require_branch_available "$f" feature
 done
 
 stage1_refresh_upstream() {
-    local mirror="$CACHE_DIR/torvalds-linux.git"
-    if [[ ! -d "$mirror" ]]; then
+    if [[ ! -d "$MIRROR" ]]; then
         # Full bare clone (no --filter=blob:none): filter-repo needs every blob
         # in the filtered paths and a partial clone fails it with
         # "fatal: Blob not found". Cost: ~5GB on disk, one-time.
-        echo "rebuild-main: cloning $UPSTREAM_URL into $mirror (first run; ~5GB, one-time)"
-        git clone --bare "$UPSTREAM_URL" "$mirror"
+        echo "rebuild-main: cloning $UPSTREAM_URL into $MIRROR (first run; ~5GB, one-time)"
+        git clone --bare "$UPSTREAM_URL" "$MIRROR"
     elif [[ -z "$NO_FETCH" ]]; then
         echo "rebuild-main: refreshing cached upstream mirror"
-        git -C "$mirror" fetch origin "$UPSTREAM_BRANCH:$UPSTREAM_BRANCH"
+        git -C "$MIRROR" fetch origin "$UPSTREAM_BRANCH:$UPSTREAM_BRANCH"
     else
         echo "rebuild-main: --no-fetch — skipping mirror refresh"
     fi
-    UPSTREAM_SHA="$(git -C "$mirror" rev-parse "$UPSTREAM_BRANCH")"
+    UPSTREAM_SHA="$(git -C "$MIRROR" rev-parse "$UPSTREAM_BRANCH")"
     echo "rebuild-main: upstream $UPSTREAM_BRANCH = $UPSTREAM_SHA"
 }
 
 stage1_refresh_upstream
 
 stage2_filter_repo() {
-    local mirror="$CACHE_DIR/torvalds-linux.git"
     echo "rebuild-main: local clone -> $OUTPUT_DIR"
-    git clone "$mirror" "$OUTPUT_DIR"
+    git clone "$MIRROR" "$OUTPUT_DIR"
     cd "$OUTPUT_DIR"
     # `git am` needs a committer identity. The clone inherits none, and CI/perf
     # boxes often lack a global one (hostname like "*.(none)" breaks
@@ -194,28 +211,68 @@ stage2_filter_repo() {
 
 stage2_filter_repo
 
-# Apply <branch> from the meshstor remote onto the current HEAD as a patch
-# series. Returns the patch count via stdout (caller captures); all status
-# messages go to stderr to avoid polluting the captured value. Leaves
-# .git/rebase-apply/ if git am fails.
+# Idempotently add the meshstor remote to the output repo and fetch its
+# master — the format-patch base for remote-sourced branches. State-checked
+# rather than flag-guarded because callers run inside $(...) subshells.
+# NB: the meshstor lineage does NOT share commit hashes with the torvalds
+# mirror (the fork's history was rewritten at import — different root
+# commits), so the mirror's master can never anchor a meshstor merge-base.
+ensure_meshstor_remote() {
+    git remote get-url meshstor >/dev/null 2>&1 \
+        || git remote add meshstor "$MESHSTOR_URL"
+    git rev-parse --verify --quiet "refs/remotes/meshstor/$UPSTREAM_BRANCH" >/dev/null \
+        || git fetch meshstor "$UPSTREAM_BRANCH:refs/remotes/meshstor/$UPSTREAM_BRANCH" >&2
+}
+
+# Apply <branch> onto the current HEAD as a patch series. The branch is
+# sourced local-first: this repo's local head wins (so un-pushed work builds
+# as-is) and the series is format-patched straight out of this repo against
+# its local master — no network. A branch absent locally is fetched from
+# the meshstor remote alongside the remote's master, exactly the original
+# remote-only flow. Returns the patch count via stdout (caller captures);
+# all status messages go to stderr to avoid polluting the captured value.
+# Leaves .git/rebase-apply/ if git am fails.
 # $1 = branch name, $2 = stage label (used in error messages).
 apply_branch_as_patches() {
     local branch="$1" label="$2"
-    local safe_dir base count
+    local safe_dir base count patch_dir cand mb
     safe_dir="$(echo "$branch" | tr / -)"
-    git fetch meshstor "$branch:refs/remotes/meshstor/$branch" >&2
-    base="$(git merge-base "meshstor/$branch" "meshstor/$UPSTREAM_BRANCH")"
-    mkdir -p ".rebuild-patches/$safe_dir"
-    git format-patch "$base..meshstor/$branch" -o ".rebuild-patches/$safe_dir/" >/dev/null
-    count="$(find ".rebuild-patches/$safe_dir" -name '*.patch' | wc -l | tr -d ' ')"
+    patch_dir="$OUTPUT_DIR/.rebuild-patches/$safe_dir"
+    mkdir -p "$patch_dir"
+    if branch_is_local "$branch"; then
+        echo "rebuild-main: sourcing $branch from local repo" >&2
+        # Fork point against the local master head; origin/master is also
+        # tried in case the branch was rebased onto a fetched-but-not-
+        # fast-forwarded master — the newer (descendant) fork point wins.
+        base=""
+        for cand in "refs/heads/$UPSTREAM_BRANCH" "refs/remotes/origin/$UPSTREAM_BRANCH"; do
+            git -C "$REPO_ROOT" rev-parse --verify --quiet "$cand" >/dev/null || continue
+            mb="$(git -C "$REPO_ROOT" merge-base "refs/heads/$branch" "$cand")" || continue
+            if [[ -z "$base" ]] || git -C "$REPO_ROOT" merge-base --is-ancestor "$base" "$mb"; then
+                base="$mb"
+            fi
+        done
+        if [[ -z "$base" ]]; then
+            echo "error: no merge-base between '$branch' and $UPSTREAM_BRANCH in $REPO_ROOT" >&2
+            exit 1
+        fi
+        git -C "$REPO_ROOT" format-patch "$base..refs/heads/$branch" -o "$patch_dir" >/dev/null
+    else
+        echo "rebuild-main: sourcing $branch from $MESHSTOR_URL" >&2
+        ensure_meshstor_remote
+        git fetch meshstor "$branch:refs/remotes/meshstor/$branch" >&2
+        base="$(git merge-base "meshstor/$branch" "meshstor/$UPSTREAM_BRANCH")"
+        git format-patch "$base..meshstor/$branch" -o "$patch_dir" >/dev/null
+    fi
+    count="$(find "$patch_dir" -name '*.patch' | wc -l | tr -d ' ')"
     if (( count == 0 )); then
         echo "rebuild-main: $label has no patches above $base — nothing to apply" >&2
-        rm -rf ".rebuild-patches/$safe_dir"
+        rm -rf "$patch_dir"
         echo "0"
         return 0
     fi
     echo "rebuild-main: applying $count patches from $branch ($label)" >&2
-    if ! git am ".rebuild-patches/$safe_dir/"*.patch >&2; then
+    if ! git am "$patch_dir"/*.patch >&2; then
         echo "" >&2
         echo "error: git am failed while applying $label ($branch)" >&2
         echo "       output dir: $OUTPUT_DIR" >&2
@@ -223,15 +280,8 @@ apply_branch_as_patches() {
         echo "       or abort:    cd $OUTPUT_DIR && git am --abort" >&2
         exit 1
     fi
-    rm -rf ".rebuild-patches/$safe_dir"
+    rm -rf "$patch_dir"
     echo "$count"
-}
-
-stage3_setup_remote() {
-    git remote add meshstor "$MESHSTOR_URL"
-    # One-shot fetch of upstream master as the format-patch base for both
-    # harness and feature branches (all rebased on a torvalds master snapshot).
-    git fetch meshstor "$UPSTREAM_BRANCH:refs/remotes/meshstor/$UPSTREAM_BRANCH"
 }
 
 stage3_apply_harness() {
@@ -240,7 +290,6 @@ stage3_apply_harness() {
     echo "rebuild-main: harness HEAD = $HARNESS_SHA"
 }
 
-stage3_setup_remote
 if [[ -n "$WITH_HARNESS" ]]; then
     stage3_apply_harness
 else
