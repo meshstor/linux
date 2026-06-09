@@ -8,8 +8,8 @@ Two comparison tools live in `bin/`:
 
 - **`perf-compare`** — feature-branch comparison: same bitmap mode across
   variants (`--bitmap`, default lockless), different code variants
-  (baseline + per-bucket-arrays + takeover + latency-ewma +
-  llbitmap-fastpath). Five DKMS rebuilds per run.
+  (baseline + per-bucket-arrays + takeover + latency-ewma).
+  Four DKMS rebuilds per run.
 - **`perf-bitmap-compare`** — bitmap-mode comparison on the same code:
   four modes (md-internal, md-lockless, ms-internal, ms-lockless);
   md-lockless is auto-skipped when the kernel lacks md llbitmap
@@ -196,8 +196,8 @@ sudo ~/linux-meshstor/bin/perf-compare \
 
 #### 3.1.C Run only a subset of variants
 
-Append variant names (`baseline per-bucket-arrays takeover latency-ewma
-llbitmap-fastpath`) at the end of any of the above:
+Append variant names (`baseline per-bucket-arrays takeover latency-ewma`)
+at the end of any of the above:
 
 ```bash
 sudo ~/linux-meshstor/bin/perf-compare \
@@ -265,7 +265,7 @@ sudo ~/linux-meshstor/bin/perf-bitmap-compare \
 
 ```bash
 sudo ~/linux-meshstor/bin/perf-bitmap-compare \
-    --branch=wip/md-llbitmap-hot-write-fast-path \
+    --branch=llbitmap-fixes \
     /dev/nvme0n1p4 /dev/nvme0n1p5
 ```
 

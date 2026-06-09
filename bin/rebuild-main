@@ -44,8 +44,7 @@ Examples:
       -> filtered upstream only
   $(basename "$0") md-latency-ewma
       -> filtered upstream + latency-ewma
-  $(basename "$0") per-bucket-arrays md-latency-ewma \\
-                   wip/md-llbitmap-hot-write-fast-path
+  $(basename "$0") per-bucket-arrays md-latency-ewma
       -> filtered upstream + three features in given order
   $(basename "$0") --with-harness md-latency-ewma
       -> filtered upstream + harness + latency-ewma
