@@ -264,7 +264,7 @@ bin/perf-extract-table "$(ls -dt results/perf-bitmap-* | head -1)"
 Wall-clock estimates per run are in
 [perftest-playbook.md](perftest-playbook.md#phase-3--run-a-comparison).
 For the per-feature-branch comparison (latency-EWMA, per-bucket-arrays,
-takeover, llbitmap-fastpath) use [`bin/perf-compare`](../bin/perf-compare)
+takeover) use [`bin/perf-compare`](../bin/perf-compare)
 instead.
 
 ## See also

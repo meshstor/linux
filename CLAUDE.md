@@ -69,8 +69,7 @@ the two personalities. RAID0/5/6 and md-cluster are intentionally out of scope
 - **`meshstor-harness`** (the usual working branch) carries packaging, `bin/`
   tooling, docs, and selftests — everything that is *not* a kernel md feature.
 - **Feature branches** carry one md feature each, rebased on a torvalds master
-  snapshot: `md-latency-ewma`, `per-bucket-arrays`,
-  `wip/md-llbitmap-hot-write-fast-path`, `takeover`,
+  snapshot: `md-latency-ewma`, `per-bucket-arrays`, `takeover`,
   `llbitmap-fixes`, etc.
 - `bin/rebuild-main` **composes** these into a working tree; it is the bridge
   between the branch model and the build pipeline.
@@ -92,7 +91,7 @@ Clones torvalds/linux, slims it with `git filter-repo` to `drivers/md` +
 ```bash
 bin/rebuild-main                                   # filtered upstream only
 bin/rebuild-main md-latency-ewma                   # + one feature
-bin/rebuild-main per-bucket-arrays md-latency-ewma wip/md-llbitmap-hot-write-fast-path
+bin/rebuild-main per-bucket-arrays md-latency-ewma
 bin/rebuild-main --with-harness md-latency-ewma    # also bake in meshstor-harness (selftests/dkms/docs)
 bin/rebuild-main --no-fetch ...                    # skip refreshing the cached mirror
 ```
@@ -199,7 +198,7 @@ wrapper is used when present) and csi-perf-test suites under
   csi-perf-style fio suites against `/dev/ms0`, trap-driven teardown. `ENGINE`
   switches `ms` vs `md`.
 - `perf-compare PART_LOCAL PART_REMOTE [VARIANT...]` — baseline vs single-feature
-  variants (`per-bucket-arrays`/`takeover`/`latency-ewma`/`llbitmap-fastpath`);
+  variants (`per-bucket-arrays`/`takeover`/`latency-ewma`);
   each `kp-*` suite targets one branch's headline claim.
 - `perf-bitmap-compare PART_LOCAL PART_REMOTE [SUITE...]` — 4-way matrix:
   `{md,ms} × {internal,lockless}` bitmap on one codebase. `md-lockless` uses the

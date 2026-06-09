@@ -36,16 +36,6 @@ SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
 #                                 regime where read-balance choice dominates
 #                                 per-IO latency. Symmetric-leg SNIA suites
 #                                 show 0% gain by design.
-#   kp-hot-region-write           llbitmap-fastpath headline (patch 1, single-
-#                                 chunk). 4 KiB randwrite into a pre-seeded
-#                                 64 MiB region — every IO hits the start-write
-#                                 fast-path. SNIA randwrite dilutes this signal
-#                                 across the 10% SS noise floor.
-#   kp-hot-region-largeio-write   llbitmap-fastpath patch 2 probe (multi-chunk
-#                                 per-bit short-circuit). 1 MiB randwrite over
-#                                 8 × 64 MiB pre-dirtied regions; every IO
-#                                 spans 16 bitmap chunks so only the per-bit
-#                                 loop fast-path can fire.
 #   kp-resync-overlap-write       per-bucket-arrays headline (during-resync).
 #                                 256 sync-engine 4 KiB randwriters while a
 #                                 throttled `check` resync is active — the
@@ -72,8 +62,6 @@ DEFAULT_SUITES=(
     snia-randread-lat
     snia-randwrite-lat
     kp-asym-read
-    kp-hot-region-write
-    kp-hot-region-largeio-write
     kp-resync-overlap-write
 )
 read -r -a _suite_names <<< "${SUITES:-${DEFAULT_SUITES[*]}}"
@@ -81,20 +69,18 @@ SUITES=()
 for _s in "${_suite_names[@]}"; do SUITES+=("$SUITES_BASE/$_s"); done
 unset _s _suite_names
 
-declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma llbitmap-fastpath)
+declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma)
 declare -A VARIANT_ARGS=(
     [baseline]=""
     [per-bucket-arrays]="per-bucket-arrays"
     [takeover]="takeover"
     [latency-ewma]="md-latency-ewma"
-    [llbitmap-fastpath]="wip/md-llbitmap-hot-write-fast-path"
 )
 declare -A VARIANT_VER=(
     [baseline]="0.1.0-baseline"
     [per-bucket-arrays]="0.1.0-pba"
     [takeover]="0.1.0-takeover"
     [latency-ewma]="0.1.0-ewma"
-    [llbitmap-fastpath]="0.1.0-llbitmap"
 )
 
 usage() {
@@ -112,8 +98,8 @@ Positional form (raid1, default): two partitions = one local + one remote
 Flag form (raid10): N --local + N --remote (>=2 each), interleaved into
 N mirror pairs. Each mirror pair has one local + one nvme-tcp leg.
 
-Variants: baseline per-bucket-arrays takeover latency-ewma llbitmap-fastpath
-          (default: all 5)
+Variants: baseline per-bucket-arrays takeover latency-ewma
+          (default: all 4)
 
 Flags:
   --level=raid1|raid10  raid level (default: raid1)
