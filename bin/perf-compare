@@ -73,13 +73,14 @@ SUITES=()
 for _s in "${_suite_names[@]}"; do SUITES+=("$SUITES_BASE/$_s"); done
 unset _s _suite_names
 
-declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma llbitmap-fixes)
+declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma llbitmap-fixes meshstor-main)
 declare -A VARIANT_ARGS=(
     [baseline]=""
     [per-bucket-arrays]="per-bucket-arrays"
     [takeover]="takeover"
     [latency-ewma]="md-latency-ewma"
     [llbitmap-fixes]="llbitmap-fixes"
+    [meshstor-main]="meshstor-main"
 )
 declare -A VARIANT_VER=(
     [baseline]="0.1.0-baseline"
@@ -87,6 +88,7 @@ declare -A VARIANT_VER=(
     [takeover]="0.1.0-takeover"
     [latency-ewma]="0.1.0-ewma"
     [llbitmap-fixes]="0.1.0-llbf"
+    [meshstor-main]="0.1.0-main"
 )
 
 usage() {
@@ -105,7 +107,8 @@ Flag form (raid10): N --local + N --remote (>=2 each), interleaved into
 N mirror pairs. Each mirror pair has one local + one nvme-tcp leg.
 
 Variants: baseline per-bucket-arrays takeover latency-ewma llbitmap-fixes
-          (default: all 5)
+          meshstor-main
+          (default: all 6)
 
 Flags:
   --level=raid1|raid10  raid level (default: raid1)
