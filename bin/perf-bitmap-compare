@@ -30,8 +30,7 @@ SUITES_BASE="${SUITES_BASE:-/home/${SUDO_USER:-$USER}/csi-perf-test/suites}"
 DEFAULT_SUITES=(
     peak-randread-iops snia-randwrite-iops
     snia-randread-lat  snia-randwrite-lat
-    kp-asym-read kp-hot-region-write
-    kp-hot-region-largeio-write kp-resync-overlap-write
+    kp-asym-read kp-resync-overlap-write
 )
 
 # ---- mode tables ----

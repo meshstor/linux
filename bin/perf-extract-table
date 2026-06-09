@@ -124,8 +124,6 @@ PREFERRED_ORDER=(
     snia-randread-lat
     snia-randwrite-lat
     kp-asym-read
-    kp-hot-region-write
-    kp-hot-region-largeio-write
     kp-resync-overlap-write
 )
 SUITES=()
