@@ -13,6 +13,7 @@ TEST_PROGS := \
 	test_first_use_persist_failure.sh \
 	test_first_use_persist_data_page_failure.sh \
 	test_grow_resize_pctl.sh \
+	test_recovery_degraded_writes.sh \
 	test_resize_race_concurrent_write.sh \
 	test_shrink_regrow_stale_state.sh \
 	test_torn_state_write_error_llbitmap.sh \
