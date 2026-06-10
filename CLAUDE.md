@@ -98,9 +98,11 @@ bin/rebuild-main --no-fetch ...                    # skip refreshing the cached 
 
 Output goes to `build/linux-meshstor-rebuilt/` (branch `meshstor-main-rebuilt`,
 sentinel `.meshstor-rebuilt`). It will only wipe a dir bearing that sentinel.
-Requires `git >= 2.30` and `git-filter-repo`. Reads branches from
-`git@github.com:meshstor/linux` (override `MESHSTOR_URL=` to HTTPS when no SSH
-agent, e.g. under `sudo`/CI).
+Requires `git >= 2.30` and `git-filter-repo`. Branches are sourced
+**local-first**: a local head in this repo (even un-pushed) wins, with
+fallback to `https://github.com/meshstor/linux` for branches that only exist
+remotely (override with `MESHSTOR_URL=`). So `deploy-branch`, `build-*`, and
+the perf tooling all work on un-pushed local branches.
 
 ### 2. `bin/build-tarball <version>` — assemble the DKMS source tarball
 
