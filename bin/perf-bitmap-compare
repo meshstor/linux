@@ -70,12 +70,12 @@ SUITES_POS=()
 # read by resolve_shas/cache_key_for/obtain_tarball/restore_system in
 # perf-compare-lib.sh.
 # shellcheck disable=SC2034
-SELECTED_VARIANTS=("meshstor")
+SELECTED_VARIANTS=("baseline")
 # shellcheck disable=SC2034
-VARIANT_LABELS=("meshstor")
+VARIANT_LABELS=("baseline")
 # shellcheck disable=SC2034
-declare -A VARIANT_ARGS=( [meshstor]="" )
-declare -A VARIANT_VER=(  [meshstor]="0.1.0-bitmapcmp" )
+declare -A VARIANT_ARGS=( [baseline]="" )
+declare -A VARIANT_VER=(  [baseline]="0.1.0-bitmapcmp" )
 # shellcheck disable=SC2034  # set by remove_existing_pkg, read by restore_system (both in lib)
 SYSTEM_DKMS_VER=""
 
@@ -106,12 +106,12 @@ parse_modes() {
 
 derive_variant_ver() {
     if [[ -n "${BRANCH:-}" ]]; then
-        VARIANT_VER[meshstor]="0.1.0-bitmapcmp-${BRANCH}"
+        VARIANT_VER[baseline]="0.1.0-bitmapcmp-${BRANCH}"
     else
-        VARIANT_VER[meshstor]="0.1.0-bitmapcmp"
+        VARIANT_VER[baseline]="0.1.0-bitmapcmp"
     fi
     # shellcheck disable=SC2034  # consumed by lib's resolve_shas/obtain_tarball
-    VARIANT_ARGS[meshstor]="${BRANCH:-}"
+    VARIANT_ARGS[baseline]="${BRANCH:-}"
 }
 
 # Echo a readable kernel-config source for release $1, or nothing if none.
@@ -399,10 +399,10 @@ main() {
     local rebuild_log="$OUT_BASE/rebuild.log"
     local build_log="$OUT_BASE/build.log"
     local tarball
-    if ! tarball="$(obtain_tarball "meshstor" "$OUT_BASE" "$rebuild_log" "$build_log")"; then
+    if ! tarball="$(obtain_tarball "baseline" "$OUT_BASE" "$rebuild_log" "$build_log")"; then
         die "build failed (see $OUT_BASE/{rebuild,build}.log)"
     fi
-    if ! install_variant "meshstor" "${VARIANT_VER[meshstor]}" "$tarball" >> "$build_log" 2>&1; then
+    if ! install_variant "baseline" "${VARIANT_VER[baseline]}" "$tarball" >> "$build_log" 2>&1; then
         die "dkms install failed (see $build_log)"
     fi
 
