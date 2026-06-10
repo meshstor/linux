@@ -55,6 +55,10 @@ SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
 #   takeover  — no-regression-only per design. Steady-state raid1 paths are
 #               unchanged; SNIA band is the broad insurance check.
 #
+# Branches without a kp-* default suite (correctness / no net perf gain):
+#   llbitmap-fixes — bitmap-domain gate + Dirty recovery fix. SNIA band is
+#                    the no-regression check; no dedicated kp-* suite.
+#
 # Override the list with the SUITES env var (space-separated suite names).
 DEFAULT_SUITES=(
     peak-randread-iops
@@ -69,18 +73,20 @@ SUITES=()
 for _s in "${_suite_names[@]}"; do SUITES+=("$SUITES_BASE/$_s"); done
 unset _s _suite_names
 
-declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma)
+declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma llbitmap-fixes)
 declare -A VARIANT_ARGS=(
     [baseline]=""
     [per-bucket-arrays]="per-bucket-arrays"
     [takeover]="takeover"
     [latency-ewma]="md-latency-ewma"
+    [llbitmap-fixes]="llbitmap-fixes"
 )
 declare -A VARIANT_VER=(
     [baseline]="0.1.0-baseline"
     [per-bucket-arrays]="0.1.0-pba"
     [takeover]="0.1.0-takeover"
     [latency-ewma]="0.1.0-ewma"
+    [llbitmap-fixes]="0.1.0-llbf"
 )
 
 usage() {
@@ -98,8 +104,8 @@ Positional form (raid1, default): two partitions = one local + one remote
 Flag form (raid10): N --local + N --remote (>=2 each), interleaved into
 N mirror pairs. Each mirror pair has one local + one nvme-tcp leg.
 
-Variants: baseline per-bucket-arrays takeover latency-ewma
-          (default: all 4)
+Variants: baseline per-bucket-arrays takeover latency-ewma llbitmap-fixes
+          (default: all 5)
 
 Flags:
   --level=raid1|raid10  raid level (default: raid1)
