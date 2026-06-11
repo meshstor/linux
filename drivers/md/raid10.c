@@ -1826,6 +1826,40 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 
 	stripe_size = stripe_data_disks << geo->chunk_shift;
 
+	/*
+	 * The barrier taken above pins only the barrier unit held_sector
+	 * falls in, but a discard can span gigabytes -- many units.  Never
+	 * process more than the leading unit under one held barrier: split
+	 * at the unit boundary and requeue both halves, each of which takes
+	 * its own bucket barrier when it re-enters this function (the
+	 * leading half no longer crosses a unit, so it cannot split again).
+	 */
+	split_size = align_to_barrier_unit_end(bio->bi_iter.bi_sector,
+					       bio_sectors(bio));
+	if (split_size < bio_sectors(bio)) {
+		split = bio_split(bio, split_size, GFP_NOIO, &conf->bio_split);
+		if (IS_ERR(split)) {
+			bio->bi_status = errno_to_blk_status(PTR_ERR(split));
+			allow_barrier(conf, held_sector);
+			bio_endio(bio);
+			md_write_end(mddev);
+			return 0;
+		}
+
+		bio_chain(split, bio);
+		trace_block_split(split, bio->bi_iter.bi_sector);
+		allow_barrier(conf, held_sector);
+		submit_bio_noacct(split);
+		submit_bio_noacct(bio);
+		/*
+		 * Both halves re-enter raid10_make_request() and take their
+		 * own md_write_start()/barrier; release the reference this
+		 * call held so writes_pending is not leaked per unit split.
+		 */
+		md_write_end(mddev);
+		return 0;
+	}
+
 	bio_start = bio->bi_iter.bi_sector;
 	bio_end = bio_end_sector(bio);
 
@@ -2085,6 +2119,15 @@ static bool raid10_make_request(struct mddev *mddev, struct bio *bio)
 		sectors = chunk_sects -
 			(bio->bi_iter.bi_sector &
 			 (chunk_sects - 1));
+	/*
+	 * wait_barrier() pins only the barrier unit bi_sector falls in, so a
+	 * request must never span two units or its tail runs unprotected
+	 * against a resync raising the neighbouring bucket.  The chunk split
+	 * above already guarantees this for power-of-2 chunks <= the unit
+	 * size, but layouts with near_copies == raid_disks are not split at
+	 * all, and chunks larger than a unit can still cross.
+	 */
+	sectors = align_to_barrier_unit_end(bio->bi_iter.bi_sector, sectors);
 	if (!__make_request(mddev, bio, sectors))
 		md_write_end(mddev);
 
@@ -3521,6 +3564,13 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 				 * try to recover this sector.
 				 */
 				continue;
+			/*
+			 * This r10bio's barrier is raised on sect's bucket
+			 * and covers only that barrier unit.  max_sync is
+			 * shared by every r10bio of this batch, so clamping
+			 * it here keeps each of them inside its own unit.
+			 */
+			max_sync = align_to_barrier_unit_end(sect, max_sync);
 			/* Unless we are doing a full sync, or a replacement
 			 * we only need to recover the block if it is set in
 			 * the bitmap
@@ -3747,6 +3797,11 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 		}
 		if (sync_blocks < max_sync)
 			max_sync = sync_blocks;
+		/*
+		 * The barrier below covers only the unit sector_nr falls in;
+		 * keep the whole transfer inside it.
+		 */
+		max_sync = align_to_barrier_unit_end(sector_nr, max_sync);
 		r10_bio = raid10_alloc_init_r10buf(conf);
 		r10_bio->state = 0;
 
@@ -4889,6 +4944,17 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
 					       & conf->prev.chunk_mask);
 		if (sector_nr + RESYNC_SECTORS < last)
 			sector_nr = last + 1 - RESYNC_SECTORS;
+		/*
+		 * Confine the section to the barrier unit 'last' falls in:
+		 * the r10bios below hold per-bucket barriers, and a section
+		 * straddling a unit boundary would leave its tail
+		 * unprotected against normal I/O in the neighbouring
+		 * bucket.  Chunks no larger than the unit size never
+		 * straddle (both are powers of two), so this only triggers
+		 * for chunks larger than a barrier unit.
+		 */
+		sector_nr = max(sector_nr,
+				last & ~(sector_t)(BARRIER_UNIT_SECTOR_SIZE - 1));
 	} else {
 		/* 'next' is after the last device address that we
 		 * might write to for this chunk in the new layout
@@ -4912,6 +4978,12 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
 
 		if (sector_nr + RESYNC_SECTORS <= last)
 			last = sector_nr + RESYNC_SECTORS - 1;
+		/*
+		 * Confine the section to sector_nr's barrier unit; see the
+		 * reshape_backwards branch above for why.
+		 */
+		last = min(last,
+			   sector_nr | (sector_t)(BARRIER_UNIT_SECTOR_SIZE - 1));
 	}
 
 	if (need_flush ||
