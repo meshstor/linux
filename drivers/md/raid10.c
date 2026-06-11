@@ -1036,12 +1036,16 @@ static void raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
 	/*
 	 * Now wait for all pending IO to complete.  Also block while the array
 	 * is frozen: freeze_array() sets array_freeze_pending and expects no
-	 * sync I/O to start until unfreeze_array() clears it.
+	 * sync I/O to start until unfreeze_array() clears it.  A 'force'
+	 * raise is exempt from the freeze gate: its caller already holds a
+	 * barrier counted in nr_sync_pending, which freeze_array() now waits
+	 * to drain, so blocking the forced raise would deadlock the freeze.
 	 */
 	wait_event_barrier(conf, !atomic_read(&conf->nr_pending[idx]) &&
 				 atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH &&
-				 !conf->array_freeze_pending);
+				 (force || !conf->array_freeze_pending));
 
+	atomic_inc(&conf->nr_sync_pending);
 	write_sequnlock_irq(&conf->resync_lock);
 }
 
@@ -1052,6 +1056,7 @@ static void lower_barrier(struct r10conf *conf, sector_t sector_nr)
 
 	write_seqlock_irqsave(&conf->resync_lock, flags);
 	atomic_dec(&conf->barrier[idx]);
+	atomic_dec(&conf->nr_sync_pending);
 	write_sequnlock_irqrestore(&conf->resync_lock, flags);
 	wake_up(&conf->wait_barrier);
 }
@@ -1165,8 +1170,17 @@ static void allow_barrier(struct r10conf *conf, sector_t sector_nr)
 /* Must hold resync_lock (via write_seqlock) */
 static int get_unqueued_pending(struct r10conf *conf)
 {
-	int idx, ret = 0;
+	int idx, ret;
 
+	/*
+	 * In-flight sync r10bios hold nr_sync_pending instead of a
+	 * nr_pending[] slot; a sync r10bio queued for raid10d retry is
+	 * additionally counted in nr_queued[] and so nets to zero, like a
+	 * queued normal bio.  Without this term the sum could go negative
+	 * and let freeze_array() return while normal I/O is still in
+	 * flight.
+	 */
+	ret = atomic_read(&conf->nr_sync_pending);
 	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
 		ret += atomic_read(&conf->nr_pending[idx]) -
 		       atomic_read(&conf->nr_queued[idx]);
@@ -1179,8 +1193,12 @@ static void freeze_array(struct r10conf *conf, int extra)
 	/* stop syncio and normal IO and wait for everything to
 	 * go quiet.
 	 * We set array_freeze_pending, and then wait until
-	 * get_unqueued_pending() matches extra (summed across all
-	 * barrier buckets).
+	 * get_unqueued_pending() matches extra: all unqueued normal I/O
+	 * (summed across the barrier buckets) plus all in-flight sync
+	 * r10bios (nr_sync_pending) must drain.  An in-progress
+	 * recovery/reshape batch can still extend itself via 'force'
+	 * raises while frozen, but those barriers are counted here too,
+	 * so the freeze waits for the whole batch to finish.
 	 *
 	 * array_freeze_pending is kept set until the matching
 	 * unfreeze_array() call so the entire frozen interval blocks
