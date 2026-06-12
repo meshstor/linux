@@ -12,6 +12,8 @@ TEST_PROGS := \
 	test_cache_pages_enomem_double_free.sh \
 	test_first_use_persist_failure.sh \
 	test_first_use_persist_data_page_failure.sh \
+	test_grow_resize_pctl.sh \
+	test_resize_race_concurrent_write.sh \
 	test_torn_state_write_error_llbitmap.sh \
 	test_torn_state_write_error_md_bitmap.sh
 
