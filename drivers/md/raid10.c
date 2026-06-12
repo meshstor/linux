@@ -1142,8 +1142,20 @@ static bool wait_barrier_nolock(struct r10conf *conf, int idx)
 	if (!read_seqretry(&conf->resync_lock, seq))
 		return true;
 
-	if (atomic_dec_and_test(&conf->nr_pending[idx]))
-		wake_up_barrier(conf);
+	atomic_dec(&conf->nr_pending[idx]);
+	/*
+	 * Wake unconditionally: this undo races the very writer that
+	 * failed the seqretry -- typically freeze_array(), whose
+	 * get_unqueued_pending() check may have sampled the transient
+	 * increment and gone to sleep on it.  Waking only on a drop to
+	 * zero loses that wakeup whenever the bucket holds other
+	 * pending I/O (under freeze_array(conf, 1) it always does: the
+	 * request handle_read_error() owns keeps it non-zero), and
+	 * nothing else may ever wake the freeze.  This path only runs
+	 * on resync_lock contention, so the wake costs nothing on the
+	 * fast path.
+	 */
+	wake_up_barrier(conf);
 
 	return false;
 }
@@ -1187,8 +1199,19 @@ static bool wait_barrier(struct r10conf *conf, sector_t sector_nr, bool nowait)
 
 static void _allow_barrier(struct r10conf *conf, int idx)
 {
+	/*
+	 * The array_freeze_pending read may only be reordered before
+	 * the decrement on paper: atomic_dec_and_test() is fully
+	 * ordered, pairing with the smp_mb() in freeze_array().  A
+	 * freeze that does not get woken from here is therefore
+	 * guaranteed to observe this decrement in its wait condition.
+	 * Keeping the wake conditional matters: an unconditional
+	 * wake_up_barrier() on every completion measurably inflates
+	 * normal-I/O tail latency while a sync sleeps in
+	 * raise_barrier() (the waitqueue then always has a sleeper).
+	 */
 	if ((atomic_dec_and_test(&conf->nr_pending[idx])) ||
-			(conf->array_freeze_pending))
+			(READ_ONCE(conf->array_freeze_pending)))
 		wake_up_barrier(conf);
 }
 
@@ -1249,6 +1272,17 @@ static void freeze_array(struct r10conf *conf, int extra)
 	 */
 	write_seqlock_irq(&conf->resync_lock);
 	conf->array_freeze_pending++;
+	/*
+	 * Pairs with the fully-ordered atomic_dec_and_test() in
+	 * _allow_barrier(): either that CPU observes
+	 * array_freeze_pending and wakes us, or the wait below observes
+	 * its decrement.  Without the fence both sides can read stale
+	 * state (a plain store-buffer race: this CPU's flag store is
+	 * not yet visible while it loads the counters), and a freeze
+	 * whose condition is already satisfied sleeps with no wakeup
+	 * left to deliver.
+	 */
+	smp_mb();
 	wait_event_barrier_cmd(conf, get_unqueued_pending(conf) == extra,
 			       flush_pending_writes(conf));
 	write_sequnlock_irq(&conf->resync_lock);
