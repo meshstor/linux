@@ -3144,6 +3144,7 @@ static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
 	struct bio *bio;
 	struct r10conf *conf = mddev->private;
 	struct md_rdev *rdev = r10_bio->devs[slot].rdev;
+	sector_t sector;
 
 	/* we got a read error. Maybe the drive is bad.  Maybe just
 	 * the block and we can fix it.
@@ -3168,12 +3169,19 @@ static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
 
 	rdev_dec_pending(rdev, mddev);
 	r10_bio->state = 0;
+	/*
+	 * raid10_read_request() may end and free r10_bio if the re-read
+	 * fails immediately (no readable mirror left), so the sector for
+	 * the trailing allow_barrier() must be saved beforehand --
+	 * raid1's handle_read_error() does the same.
+	 */
+	sector = r10_bio->sector;
 	raid10_read_request(mddev, r10_bio->master_bio, r10_bio);
 	/*
 	 * allow_barrier after re-submit to ensure no sync io
 	 * can be issued while regular io pending.
 	 */
-	allow_barrier(conf, r10_bio->sector);
+	allow_barrier(conf, sector);
 }
 
 static void handle_write_completed(struct r10conf *conf, struct r10bio *r10_bio)
