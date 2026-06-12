@@ -5056,7 +5056,8 @@ read_more:
 		 * on all the target devices.
 		 */
 		// FIXME
-		mempool_free(r10_bio, &conf->r10buf_pool);
+		put_buf(r10_bio);
+		lower_barrier(conf, reshape_sector);
 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 		return sectors_done;
 	}
@@ -5136,8 +5137,20 @@ read_more:
 			len = PAGE_SIZE;
 		for (bio = blist; bio ; bio = bio->bi_next) {
 			if (WARN_ON(!bio_add_page(bio, page, len, 0))) {
-				bio->bi_status = BLK_STS_RESOURCE;
-				bio_endio(bio);
+				/*
+				 * None of these bios were submitted: ending
+				 * one here would run its end_io handler
+				 * against an r10bio with remaining == 0 and
+				 * drop rdev references that were never taken.
+				 * Tear the request down by hand instead, and
+				 * release both barriers so the abort cannot
+				 * wedge freeze_array() or close_sync().
+				 */
+				rdev_dec_pending(rdev, mddev);
+				bio_put(read_bio);
+				put_buf(r10_bio);
+				lower_barrier(conf, reshape_sector);
+				set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 				return sectors_done;
 			}
 		}
@@ -5185,6 +5198,17 @@ static void reshape_request_write(struct mddev *mddev, struct r10bio *r10_bio)
 			/* Reshape has been aborted */
 			md_done_sync(mddev, r10_bio->sectors);
 			md_sync_error(mddev);
+			/*
+			 * The r10bio still holds the inner barrier raised in
+			 * reshape_request() (counted in nr_sync_pending) and
+			 * owns master_bio (the read bio).  Release them exactly
+			 * as the normal completion in end_reshape_request()
+			 * does; otherwise the leaked nr_sync_pending makes every
+			 * later freeze_array() -- quiesce, suspend,
+			 * handle_read_error() -- hang forever.
+			 */
+			bio_put(r10_bio->master_bio);
+			put_buf(r10_bio);
 			return;
 		}
 
