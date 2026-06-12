@@ -1901,6 +1901,7 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 		split = bio_split(bio, split_size, GFP_NOIO, &conf->bio_split);
 		if (IS_ERR(split)) {
 			bio->bi_status = errno_to_blk_status(PTR_ERR(split));
+			allow_barrier(conf, held_sector);
 			bio_endio(bio);
 			md_write_end(mddev);
 			return 0;
@@ -1920,6 +1921,7 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 		split = bio_split(bio, split_size, GFP_NOIO, &conf->bio_split);
 		if (IS_ERR(split)) {
 			bio->bi_status = errno_to_blk_status(PTR_ERR(split));
+			allow_barrier(conf, held_sector);
 			bio_endio(bio);
 			md_write_end(mddev);
 			return 0;
