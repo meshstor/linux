@@ -1007,9 +1007,13 @@ static void flush_pending_writes(struct r10conf *conf)
  * backgroup IO calls must call raise_barrier.  Once that returns
  *    there is no normal IO happeing.  It must arrange to call
  *    lower_barrier when the particular background IO completes.
+ * raise_barrier() returns -EINTR if MD_RECOVERY_INTR was set while it
+ *    waited, so an aborted resync/recovery/reshape cannot sit
+ *    uninterruptibly behind a frozen array or a pinned bucket; the
+ *    caller must unwind without calling lower_barrier().
  */
 
-static void raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
+static int raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
 {
 	int idx = sector_to_idx(sector_nr);
 
@@ -1026,9 +1030,20 @@ static void raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
 	 * design's WARN_ON_ONCE(force && !barrier) invariant no longer holds.
 	 * 'force' still skips the wait below so a second raise cannot deadlock
 	 * against a normal I/O already waiting on a bucket this batch holds.
+	 *
+	 * Unlike raid1 we bail out on MD_RECOVERY_INTR here too: a quiesce
+	 * holds the freeze for its whole interval, and normal I/O arriving
+	 * meanwhile keeps nr_waiting[idx] raised, so this wait can block for
+	 * as long as the array stays frozen.
 	 */
 	wait_event_barrier(conf, force ||
-			   !atomic_read(&conf->nr_waiting[idx]));
+			   !atomic_read(&conf->nr_waiting[idx]) ||
+			   test_bit(MD_RECOVERY_INTR, &conf->mddev->recovery));
+
+	if (test_bit(MD_RECOVERY_INTR, &conf->mddev->recovery)) {
+		write_sequnlock_irq(&conf->resync_lock);
+		return -EINTR;
+	}
 
 	/* block any new IO from starting */
 	atomic_inc(&conf->barrier[idx]);
@@ -1040,13 +1055,30 @@ static void raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
 	 * raise is exempt from the freeze gate: its caller already holds a
 	 * barrier counted in nr_sync_pending, which freeze_array() now waits
 	 * to drain, so blocking the forced raise would deadlock the freeze.
+	 *
+	 * Bail out if MD_RECOVERY_INTR gets set while we wait (raid1's
+	 * pattern): a forced raise can otherwise deadlock against a normal
+	 * I/O that is queued for raid10d retry (holding nr_pending[idx])
+	 * while raid10d itself sits in freeze_array() waiting for this
+	 * thread's nr_sync_pending to drain.  The -EINTR return lets an
+	 * administrative abort (stop_sync_thread(), array stop,
+	 * 'echo idle > sync_action') break that cycle.
 	 */
-	wait_event_barrier(conf, !atomic_read(&conf->nr_pending[idx]) &&
-				 atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH &&
-				 (force || !conf->array_freeze_pending));
+	wait_event_barrier(conf, (!atomic_read(&conf->nr_pending[idx]) &&
+				  atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH &&
+				  (force || !conf->array_freeze_pending)) ||
+				 test_bit(MD_RECOVERY_INTR, &conf->mddev->recovery));
+
+	if (test_bit(MD_RECOVERY_INTR, &conf->mddev->recovery)) {
+		atomic_dec(&conf->barrier[idx]);
+		write_sequnlock_irq(&conf->resync_lock);
+		wake_up(&conf->wait_barrier);
+		return -EINTR;
+	}
 
 	atomic_inc(&conf->nr_sync_pending);
 	write_sequnlock_irq(&conf->resync_lock);
+	return 0;
 }
 
 static void lower_barrier(struct r10conf *conf, sector_t sector_nr)
@@ -3614,7 +3646,22 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 
 			r10_bio = raid10_alloc_init_r10buf(conf);
 			r10_bio->state = 0;
-			raise_barrier(conf, sect, rb2 != NULL);
+			if (raise_barrier(conf, sect, rb2 != NULL)) {
+				/*
+				 * Interrupted: stop extending the batch.  The
+				 * raise was undone, so free the r10bio raw
+				 * (no barrier to lower) and fall through to
+				 * submit what is already built; md_do_sync()
+				 * sees MD_RECOVERY_INTR and winds down.
+				 */
+				mempool_free(r10_bio, &conf->r10buf_pool);
+				if (mrdev)
+					rdev_dec_pending(mrdev, mddev);
+				if (mreplace)
+					rdev_dec_pending(mreplace, mddev);
+				r10_bio = rb2;
+				break;
+			}
 			atomic_set(&r10_bio->remaining, 0);
 
 			r10_bio->master_bio = (struct bio*)rb2;
@@ -3827,7 +3874,10 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 
 		r10_bio->mddev = mddev;
 		atomic_set(&r10_bio->remaining, 0);
-		raise_barrier(conf, sector_nr, 0);
+		if (raise_barrier(conf, sector_nr, 0)) {
+			mempool_free(r10_bio, &conf->r10buf_pool);
+			return 0;
+		}
 		conf->next_resync = sector_nr;
 
 		r10_bio->master_bio = NULL;
@@ -5037,12 +5087,17 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
 	 * matching lower_barrier() targets the same bucket.
 	 */
 	reshape_sector = sector_nr;
-	raise_barrier(conf, reshape_sector, 0);
+	if (raise_barrier(conf, reshape_sector, 0))
+		return sectors_done;
 read_more:
 	/* Now schedule reads for blocks from sector_nr to last */
 	r10_bio = raid10_alloc_init_r10buf(conf);
 	r10_bio->state = 0;
-	raise_barrier(conf, sector_nr, 1);
+	if (raise_barrier(conf, sector_nr, 1)) {
+		mempool_free(r10_bio, &conf->r10buf_pool);
+		lower_barrier(conf, reshape_sector);
+		return sectors_done;
+	}
 	atomic_set(&r10_bio->remaining, 0);
 	r10_bio->mddev = mddev;
 	r10_bio->sector = sector_nr;
