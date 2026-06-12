@@ -152,6 +152,16 @@ struct r1bio {
 	struct bio		*behind_master_bio;
 
 	/*
+	 * Latency measurement (read path only). submit_ns is stored
+	 * unconditionally in raid1_read_request - 0 means "not
+	 * measured" - because r1bios are mempool-recycled and the
+	 * handle_read_error retry reuses this struct. lat_weight is
+	 * nr_pending at stamp time (>= 1, includes self).
+	 */
+	u64			submit_ns;
+	u32			lat_weight;
+
+	/*
 	 * if the IO is in WRITE direction, then multiple bios are used.
 	 * We choose the number when they are allocated.
 	 */
@@ -184,6 +194,7 @@ enum r1bio_state {
 	R1BIO_MadeGood,
 	R1BIO_WriteError,
 	R1BIO_FailFast,
+	R1BIO_Probe,		/* read steered by a probe credit; always stamped */
 };
 
 static inline int sector_to_idx(sector_t sector)

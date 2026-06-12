@@ -418,6 +418,29 @@ static void raid1_end_read_request(struct bio *bio)
 	}
 
 	if (uptodate) {
+		/*
+		 * 'uptodate' here means "don't retry" and includes
+		 * failed RAHEAD/NOWAIT and last-leg-failed completions;
+		 * only genuine successes (R1BIO_Uptodate) may feed the
+		 * latency EWMA - a fast NOWAIT failure recorded as a
+		 * fast sample would flatter a congested leg.
+		 */
+		if (test_bit(R1BIO_Uptodate, &r1_bio->state) &&
+		    READ_ONCE(conf->mddev->lat_balance) &&
+		    READ_ONCE(conf->mddev->lat_nonrot)) {
+			/*
+			 * First read after an idle park resumes the
+			 * fold worker. Only measured legs kick: an
+			 * unmeasured (rotational) leg's traffic gives
+			 * the worker nothing to fold, and kicking on
+			 * it would just churn park/unpark.
+			 */
+			if (unlikely(READ_ONCE(conf->mddev->lat_fold_idle)) &&
+			    READ_ONCE(rdev->lat_stats))
+				md_latency_fold_kick(conf->mddev);
+			md_lat_read_done(rdev, r1_bio->submit_ns,
+					 r1_bio->lat_weight);
+		}
 		raid_end_bio_io(r1_bio);
 		rdev_dec_pending(rdev, conf->mddev);
 	} else {
@@ -784,6 +807,12 @@ struct read_balance_ctl {
 	int min_pending_disk;
 	int sequential_disk;
 	int readable_disks;
+	u64 min_cost;		/* ewma * (nr_pending + 1) */
+	u64 runner_up_cost;	/* second best, for 12.5% hysteresis */
+	int min_cost_disk;
+	int probe_disk;		/* first candidate with armed credit */
+	struct md_rdev *probe_rdev;
+	unsigned int probe_pending;	/* its queue depth at scan time */
 };
 
 static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
@@ -795,7 +824,18 @@ static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
 		.min_pending_disk       = -1,
 		.min_pending            = UINT_MAX,
 		.sequential_disk	= -1,
+		.min_cost		= U64_MAX,
+		.runner_up_cost		= U64_MAX,
+		.min_cost_disk		= -1,
+		.probe_disk		= -1,
 	};
+	/*
+	 * Kill switch, and all-rotational arrays, where ms-scale seek
+	 * variance would defeat the EWMA: skip both the candidate cost
+	 * tracking and the latency-aware pick below.
+	 */
+	bool lat_on = READ_ONCE(conf->mddev->lat_balance) &&
+		      READ_ONCE(conf->nonrot_disks);
 
 	for (disk = 0 ; disk < conf->raid_disks * 2 ; disk++) {
 		struct md_rdev *rdev;
@@ -843,6 +883,35 @@ static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
 			ctl.closest_dist = dist;
 			ctl.closest_dist_disk = disk;
 		}
+
+		if (lat_on) {
+			u32 ewma = READ_ONCE(rdev->latency_ewma_ns);
+
+			if (ewma) {
+				/*
+				 * 'pending' may carry the sequential +1
+				 * penalty from above - intentionally shared
+				 * with the stock min-pending heuristic: both
+				 * pickers see the same effective queue depth.
+				 */
+				u64 cost = (u64)ewma * (pending + 1);
+
+				if (cost < ctl.min_cost) {
+					ctl.runner_up_cost = ctl.min_cost;
+					ctl.min_cost = cost;
+					ctl.min_cost_disk = disk;
+				} else if (cost < ctl.runner_up_cost) {
+					ctl.runner_up_cost = cost;
+				}
+			}
+
+			if (ctl.probe_disk == -1 &&
+			    atomic_read(&rdev->probe_credit)) {
+				ctl.probe_disk = disk;
+				ctl.probe_rdev = rdev;
+				ctl.probe_pending = pending;
+			}
+		}
 	}
 
 	/*
@@ -851,6 +920,40 @@ static int choose_best_rdev(struct r1conf *conf, struct r1bio *r1_bio)
 	 */
 	if (ctl.sequential_disk != -1 && ctl.min_pending != 0)
 		return ctl.sequential_disk;
+
+	/*
+	 * Latency-aware path. Probe claim first: a winning claim
+	 * decides the read outright - probes are what re-seed a
+	 * starved leg's EWMA so the SED pick below can re-engage.
+	 * The claim is refused while the probed leg's queue is far
+	 * above the least-loaded leg's: a probe behind a deep
+	 * backlog inherits the whole backlog's latency and re-arms
+	 * every few folds while the leg stays slow - an unbounded
+	 * p99.9 tail bought for no information the pending term does
+	 * not already encode. The guard sits before the xchg, so a
+	 * refused claim leaves the credit armed for a calmer moment.
+	 * The SED pick requires two measured legs (a sole EWMA says
+	 * nothing about which leg is faster - steering on it would
+	 * pin all reads to whichever leg happens to be measured)
+	 * plus 12.5% hysteresis, and otherwise falls back to the
+	 * stock tail.
+	 */
+	if (lat_on) {
+		if (ctl.probe_disk != -1 &&
+		    r1_bio->sectors <= MD_LAT_SIZE_CAP_SECTORS &&
+		    ctl.probe_pending <= MD_LAT_PROBE_PEND_MULT *
+					 ctl.min_pending +
+					 MD_LAT_PROBE_PEND_SLACK &&
+		    atomic_xchg(&ctl.probe_rdev->probe_credit, 0)) {
+			set_bit(R1BIO_Probe, &r1_bio->state);
+			return ctl.probe_disk;
+		}
+		if (ctl.min_cost_disk != -1 &&
+		    ctl.runner_up_cost != U64_MAX &&
+		    ctl.runner_up_cost - ctl.min_cost >=
+						(ctl.min_cost >> 3))
+			return ctl.min_cost_disk;
+	}
 
 	/*
 	 * If all disks are rotational, choose the closest disk. If any disk is
@@ -1446,10 +1549,27 @@ static void raid1_read_request(struct mddev *mddev, struct bio *bio,
 	        read_bio->bi_opf |= MD_FAILFAST;
 	read_bio->bi_private = r1_bio;
 	mddev_trace_remap(mddev, read_bio, r1_bio->sector);
+	if (READ_ONCE(mddev->lat_balance) && READ_ONCE(mddev->lat_nonrot) &&
+	    (test_bit(R1BIO_Probe, &r1_bio->state) ||
+	     (r1_bio->sectors <= MD_LAT_SIZE_CAP_SECTORS &&
+	      md_lat_sample_gate(mirror->rdev)))) {
+		r1_bio->lat_weight =
+			(u32)atomic_read(&mirror->rdev->nr_pending);
+		r1_bio->submit_ns = ktime_get_ns();
+	} else {
+		r1_bio->submit_ns = 0;
+	}
 	submit_bio_noacct(read_bio);
 	return;
 
 err_handle:
+	/*
+	 * A claimed probe credit must not be destroyed without ever
+	 * issuing the probe read - re-arm so the starved leg's
+	 * rediscovery is not delayed by a wasted arm cycle.
+	 */
+	if (test_bit(R1BIO_Probe, &r1_bio->state))
+		atomic_set(&mirror->rdev->probe_credit, 1);
 	atomic_dec(&mirror->rdev->nr_pending);
 	raid_end_bio_io(r1_bio);
 }
@@ -2005,6 +2125,12 @@ static int raid1_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		conf->fullsync = 1;
 	}
 
+	/*
+	 * A hot-added non-rotational leg must wake a fold worker parked
+	 * on the all-rotational verdict; no-op while it is running.
+	 */
+	if (!err)
+		md_latency_fold_kick(mddev);
 	print_conf(conf);
 	return err;
 }
@@ -3316,12 +3442,16 @@ static int raid1_run(struct mddev *mddev)
 	ret = md_integrity_register(mddev);
 	if (ret)
 		md_unregister_thread(mddev, &mddev->thread);
+	else
+		md_latency_fold_start(mddev);
 	return ret;
 }
 
 static void raid1_free(struct mddev *mddev, void *priv)
 {
 	struct r1conf *conf = priv;
+
+	md_latency_fold_stop(mddev);
 
 	mempool_destroy(conf->r1bio_pool);
 	kfree(conf->mirrors);
