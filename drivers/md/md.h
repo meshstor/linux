@@ -12,10 +12,12 @@
 #include <linux/backing-dev.h>
 #include <linux/badblocks.h>
 #include <linux/kobject.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/timer.h>
+#include <linux/u64_stats_sync.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/raid/md_u.h>
@@ -26,6 +28,60 @@
  * Number of guaranteed raid bios in case of extreme VM load:
  */
 #define	NR_RAID_BIOS 256
+
+/*
+ * Latency-aware read balance (raid1/raid10). Hot path records
+ * queue-normalized read latency into per-CPU counters; a per-mddev
+ * fold worker publishes a per-rdev EWMA; read_balance picks
+ * min(ewma * (nr_pending + 1)) when at least two legs are measured
+ * and the winner leads by >= 12.5%, falling back to the stock
+ * policy otherwise.
+ */
+#define MD_LAT_FOLD_MS		25	/* default fold period */
+#define MD_LAT_SAMPLE_SHIFT	8	/* gate ceiling: sample >= 1 in 256 */
+#define MD_LAT_SAMPLE_TARGET	4	/* samples per leg per fold the
+					 * adaptive gate aims at
+					 */
+#define MD_LAT_FOLD_ALPHA_SHIFT	2	/* EWMA alpha = 1/4 per fold */
+#define MD_LATENCY_CLAMP_NS	10000000ULL	/* 10 ms per-slot clamp */
+/*
+ * The fold worker keeps the EWMA inside [1, MD_LATENCY_CLAMP_NS] and
+ * publishes it as a u32; the completion path multiplies the clamp by
+ * a u32 weight inside a u64. Both need headroom above the clamp.
+ */
+static_assert(MD_LATENCY_CLAMP_NS < (1ULL << 31));
+#define MD_LAT_SIZE_CAP_SECTORS	128	/* measure reads <= 64 KiB */
+#define MD_LAT_PROBE_FOLDS	4	/* folds w/o samples to arm a probe;
+					 * also min folds between any two arms
+					 */
+#define MD_LAT_PROBE_MIN_GAP	128	/* array reads between any two arms */
+#define MD_LAT_PROBE_PEND_MULT	4	/* claim-time congestion guard: claim
+					 * only while the probed leg's queue
+					 * is within MULT * min_pending +
+					 * SLACK of the least-loaded leg
+					 */
+#define MD_LAT_PROBE_PEND_SLACK	8
+#define MD_LAT_STALE_FOLDS	40	/* folds w/o samples to invalidate the
+					 * EWMA: 1s at the default cadence,
+					 * 40s at the idle cap. In practice an
+					 * idle array parks ~2.6s into the
+					 * spell and the park edge invalidates
+					 * everything - see md_latency_fold
+					 */
+#define MD_LAT_IDLE_CAP_MS	1000	/* max backed-off fold period */
+
+struct md_lat_pcpu {
+	u64_stats_t		sum_ns;		/* sojourn, clamped per-slot */
+	u64_stats_t		sum_weight;	/* nr_pending at stamp */
+	u64_stats_t		samples;	/* measured completions */
+	u64_stats_t		reads;		/* ALL successful read completions */
+	struct u64_stats_sync	sync;
+	unsigned int		seq;		/* submit-side sampling sequence;
+						 * outside the seqcount: only
+						 * md_lat_sample_gate touches
+						 * it, on this CPU
+						 */
+};
 
 enum md_submodule_type {
 	MD_PERSONALITY = 0,
@@ -196,6 +252,38 @@ struct md_rdev {
 					 * only maintained for arrays that
 					 * support hot removal
 					 */
+	/*
+	 * Lazily allocated by the fold worker - only for active
+	 * non-rotational legs, the only legs ever measured; freed in
+	 * md_rdev_clear.
+	 * Each reader has its own lifetime guarantee. The fold worker
+	 * reads lat_stats under rcu_read_lock: every md_rdev_clear is
+	 * ordered after the unbind list_del_rcu + synchronize_rcu
+	 * (native md) or after the worker was synchronously cancelled
+	 * (dm-raid). md_lat_read_done takes no RCU lock: it is safe
+	 * only because the completing read still holds a nr_pending
+	 * reference, and no removal path reaches md_rdev_clear before
+	 * nr_pending drains.
+	 */
+	struct md_lat_pcpu __percpu *lat_stats;
+	u32		latency_ewma_ns; /* fold-published, queue-normalized;
+					  * 0 = never measured. u32: clamp
+					  * bounds it under 2^32, single-copy
+					  * atomic on all arches.
+					  */
+	u8		lat_eff_shift;	/* fold-published sampling gate for
+					 * this leg, [0, MD_LAT_SAMPLE_SHIFT];
+					 * adapts to the leg's read rate
+					 */
+	atomic_t	probe_credit;	/* armed by fold worker, claimed by
+					 * read_balance with atomic_xchg
+					 */
+	/* fold-worker-private (no locking; single writer): */
+	u64		lat_base_sum_ns;
+	u64		lat_base_weight;
+	u64		lat_base_samples;
+	u64		lat_base_reads;
+	unsigned int	lat_staleness;	/* folds since last sample */
 	atomic_t	read_errors;	/* number of consecutive read errors that
 					 * we have tried to ignore.
 					 */
@@ -224,6 +312,87 @@ struct md_rdev {
 		sector_t sector;	/* First sector of the PPL space */
 	} ppl;
 };
+
+/*
+ * Sampling gate: measure ~1 in 2^lat_eff_shift of this leg's reads.
+ * lat_eff_shift is fold-published: 0 (measure every read) while the
+ * leg's read rate is low or unknown, rising to MD_LAT_SAMPLE_SHIFT
+ * at high rates. The sequence lives in the leg's own per-CPU stats,
+ * so legs never share a counter: a shared one phase-locks under a
+ * periodic interleave (two legs strictly alternating on one CPU at
+ * shift 1 give one leg only odd counts - it never samples), starving
+ * a leg outright instead of merely shifting its phase. Before the
+ * first fold allocates lat_stats there is nothing to record into,
+ * so the gate also answers no; rotational legs and spares are never
+ * allocated stats, so the same NULL test keeps them unmeasured.
+ */
+static inline bool md_lat_sample_gate(struct md_rdev *rdev)
+{
+	struct md_lat_pcpu __percpu *pcpu = READ_ONCE(rdev->lat_stats);
+	unsigned int shift;
+
+	if (!pcpu)
+		return false;
+	shift = READ_ONCE(rdev->lat_eff_shift);
+	if (!shift)
+		return true;
+	return (this_cpu_inc_return(pcpu->seq) &
+		((1U << shift) - 1)) == 0;
+}
+
+/*
+ * Record one successful read completion. submit_ns == 0 means
+ * "not measured" (only the reads counter bumps). weight is
+ * nr_pending at stamp time (>= 1, includes self). May run in any
+ * context including hardirq. The caller still holds the read's
+ * nr_pending reference on rdev - that reference, not RCU, is what
+ * keeps lat_stats alive here (see the lat_stats field comment).
+ * Callers skip the call entirely while latency_balance is off or
+ * the array has no non-rotational leg (lat_nonrot), so the kill
+ * switch and all-rotational arrays shed this per-completion cost
+ * too; the fold worker parks on those same edges.
+ */
+static inline void md_lat_read_done(struct md_rdev *rdev, u64 submit_ns,
+				    u32 weight)
+{
+	struct md_lat_pcpu __percpu *pcpu = READ_ONCE(rdev->lat_stats);
+	struct md_lat_pcpu *stats;
+	unsigned long flags;
+
+	if (!pcpu)
+		return;
+
+	stats = get_cpu_ptr(pcpu);
+	flags = u64_stats_update_begin_irqsave(&stats->sync);
+	u64_stats_inc(&stats->reads);
+	if (submit_ns) {
+		u64 sojourn = ktime_get_ns() - submit_ns;
+		u64 cap = MD_LATENCY_CLAMP_NS * weight;
+
+		/*
+		 * Per-slot clamp: a flat sojourn clamp divided by full
+		 * weight would deflate S for saturated legs and steer
+		 * reads toward them. The ULONG_MAX bound
+		 * exists because u64_stats_add() takes unsigned long:
+		 * without it a >4.3s outlier would truncate to garbage
+		 * on 32-bit (no-op on 64-bit).
+		 */
+		if (sojourn > cap)
+			sojourn = cap;
+		if (sojourn > (u64)ULONG_MAX)
+			sojourn = (u64)ULONG_MAX;
+		u64_stats_add(&stats->sum_ns, sojourn);
+		u64_stats_add(&stats->sum_weight, weight);
+		u64_stats_inc(&stats->samples);
+	}
+	u64_stats_update_end_irqrestore(&stats->sync, flags);
+	put_cpu_ptr(pcpu);
+}
+
+void md_latency_fold_start(struct mddev *mddev);
+void md_latency_fold_stop(struct mddev *mddev);
+void md_latency_fold_kick(struct mddev *mddev);
+
 enum flag_bits {
 	Faulty,			/* device is known to have a fault */
 	In_sync,		/* device is in_sync with rest of array */
@@ -551,6 +720,25 @@ struct mddev {
 
 	/* used for delayed sysfs removal */
 	struct work_struct del_work;
+	/* latency-aware read balance (raid1/raid10 only) */
+	struct delayed_work	lat_fold_work;
+	unsigned int		lat_fold_ms;	 /* sysfs latency_fold_ms */
+	unsigned int		lat_fold_cur_ms; /* current, idle-backed-off */
+	bool			lat_balance;	 /* sysfs latency_balance */
+	bool			lat_nonrot;	 /* fold-published: any non-rot
+						  * leg; gates the measurement
+						  * sites (the pickers use
+						  * their own conf state)
+						  */
+	bool			lat_fold_active;
+	bool			lat_fold_idle;	 /* parked for want of reads;
+						  * completions on measured
+						  * legs kick the worker back
+						  */
+	u64			lat_fold_count;	 /* worker-private */
+	u64			lat_reads_total; /* worker-private */
+	u64			lat_reads_at_arm;
+	u64			lat_last_arm_fold;
 	/* used for register new sync thread */
 	struct work_struct sync_work;
 

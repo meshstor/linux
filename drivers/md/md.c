@@ -94,6 +94,15 @@ static DECLARE_WAIT_QUEUE_HEAD(resync_wait);
  */
 static struct workqueue_struct *md_misc_wq;
 
+/*
+ * Seeds mddev->lat_balance at mddev_init time. Native md arrays can
+ * override per-array via sysfs afterwards; dm-raid arrays cannot -
+ * their mddev never registers a kobject, so this parameter is the
+ * only latency-balance control they have. Runtime writes affect
+ * arrays initialized afterwards.
+ */
+static bool lat_balance_default = true;
+
 static int remove_and_add_spares(struct mddev *mddev,
 				 struct md_rdev *this);
 static void mddev_detach(struct mddev *mddev);
@@ -742,6 +751,367 @@ err:
 	return false;
 }
 
+/*
+ * Latency fold worker ("the accountant"). Single writer of all
+ * latency shared state except the probe-credit claim and
+ * md_rdev_clear (which frees lat_stats and zeroes the EWMA, but only
+ * after the rdev left mddev->disks behind synchronize_rcu, or - on
+ * the dm-raid path - after this worker was synchronously cancelled).
+ * That grace period covers only this worker's rcu_read_lock walks;
+ * the completion-path reader is protected by nr_pending instead -
+ * see md_lat_read_done(). Runs without reconfig_mutex by design:
+ * pers->free does the synchronous cancel while holding it. Touches
+ * only mddev/rdev state, never conf, so it is safe even between
+ * pers->free and the cancel. Self-requeues (with idle backoff) while
+ * the array is worth measuring; parks when latency_balance is off,
+ * no leg is non-rotational, or the idle backoff exhausts its ladder
+ * without seeing a read, and is re-kicked by latency_balance_store,
+ * the personalities' add_disk, and - for the idle case, flagged by
+ * lat_fold_idle - the read completion path.
+ */
+static void md_latency_fold(struct work_struct *ws)
+{
+	struct mddev *mddev = container_of(to_delayed_work(ws),
+					   struct mddev, lat_fold_work);
+	struct md_rdev *rdev, *arm_rdev = NULL;
+	unsigned int arm_staleness = 0;
+	bool any_nonrot = false;
+	u64 reads_this_fold = 0;
+
+	/*
+	 * Kill switch: with latency_balance off the read paths neither
+	 * stamp nor record, so the counters cannot advance and no probe
+	 * may be armed - park instead of ticking forever;
+	 * latency_balance_store kicks the worker on re-enable.
+	 */
+	if (!READ_ONCE(mddev->lat_balance))
+		goto park;
+
+	/* running again - completions need not kick anymore */
+	if (READ_ONCE(mddev->lat_fold_idle))
+		WRITE_ONCE(mddev->lat_fold_idle, false);
+
+	rcu_read_lock();
+	/*
+	 * All-rotational arrays: the pickers never consult the EWMA
+	 * there (ms-scale seek variance would defeat it), so measuring
+	 * would be pure overhead. Publish the verdict to gate the
+	 * stamp/record sites and park. Only active legs count: a
+	 * non-rotational spare can neither serve reads nor be picked,
+	 * so it must not keep the worker ticking on an otherwise
+	 * all-rotational array (its activation kicks the worker via
+	 * the personalities' add_disk). Detection lives here rather
+	 * than in personality hot-plug hooks: add_disk only kicks the
+	 * worker, and this scan decides whether the hot-added leg
+	 * flips the verdict.
+	 */
+	rdev_for_each_rcu(rdev, mddev) {
+		if (rdev->raid_disk >= 0 && rdev->bdev &&
+		    !bdev_rot(rdev->bdev)) {
+			any_nonrot = true;
+			break;
+		}
+	}
+	if (READ_ONCE(mddev->lat_nonrot) != any_nonrot)
+		WRITE_ONCE(mddev->lat_nonrot, any_nonrot);
+	if (!any_nonrot) {
+		rcu_read_unlock();
+		goto park;
+	}
+
+	rdev_for_each_rcu(rdev, mddev) {
+		struct md_lat_pcpu __percpu *pcpu = rdev->lat_stats;
+		u64 sum = 0, weight = 0, samples = 0, reads = 0;
+		u64 dsamples, dreads;
+		unsigned int eff_shift;
+		int cpu;
+
+		/*
+		 * Only active non-rotational legs are measured. An
+		 * HDD's seek-variance EWMA would spuriously win or
+		 * lose the SED pick on mixed arrays, and a probe
+		 * there would route a user read onto a disk at seek
+		 * latency - a tail stock never had. A spare
+		 * (raid_disk < 0) can never be picked at all, so its
+		 * ever-growing staleness must not consume probe-arm
+		 * cycles. Never allocating stats is what keeps both
+		 * unmeasured: the sampling gate and md_lat_read_done
+		 * treat a NULL lat_stats as "do not measure". A leg
+		 * that leaves the measured set after allocation (the
+		 * rotational flag is writable at runtime; an active
+		 * leg can be demoted to spare) keeps its stats - a
+		 * completing read may still be recording under its
+		 * nr_pending reference - but its published EWMA and
+		 * any armed credit are revoked so the pickers can
+		 * neither steer to it nor probe it. Baselines freeze
+		 * with the scan; on re-entry the first window's
+		 * deltas span the gap, which the [1, CLAMP] mean
+		 * bound and organic re-measurement absorb.
+		 */
+		if (rdev->raid_disk < 0 || !rdev->bdev ||
+		    bdev_rot(rdev->bdev)) {
+			if (pcpu) {
+				if (rdev->latency_ewma_ns)
+					WRITE_ONCE(rdev->latency_ewma_ns, 0);
+				atomic_set(&rdev->probe_credit, 0);
+			}
+			continue;
+		}
+
+		if (!pcpu) {
+			/*
+			 * GFP_NOWAIT is load-bearing: we are inside an
+			 * RCU read-side section (sleeping illegal), and
+			 * GFP_KERNEL reclaim could wait on writeback to
+			 * this very array, deadlocking against the stop
+			 * path's cancel_delayed_work_sync. Failure is
+			 * retried next fold.
+			 */
+			pcpu = alloc_percpu_gfp(struct md_lat_pcpu,
+						GFP_NOWAIT | __GFP_NOWARN);
+			if (!pcpu)
+				continue;
+			for_each_possible_cpu(cpu)
+				u64_stats_init(&per_cpu_ptr(pcpu, cpu)->sync);
+			rdev->lat_base_sum_ns = 0;
+			rdev->lat_base_weight = 0;
+			rdev->lat_base_samples = 0;
+			rdev->lat_base_reads = 0;
+			rdev->lat_staleness = 0;
+			atomic_set(&rdev->probe_credit, 0);
+			WRITE_ONCE(rdev->latency_ewma_ns, 0);
+			/* measure every read until the rate is known */
+			WRITE_ONCE(rdev->lat_eff_shift, 0);
+			/* zeroed state must be visible before counters */
+			smp_store_release(&rdev->lat_stats, pcpu);
+			continue;	/* first window starts now */
+		}
+
+		for_each_possible_cpu(cpu) {
+			struct md_lat_pcpu *s = per_cpu_ptr(pcpu, cpu);
+			u64 s_sum, s_weight, s_samples, s_reads;
+			unsigned int seq;
+
+			do {
+				seq = u64_stats_fetch_begin(&s->sync);
+				s_sum = u64_stats_read(&s->sum_ns);
+				s_weight = u64_stats_read(&s->sum_weight);
+				s_samples = u64_stats_read(&s->samples);
+				s_reads = u64_stats_read(&s->reads);
+			} while (u64_stats_fetch_retry(&s->sync, seq));
+			sum += s_sum;
+			weight += s_weight;
+			samples += s_samples;
+			reads += s_reads;
+		}
+
+		dsamples = samples - rdev->lat_base_samples;
+		dreads = reads - rdev->lat_base_reads;
+		rdev->lat_base_reads = reads;
+		reads_this_fold += dreads;
+
+		/*
+		 * Publish next fold's sampling gate from this fold's
+		 * read rate: aim at ~MD_LAT_SAMPLE_TARGET samples per
+		 * fold so a leg's EWMA outruns the staleness horizon
+		 * at any IOPS. A leg with sparse reads measures every
+		 * read it gets - the stamping cost vanishes exactly
+		 * when the read rate makes it affordable.
+		 */
+		if (dreads < 2 * MD_LAT_SAMPLE_TARGET)
+			eff_shift = 0;
+		else
+			eff_shift = min_t(unsigned int,
+					  ilog2(dreads / MD_LAT_SAMPLE_TARGET),
+					  MD_LAT_SAMPLE_SHIFT);
+		if (READ_ONCE(rdev->lat_eff_shift) != eff_shift)
+			WRITE_ONCE(rdev->lat_eff_shift, eff_shift);
+
+		if (dsamples) {
+			u64 dsum = sum - rdev->lat_base_sum_ns;
+			u64 dweight = weight - rdev->lat_base_weight;
+			u64 mean;
+			u32 ewma = rdev->latency_ewma_ns;
+			s64 delta;
+
+			/*
+			 * Every sample records weight >= 1, so
+			 * dweight >= dsamples; enforce it anyway so a
+			 * torn/poisoned baseline cannot reach the
+			 * division as zero.
+			 */
+			if (dweight < dsamples)
+				dweight = dsamples;
+			mean = div64_u64(dsum, dweight);
+
+			/*
+			 * [1, CLAMP]: upper bound guards a torn/poisoned
+			 * baseline; lower bound keeps integer floor from
+			 * colliding with the ewma==0 "unmeasured"
+			 * sentinel.
+			 */
+			mean = clamp_t(u64, mean, 1, MD_LATENCY_CLAMP_NS);
+			if (!ewma) {
+				ewma = mean;
+			} else {
+				delta = (s64)mean - (s64)ewma;
+				ewma = (u32)((s64)ewma +
+					(delta >> MD_LAT_FOLD_ALPHA_SHIFT));
+			}
+			WRITE_ONCE(rdev->latency_ewma_ns, ewma);
+			rdev->lat_base_sum_ns = sum;
+			rdev->lat_base_weight = weight;
+			rdev->lat_base_samples = samples;
+			rdev->lat_staleness = 0;
+			/* organic samples: leg needs no probe */
+			atomic_set(&rdev->probe_credit, 0);
+		} else {
+			/*
+			 * No samples this fold. Past MD_LAT_STALE_FOLDS
+			 * the EWMA describes a leg the workload can no
+			 * longer measure (only large reads, an idle
+			 * spell, WriteMostly set since) - drop it to
+			 * the unmeasured sentinel so the picker falls
+			 * back to the stock tail instead of steering
+			 * on history; the next sample re-seeds the
+			 * EWMA directly.
+			 */
+			if (rdev->lat_staleness < UINT_MAX)
+				rdev->lat_staleness++;
+			if (rdev->lat_staleness >= MD_LAT_STALE_FOLDS &&
+			    rdev->latency_ewma_ns)
+				WRITE_ONCE(rdev->latency_ewma_ns, 0);
+			/*
+			 * Arm candidacy: Faulty/WriteMostly legs never
+			 * claim, and an already-armed leg needs no new
+			 * credit - neither may consume the global arm
+			 * budget. (Rotational legs and spares never
+			 * get here - the unmeasured-leg skip above
+			 * covers them.) Staleness is not reset on
+			 * arm (it must keep counting toward
+			 * invalidation while a credit sits unclaimed),
+			 * so the credit test is also what rotates
+			 * arming across multiple starved legs.
+			 */
+			if (!test_bit(Faulty, &rdev->flags) &&
+			    !test_bit(WriteMostly, &rdev->flags) &&
+			    !atomic_read(&rdev->probe_credit) &&
+			    rdev->lat_staleness > arm_staleness) {
+				arm_staleness = rdev->lat_staleness;
+				arm_rdev = rdev;
+			}
+		}
+	}
+
+	mddev->lat_fold_count++;
+	mddev->lat_reads_total += reads_this_fold;
+
+	/*
+	 * Probe arming: at most one leg per MD_LAT_PROBE_FOLDS folds
+	 * globally AND at least MD_LAT_PROBE_MIN_GAP array reads since
+	 * the last arm of any leg. All-rotational arrays never reach
+	 * here (the pre-pass above bailed out): credits would never
+	 * be claimed.
+	 */
+	if (arm_rdev &&
+	    arm_staleness >= MD_LAT_PROBE_FOLDS &&
+	    mddev->lat_fold_count - mddev->lat_last_arm_fold >=
+						MD_LAT_PROBE_FOLDS &&
+	    mddev->lat_reads_total - mddev->lat_reads_at_arm >=
+						MD_LAT_PROBE_MIN_GAP) {
+		mddev->lat_last_arm_fold = mddev->lat_fold_count;
+		mddev->lat_reads_at_arm = mddev->lat_reads_total;
+		atomic_set(&arm_rdev->probe_credit, 1);
+	}
+	rcu_read_unlock();
+
+	/* idle backoff keys on reads, not samples */
+	if (reads_this_fold) {
+		mddev->lat_fold_cur_ms = READ_ONCE(mddev->lat_fold_ms);
+	} else if (mddev->lat_fold_cur_ms >= MD_LAT_IDLE_CAP_MS) {
+		/*
+		 * The whole backoff ladder (~2.6 s at the default
+		 * cadence) passed without a single read on a measured
+		 * leg: stop ticking instead of waking idle CPUs at
+		 * 1 Hz forever. lat_fold_idle is what lets the
+		 * completion path kick us back at the cost of one
+		 * flag test per completion; the flag is set before
+		 * the park-side invalidation, so at worst the read
+		 * racing with this decision goes unkicked and the
+		 * next one resumes the worker.
+		 */
+		WRITE_ONCE(mddev->lat_fold_idle, true);
+		goto park;
+	} else {
+		mddev->lat_fold_cur_ms = min_t(unsigned int,
+					       mddev->lat_fold_cur_ms * 2,
+					       MD_LAT_IDLE_CAP_MS);
+	}
+
+	if (READ_ONCE(mddev->lat_fold_active))
+		queue_delayed_work(md_misc_wq, &mddev->lat_fold_work,
+				   msecs_to_jiffies(mddev->lat_fold_cur_ms));
+	return;
+
+park:
+	/*
+	 * A disabled, all-rotational or sustained-idle array must
+	 * cost zero timer wakeups, so stop self-requeueing;
+	 * md_latency_fold_kick restarts the loop when an edge may
+	 * have flipped back.
+	 * Invalidate the measurement state so a resume starts from
+	 * the unmeasured sentinel instead of steering on arbitrarily
+	 * old EWMAs (parked staleness counters cannot age them out).
+	 * Samples recorded since the last fold can still re-seed a
+	 * leg on the first resumed fold; the alpha-1/4 EWMA washes
+	 * those out within a few fold periods.
+	 */
+	rcu_read_lock();
+	rdev_for_each_rcu(rdev, mddev) {
+		if (!rdev->lat_stats)
+			continue;
+		WRITE_ONCE(rdev->latency_ewma_ns, 0);
+		WRITE_ONCE(rdev->lat_eff_shift, 0);
+		atomic_set(&rdev->probe_credit, 0);
+		rdev->lat_staleness = 0;
+	}
+	rcu_read_unlock();
+}
+
+/*
+ * Wake a parked fold worker. Safe against any worker state: queueing
+ * no-ops while the work is already pending, and lat_fold_active is
+ * cleared before the synchronous cancel in md_latency_fold_stop, so
+ * a racing kick cannot push the work past teardown (at worst one
+ * stray fold runs before the cancel - tolerated, the worker never
+ * touches conf).
+ */
+void md_latency_fold_kick(struct mddev *mddev)
+{
+	if (!READ_ONCE(mddev->lat_fold_active))
+		return;
+	queue_delayed_work(md_misc_wq, &mddev->lat_fold_work,
+			   msecs_to_jiffies(READ_ONCE(mddev->lat_fold_ms)));
+}
+EXPORT_SYMBOL_GPL(md_latency_fold_kick);
+
+void md_latency_fold_start(struct mddev *mddev)
+{
+	WRITE_ONCE(mddev->lat_fold_idle, false);
+	mddev->lat_fold_cur_ms = READ_ONCE(mddev->lat_fold_ms);
+	WRITE_ONCE(mddev->lat_fold_active, true);
+	queue_delayed_work(md_misc_wq, &mddev->lat_fold_work,
+			   msecs_to_jiffies(mddev->lat_fold_cur_ms));
+}
+EXPORT_SYMBOL_GPL(md_latency_fold_start);
+
+void md_latency_fold_stop(struct mddev *mddev)
+{
+	WRITE_ONCE(mddev->lat_fold_active, false);
+	cancel_delayed_work_sync(&mddev->lat_fold_work);
+}
+EXPORT_SYMBOL_GPL(md_latency_fold_stop);
+
 int mddev_init(struct mddev *mddev)
 {
 	int err = 0;
@@ -800,6 +1170,9 @@ int mddev_init(struct mddev *mddev)
 
 	INIT_WORK(&mddev->sync_work, md_start_sync);
 	INIT_WORK(&mddev->del_work, mddev_delayed_delete);
+	INIT_DELAYED_WORK(&mddev->lat_fold_work, md_latency_fold);
+	mddev->lat_fold_ms = MD_LAT_FOLD_MS;
+	mddev->lat_balance = READ_ONCE(lat_balance_default);
 
 	return 0;
 
@@ -817,6 +1190,14 @@ EXPORT_SYMBOL_GPL(mddev_init);
 
 void mddev_destroy(struct mddev *mddev)
 {
+	/*
+	 * Backstop for the latency fold worker: the raid1/raid10
+	 * personalities cancel it in their free(), but a run() error
+	 * path that never reaches pers->free must not leave a
+	 * self-requeueing work outliving the mddev. No-op when the
+	 * work was never queued.
+	 */
+	cancel_delayed_work_sync(&mddev->lat_fold_work);
 	bioset_exit(&mddev->bio_set);
 	bioset_exit(&mddev->sync_set);
 	bioset_exit(&mddev->io_clone_set);
@@ -1091,6 +1472,15 @@ void md_rdev_clear(struct md_rdev *rdev)
 		rdev->bb_page = NULL;
 	}
 	badblocks_exit(&rdev->badblocks);
+	free_percpu(rdev->lat_stats);
+	rdev->lat_stats = NULL;
+	/*
+	 * Don't leak a previous membership's EWMA, sampling gate or
+	 * an armed probe credit into a re-add.
+	 */
+	WRITE_ONCE(rdev->latency_ewma_ns, 0);
+	WRITE_ONCE(rdev->lat_eff_shift, 0);
+	atomic_set(&rdev->probe_credit, 0);
 }
 EXPORT_SYMBOL_GPL(md_rdev_clear);
 
@@ -3703,6 +4093,14 @@ ppl_size_store(struct md_rdev *rdev, const char *buf, size_t len)
 static struct rdev_sysfs_entry rdev_ppl_size =
 __ATTR(ppl_size, S_IRUGO|S_IWUSR, ppl_size_show, ppl_size_store);
 
+static ssize_t
+latency_ewma_show(struct md_rdev *rdev, char *page)
+{
+	return sprintf(page, "%u\n", READ_ONCE(rdev->latency_ewma_ns));
+}
+static struct rdev_sysfs_entry rdev_latency_ewma =
+__ATTR(latency_ewma_ns, 0444, latency_ewma_show, NULL);
+
 static struct attribute *rdev_default_attrs[] = {
 	&rdev_state.attr,
 	&rdev_errors.attr,
@@ -3715,6 +4113,7 @@ static struct attribute *rdev_default_attrs[] = {
 	&rdev_unack_bad_blocks.attr,
 	&rdev_ppl_sector.attr,
 	&rdev_ppl_size.attr,
+	&rdev_latency_ewma.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(rdev_default);
@@ -6039,6 +6438,53 @@ unlock:
 static struct md_sysfs_entry md_logical_block_size =
 __ATTR(logical_block_size, 0644, lbs_show, lbs_store);
 
+static ssize_t
+latency_balance_show(struct mddev *mddev, char *page)
+{
+	return sprintf(page, "%d\n", READ_ONCE(mddev->lat_balance) ? 1 : 0);
+}
+
+static ssize_t
+latency_balance_store(struct mddev *mddev, const char *buf, size_t len)
+{
+	bool v;
+	int err = kstrtobool(buf, &v);
+
+	if (err)
+		return err;
+	WRITE_ONCE(mddev->lat_balance, v);
+	/* the worker parks itself while disabled - wake it on enable */
+	if (v)
+		md_latency_fold_kick(mddev);
+	return len;
+}
+
+static struct md_sysfs_entry md_latency_balance =
+__ATTR(latency_balance, S_IRUGO|S_IWUSR, latency_balance_show, latency_balance_store);
+
+static ssize_t
+latency_fold_ms_show(struct mddev *mddev, char *page)
+{
+	return sprintf(page, "%u\n", READ_ONCE(mddev->lat_fold_ms));
+}
+
+static ssize_t
+latency_fold_ms_store(struct mddev *mddev, const char *buf, size_t len)
+{
+	unsigned int v;
+	int err = kstrtouint(buf, 10, &v);
+
+	if (err)
+		return err;
+	if (v < 5 || v > 1000)
+		return -EINVAL;
+	WRITE_ONCE(mddev->lat_fold_ms, v);
+	return len;
+}
+
+static struct md_sysfs_entry md_latency_fold_ms =
+__ATTR(latency_fold_ms, S_IRUGO|S_IWUSR, latency_fold_ms_show, latency_fold_ms_store);
+
 static struct attribute *md_default_attrs[] = {
 	&md_level.attr,
 	&md_new_level.attr,
@@ -6061,6 +6507,8 @@ static struct attribute *md_default_attrs[] = {
 	&md_fail_last_dev.attr,
 	&md_serialize_policy.attr,
 	&md_logical_block_size.attr,
+	&md_latency_balance.attr,
+	&md_latency_fold_ms.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(md_default);
@@ -11012,6 +11460,7 @@ module_param_call(new_array, add_named_array, NULL, NULL, S_IWUSR);
 module_param(create_on_open, bool, S_IRUSR|S_IWUSR);
 module_param(legacy_async_del_gendisk, bool, 0600);
 module_param(check_new_feature, bool, 0600);
+module_param_named(latency_balance, lat_balance_default, bool, 0644);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("MD RAID framework");
