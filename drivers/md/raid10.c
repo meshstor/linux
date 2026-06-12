@@ -400,6 +400,21 @@ static void raid10_end_read_request(struct bio *bio)
 		 * user-side. So if something waits for IO, then it will
 		 * wait for the 'master' bio.
 		 */
+		if (READ_ONCE(conf->mddev->lat_balance) &&
+		    READ_ONCE(conf->mddev->lat_nonrot)) {
+			/*
+			 * First read after an idle park resumes the
+			 * fold worker. Only measured legs kick: an
+			 * unmeasured (rotational) leg's traffic gives
+			 * the worker nothing to fold, and kicking on
+			 * it would just churn park/unpark.
+			 */
+			if (unlikely(READ_ONCE(conf->mddev->lat_fold_idle)) &&
+			    READ_ONCE(rdev->lat_stats))
+				md_latency_fold_kick(conf->mddev);
+			md_lat_read_done(rdev, r10_bio->submit_ns,
+					 r10_bio->lat_weight);
+		}
 		set_bit(R10BIO_Uptodate, &r10_bio->state);
 	} else if (!raid1_should_handle_error(bio)) {
 		uptodate = 1;
@@ -730,11 +745,21 @@ static struct md_rdev *read_balance(struct r10conf *conf,
 	int best_good_sectors;
 	sector_t new_distance, best_dist;
 	struct md_rdev *best_dist_rdev, *best_pending_rdev, *rdev = NULL;
+	struct md_rdev *best_cost_rdev = NULL, *probe_rdev = NULL;
 	int do_balance;
 	int best_dist_slot, best_pending_slot;
+	int best_cost_slot = -1, probe_slot = -1;
+	unsigned int probe_pending = 0;
+	u64 best_cost = U64_MAX, runner_up_cost = U64_MAX;
 	bool has_nonrot_disk = false;
 	unsigned int min_pending;
 	struct geom *geo = &conf->geo;
+	/*
+	 * Kill switch: skip the candidate cost tracking here and the
+	 * latency-aware pick below (which also needs do_balance and a
+	 * non-rotational leg).
+	 */
+	bool lat_enabled = READ_ONCE(conf->mddev->lat_balance);
 
 	raid10_find_phys(conf, r10_bio);
 	best_dist_slot = -1;
@@ -815,6 +840,30 @@ static struct md_rdev *read_balance(struct r10conf *conf,
 			best_pending_rdev = rdev;
 		}
 
+		if (lat_enabled) {
+			u32 ewma = READ_ONCE(rdev->latency_ewma_ns);
+
+			if (ewma) {
+				u64 cost = (u64)ewma * (pending + 1);
+
+				if (cost < best_cost) {
+					runner_up_cost = best_cost;
+					best_cost = cost;
+					best_cost_slot = slot;
+					best_cost_rdev = rdev;
+				} else if (cost < runner_up_cost) {
+					runner_up_cost = cost;
+				}
+			}
+
+			if (probe_slot < 0 &&
+			    atomic_read(&rdev->probe_credit)) {
+				probe_slot = slot;
+				probe_rdev = rdev;
+				probe_pending = pending;
+			}
+		}
+
 		if (best_dist_slot >= 0)
 			/* At least 2 disks to choose from so failfast is OK */
 			set_bit(R10BIO_FailFast, &r10_bio->state);
@@ -839,7 +888,44 @@ static struct md_rdev *read_balance(struct r10conf *conf,
 		}
 	}
 	if (slot >= conf->copies) {
-		if (has_nonrot_disk) {
+		bool lat_on = lat_enabled && do_balance && has_nonrot_disk;
+
+		/*
+		 * Latency-aware path. Probe claim first: a winning
+		 * claim decides the read outright - probes are what
+		 * re-seed a starved leg's EWMA so the SED pick below
+		 * can re-engage. The claim is refused while the
+		 * probed leg's queue is far above the least-loaded
+		 * leg's: a probe behind a deep backlog inherits the
+		 * whole backlog's latency and re-arms every few folds
+		 * while the leg stays slow - an unbounded p99.9 tail
+		 * bought for no information the pending term does not
+		 * already encode. The SED pick requires two measured
+		 * legs (a sole EWMA says nothing about which leg is
+		 * faster - steering on it would pin all reads to
+		 * whichever leg happens to be measured) plus 12.5%
+		 * hysteresis, and otherwise falls back to the
+		 * stock tail. Reshape source reads, large reads and
+		 * guard-refused reads must not claim - every test
+		 * sits before the xchg, so the credit stays armed
+		 * for the next eligible read.
+		 */
+		if (lat_on && probe_slot >= 0 &&
+		    !test_bit(R10BIO_IsReshape, &r10_bio->state) &&
+		    r10_bio->sectors <= MD_LAT_SIZE_CAP_SECTORS &&
+		    probe_pending <= MD_LAT_PROBE_PEND_MULT * min_pending +
+				     MD_LAT_PROBE_PEND_SLACK &&
+		    atomic_xchg(&probe_rdev->probe_credit, 0)) {
+			set_bit(R10BIO_Probe, &r10_bio->state);
+			slot = probe_slot;
+			rdev = probe_rdev;
+		} else if (lat_on && best_cost_slot >= 0 &&
+			   runner_up_cost != U64_MAX &&
+			   runner_up_cost - best_cost >=
+						(best_cost >> 3)) {
+			slot = best_cost_slot;
+			rdev = best_cost_rdev;
+		} else if (has_nonrot_disk) {
 			slot = best_pending_slot;
 			rdev = best_pending_rdev;
 		} else {
@@ -1244,9 +1330,25 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
 	        read_bio->bi_opf |= MD_FAILFAST;
 	read_bio->bi_private = r10_bio;
 	mddev_trace_remap(mddev, read_bio, r10_bio->sector);
+	if (READ_ONCE(mddev->lat_balance) && READ_ONCE(mddev->lat_nonrot) &&
+	    (test_bit(R10BIO_Probe, &r10_bio->state) ||
+	     (r10_bio->sectors <= MD_LAT_SIZE_CAP_SECTORS &&
+	      md_lat_sample_gate(rdev)))) {
+		r10_bio->lat_weight = (u32)atomic_read(&rdev->nr_pending);
+		r10_bio->submit_ns = ktime_get_ns();
+	} else {
+		r10_bio->submit_ns = 0;
+	}
 	submit_bio_noacct(read_bio);
 	return;
 err_handle:
+	/*
+	 * A claimed probe credit must not be destroyed without ever
+	 * issuing the probe read - re-arm so the starved leg's
+	 * rediscovery is not delayed by a wasted arm cycle.
+	 */
+	if (test_bit(R10BIO_Probe, &r10_bio->state))
+		atomic_set(&rdev->probe_credit, 1);
 	atomic_dec(&rdev->nr_pending);
 	raid_end_bio_io(r10_bio);
 }
@@ -2182,6 +2284,12 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		WRITE_ONCE(p->replacement, rdev);
 	}
 
+	/*
+	 * A hot-added non-rotational leg must wake a fold worker parked
+	 * on the all-rotational verdict; no-op while it is running.
+	 */
+	if (!err)
+		md_latency_fold_kick(mddev);
 	print_conf(conf);
 	return err;
 }
@@ -4133,6 +4241,7 @@ static int raid10_run(struct mddev *mddev)
 		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	}
 
+	md_latency_fold_start(mddev);
 	return 0;
 
 out_free_conf:
@@ -4145,6 +4254,7 @@ out:
 
 static void raid10_free(struct mddev *mddev, void *priv)
 {
+	md_latency_fold_stop(mddev);
 	raid10_free_conf(priv);
 }
 

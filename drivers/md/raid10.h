@@ -130,6 +130,14 @@ struct r10bio {
 
 	struct list_head	retry_list;
 	/*
+	 * Latency measurement (normal read path only; reshape reads
+	 * are built in reshape_request and complete via
+	 * end_reshape_read, so they never touch these). Stored
+	 * unconditionally in raid10_read_request; 0 = not measured.
+	 */
+	u64			submit_ns;
+	u32			lat_weight;
+	/*
 	 * if the IO is in WRITE direction, then multiple bios are used,
 	 * one for each copy.
 	 * When resyncing we also use one for each copy.
@@ -175,5 +183,6 @@ enum r10bio_state {
 /* failfast devices did receive failfast requests. */
 	R10BIO_FailFast,
 	R10BIO_Discard,
+	R10BIO_Probe,		/* read steered by a probe credit; always stamped */
 };
 #endif
