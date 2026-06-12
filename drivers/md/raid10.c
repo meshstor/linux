@@ -1009,8 +1009,11 @@ static void flush_pending_writes(struct r10conf *conf)
  *    lower_barrier when the particular background IO completes.
  * raise_barrier() returns -EINTR if MD_RECOVERY_INTR was set while it
  *    waited, so an aborted resync/recovery/reshape cannot sit
- *    uninterruptibly behind a frozen array or a pinned bucket; the
- *    caller must unwind without calling lower_barrier().
+ *    uninterruptibly behind a frozen array or a pinned bucket, and
+ *    -EBUSY if a forced raise would have to wait out a freeze_array()
+ *    that is in turn waiting for this thread's barriers.  For either
+ *    non-zero return the caller must unwind without calling
+ *    lower_barrier().
  */
 
 static int raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
@@ -1056,17 +1059,26 @@ static int raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
 	 * barrier counted in nr_sync_pending, which freeze_array() now waits
 	 * to drain, so blocking the forced raise would deadlock the freeze.
 	 *
+	 * A forced raise must not sit out a freeze waiting on nr_pending[idx]
+	 * either: that pending I/O can be a failed request queued for raid10d
+	 * retry, while raid10d itself sits in freeze_array() waiting for this
+	 * thread's nr_sync_pending to drain -- a cycle nothing breaks (the
+	 * caller's built-but-unsubmitted r10bios can only be submitted once
+	 * this raise returns).  Back off with -EBUSY instead: the caller ends
+	 * the batch early and submits what is already built, the freeze gets
+	 * its drain, and the next window's non-forced raise parks at the gate
+	 * above until unfreeze_array().
+	 *
 	 * Bail out if MD_RECOVERY_INTR gets set while we wait (raid1's
-	 * pattern): a forced raise can otherwise deadlock against a normal
-	 * I/O that is queued for raid10d retry (holding nr_pending[idx])
-	 * while raid10d itself sits in freeze_array() waiting for this
-	 * thread's nr_sync_pending to drain.  The -EINTR return lets an
-	 * administrative abort (stop_sync_thread(), array stop,
-	 * 'echo idle > sync_action') break that cycle.
+	 * pattern), so an administrative abort (stop_sync_thread(), array
+	 * stop, 'echo idle > sync_action') cannot get stuck behind a long
+	 * freeze (e.g. a quiesce) on this wait either.
 	 */
 	wait_event_barrier(conf, (!atomic_read(&conf->nr_pending[idx]) &&
 				  atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH &&
 				  (force || !conf->array_freeze_pending)) ||
+				 (force && conf->array_freeze_pending &&
+				  atomic_read(&conf->nr_pending[idx])) ||
 				 test_bit(MD_RECOVERY_INTR, &conf->mddev->recovery));
 
 	if (test_bit(MD_RECOVERY_INTR, &conf->mddev->recovery)) {
@@ -1074,6 +1086,14 @@ static int raise_barrier(struct r10conf *conf, sector_t sector_nr, int force)
 		write_sequnlock_irq(&conf->resync_lock);
 		wake_up(&conf->wait_barrier);
 		return -EINTR;
+	}
+
+	if (force && conf->array_freeze_pending &&
+	    atomic_read(&conf->nr_pending[idx])) {
+		atomic_dec(&conf->barrier[idx]);
+		write_sequnlock_irq(&conf->resync_lock);
+		wake_up(&conf->wait_barrier);
+		return -EBUSY;
 	}
 
 	atomic_inc(&conf->nr_sync_pending);
@@ -1253,7 +1273,11 @@ static void freeze_array(struct r10conf *conf, int extra)
 	 * r10bios (nr_sync_pending) must drain.  An in-progress
 	 * recovery/reshape batch can still extend itself via 'force'
 	 * raises while frozen, but those barriers are counted here too,
-	 * so the freeze waits for the whole batch to finish.
+	 * so the freeze waits for the whole batch to finish.  A forced
+	 * raise that would have to wait on pending normal I/O backs off
+	 * with -EBUSY instead of extending the batch, so the freeze
+	 * cannot deadlock against an I/O that needs raid10d (which may
+	 * be the caller here) to drain.
 	 *
 	 * array_freeze_pending is kept set until the matching
 	 * unfreeze_array() call so the entire frozen interval blocks
@@ -1283,6 +1307,13 @@ static void freeze_array(struct r10conf *conf, int extra)
 	 * left to deliver.
 	 */
 	smp_mb();
+	/*
+	 * A forced raise_barrier() already asleep on nr_pending[idx] must
+	 * re-evaluate its backoff condition against the new freeze: in the
+	 * state this freeze may otherwise wait out forever, nothing
+	 * completes and nothing else delivers a wakeup.
+	 */
+	wake_up(&conf->wait_barrier);
 	wait_event_barrier_cmd(conf, get_unqueued_pending(conf) == extra,
 			       flush_pending_writes(conf));
 	write_sequnlock_irq(&conf->resync_lock);
@@ -3690,11 +3721,16 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
 			r10_bio->state = 0;
 			if (raise_barrier(conf, sect, rb2 != NULL)) {
 				/*
-				 * Interrupted: stop extending the batch.  The
-				 * raise was undone, so free the r10bio raw
-				 * (no barrier to lower) and fall through to
-				 * submit what is already built; md_do_sync()
-				 * sees MD_RECOVERY_INTR and winds down.
+				 * Interrupted (-EINTR) or backing off from a
+				 * pending freeze_array() (-EBUSY): stop
+				 * extending the batch.  The raise was undone,
+				 * so free the r10bio raw (no barrier to
+				 * lower) and fall through to submit what is
+				 * already built.  On -EINTR md_do_sync()
+				 * sees MD_RECOVERY_INTR and winds down; on
+				 * -EBUSY the next window's first raise parks
+				 * at the freeze gate and recovery resumes
+				 * after unfreeze_array().
 				 */
 				mempool_free(r10_bio, &conf->r10buf_pool);
 				if (mrdev)
