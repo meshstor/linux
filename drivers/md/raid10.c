@@ -1106,6 +1106,15 @@ static void lower_barrier(struct r10conf *conf, sector_t sector_nr)
 	unsigned long flags;
 	int idx = sector_to_idx(sector_nr);
 
+	/*
+	 * A lower without a matching raise drives nr_sync_pending negative
+	 * (barrier[idx] and nr_sync_pending move in lockstep on every
+	 * successful raise), which lets get_unqueued_pending() undershoot and
+	 * freeze_array() return while sync I/O is still in flight.  Catch the
+	 * imbalance at its source, as raid1's lower_barrier() does.
+	 */
+	BUG_ON(atomic_read(&conf->barrier[idx]) <= 0);
+
 	write_seqlock_irqsave(&conf->resync_lock, flags);
 	atomic_dec(&conf->barrier[idx]);
 	atomic_dec(&conf->nr_sync_pending);
@@ -1323,6 +1332,7 @@ static void unfreeze_array(struct r10conf *conf)
 {
 	/* reverse the effect of the freeze */
 	write_seqlock_irq(&conf->resync_lock);
+	WARN_ON_ONCE(conf->array_freeze_pending <= 0);
 	conf->array_freeze_pending--;
 	write_sequnlock_irq(&conf->resync_lock);
 	wake_up(&conf->wait_barrier);
