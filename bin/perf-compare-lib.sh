@@ -357,6 +357,37 @@ unload_ms_modules() {
     done
 }
 
+# Remove any meshstor-ms .ko physically present in the RUNNING kernel's module
+# tree, then refresh depmod. This is the cleanup `dkms remove` cannot do:
+# dkms only deletes files it still tracks, so a .ko left by a prior install
+# survives in two situations that both break the next run —
+#   1. a higher-versioned ms_mod from an earlier deploy-branch: dkms install's
+#      per-module "is it newer?" guard refuses to overwrite it while the
+#      unversioned raid{1,10}_ms ARE overwritten, yielding a mismatched set
+#      that fails to modprobe ("disagrees about version of symbol …");
+#   2. a "Differences between built and installed modules" state where the
+#      on-disk .ko no longer matches what dkms believes it installed.
+# Purging the ghost .ko guarantees the next `dkms install` lands a coherent
+# module set. Idempotent; only runs depmod if it actually removed something.
+purge_ms_kmods() {
+    local kver moddir removed=0 m f
+    kver="$(uname -r)"
+    moddir="/lib/modules/$kver"
+    for m in ms_mod raid1_ms raid10_ms; do
+        for f in "$moddir"/extra/"$m".ko* \
+                 "$moddir"/updates/dkms/"$m".ko* \
+                 "$moddir"/weak-updates/"$m".ko* \
+                 "$moddir"/weak-updates/*/"$m".ko*; do
+            [[ -e "$f" ]] || continue
+            rm -f "$f" && removed=1
+        done
+    done
+    if (( removed )); then
+        log "purged stale ms_* .ko from $moddir; depmod $kver"
+        depmod "$kver" 2>/dev/null || true
+    fi
+}
+
 dkms_remove_safe() {
     local pkg="$1"
     # dkms status formats:
@@ -385,6 +416,13 @@ remove_existing_pkg() {
     else
         log "no existing system meshstor-ms found"
     fi
+    # Sweep ghost .ko unconditionally: a stale module set can be present even
+    # when the dkms registry disagrees (the registry pointed at one version
+    # while the on-disk ms_mod was a higher-versioned leftover) — the exact
+    # state that makes every variant fail with LOAD_FAILED. Removing the
+    # dkms-source for SYSTEM_DKMS_VER is left intact, so restore_system can
+    # rebuild it from /usr/src at the end.
+    purge_ms_kmods
 }
 
 install_variant() {
@@ -398,11 +436,16 @@ install_variant() {
     # tarball would otherwise be masked by dkms install silently reusing a
     # stale /usr/src/<pkg>-<ver>/ tree from a prior run — defeating the
     # auto-heal path in run_variant.
-    if ! dkms ldtarball "$tarball" >/dev/null; then
+    if ! dkms ldtarball "$tarball" --force >/dev/null; then
         return 1
     fi
     log "dkms install meshstor-ms/$ver"
-    dkms install "meshstor-ms/$ver" >/dev/null
+    # --force: overwrite whatever .ko are already in the kernel tree regardless
+    # of version. Without it, a higher-versioned leftover ms_mod is kept by
+    # dkms's "is it newer?" guard while the unversioned raid{1,10}_ms get
+    # overwritten — a mismatched set that fails to modprobe. remove_existing_pkg
+    # already purges such ghosts up front; --force is the second line of defense.
+    dkms install "meshstor-ms/$ver" --force >/dev/null
 }
 
 load_ms_modules() {
@@ -418,14 +461,16 @@ restore_system() {
     for label in "${VARIANT_LABELS[@]}"; do
         dkms_remove_safe "meshstor-ms/${VARIANT_VER[$label]}"
     done
+    # Clear any ghost .ko the per-variant removals could not (foreign/mismatched
+    # files dkms won't touch) so the system pkg reinstalls into a clean tree.
+    purge_ms_kmods
     if [[ -n "${SYSTEM_DKMS_VER:-}" ]]; then
-        if dkms status | grep -q "^meshstor-ms/$SYSTEM_DKMS_VER,"; then
-            log "system pkg already installed, skipping reinstall"
-        else
-            log "dkms install meshstor-ms/$SYSTEM_DKMS_VER"
-            dkms install "meshstor-ms/$SYSTEM_DKMS_VER" >/dev/null 2>&1 \
-                || warn "dkms install meshstor-ms/$SYSTEM_DKMS_VER failed; manual restore needed"
-        fi
+        # Always reinstall with --force: purge_ms_kmods just deleted the built
+        # .ko, so even if the dkms registry still lists this version as
+        # "installed" the kernel tree is now empty and needs a real rebuild.
+        log "dkms install meshstor-ms/$SYSTEM_DKMS_VER"
+        dkms install "meshstor-ms/$SYSTEM_DKMS_VER" --force >/dev/null 2>&1 \
+            || warn "dkms install meshstor-ms/$SYSTEM_DKMS_VER failed; manual restore needed"
         load_ms_modules || warn "modprobe ms_mod failed; manual restore needed"
     fi
 }

@@ -212,6 +212,22 @@ if [ -d /var/lib/dkms/meshstor-ms ]; then
 fi
 # Clear any leftover source trees so ldtarball re-extracts cleanly.
 rm -rf /usr/src/meshstor-ms-* 2>/dev/null || true
+# Sweep ghost .ko that `dkms remove` cannot delete (files it no longer tracks:
+# a higher-versioned leftover ms_mod, or a built/installed mismatch). Left in
+# place they make `dkms install` skip ms_mod via its "is it newer?" guard while
+# overwriting the unversioned raid{1,10}_ms — a mismatched set that fails to
+# modprobe. --force below also covers this, but purging keeps the tree honest.
+for kd in /lib/modules/*/; do
+    rmd=
+    for m in ms_mod raid1_ms raid10_ms; do
+        for f in "$kd"extra/"$m".ko* "$kd"updates/dkms/"$m".ko* \
+                 "$kd"weak-updates/"$m".ko* "$kd"weak-updates/*/"$m".ko*; do
+            [ -e "$f" ] || continue
+            rm -f "$f"; rmd=1
+        done
+    done
+    if [ -n "$rmd" ]; then echo "   purged stale ms_* .ko from $kd"; depmod "$(basename "$kd")" 2>/dev/null || true; fi
+done
 
 echo ">> dkms ldtarball + install meshstor-ms/$PKG_VERSION"
 dkms ldtarball --archive="$PKG_TARBALL" --force
@@ -251,6 +267,21 @@ if [ -d /var/lib/dkms/meshstor-ms ]; then
     done
 fi
 rm -rf /usr/src/meshstor-ms-* 2>/dev/null || true
+# `dkms remove` only deletes .ko it still tracks, so a version-guard skip or a
+# built/installed mismatch strands ms_* .ko in the kernel tree — and a stranded
+# higher-versioned ms_mod then blocks/mismatches every future install. A true
+# return-to-no-meshstor cleanup must delete them outright across every kernel.
+for kd in /lib/modules/*/; do
+    rmd=
+    for m in ms_mod raid1_ms raid10_ms; do
+        for f in "$kd"extra/"$m".ko* "$kd"updates/dkms/"$m".ko* \
+                 "$kd"weak-updates/"$m".ko* "$kd"weak-updates/*/"$m".ko*; do
+            [ -e "$f" ] || continue
+            rm -f "$f"; rmd=1
+        done
+    done
+    if [ -n "$rmd" ]; then echo "   purged stale ms_* .ko from $kd"; depmod "$(basename "$kd")" 2>/dev/null || true; fi
+done
 echo ">> purged. ms_mod loaded=$([ -d /sys/module/ms_mod ] && echo yes || echo no)"
 EOS
 
