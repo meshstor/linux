@@ -1,6 +1,6 @@
 --- a/md.c
 +++ b/md.c
-@@ -8237,6 +8237,15 @@
+@@ -8276,6 +8276,15 @@
  	return 0;
  }
  
@@ -16,7 +16,7 @@
  static inline int md_ioctl_valid(unsigned int cmd)
  {
  	switch (cmd) {
-@@ -8625,7 +8634,11 @@
+@@ -8664,7 +8673,11 @@
  #ifdef CONFIG_COMPAT
  	.compat_ioctl	= md_compat_ioctl,
  #endif

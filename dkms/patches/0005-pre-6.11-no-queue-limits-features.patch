@@ -15,7 +15,7 @@ when the running kernel's <linux/blkdev.h> defines `features` inside
 
 --- a/md.c
 +++ b/md.c
-@@ -6286,8 +6286,10 @@
+@@ -6325,8 +6325,10 @@
  void md_init_stacking_limits(struct queue_limits *lim)
  {
  	blk_set_stacking_limits(lim);
@@ -28,9 +28,9 @@ when the running kernel's <linux/blkdev.h> defines `features` inside
  
 --- a/raid10.c
 +++ b/raid10.c
-@@ -3942,7 +3942,9 @@
- 	lim.io_min = mddev->chunk_sectors << 9;
- 	lim.chunk_sectors = mddev->chunk_sectors;
+@@ -4258,7 +4258,9 @@
+ 	lim.io_min = chunk_sectors << 9;
+ 	lim.chunk_sectors = chunk_sectors;
  	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
 +#ifdef HAVE_QUEUE_LIMITS_FEATURES
  	lim.features |= BLK_FEAT_ATOMIC_WRITES;
@@ -40,7 +40,7 @@ when the running kernel's <linux/blkdev.h> defines `features` inside
  		return err;
 --- a/raid1.c
 +++ b/raid1.c
-@@ -3209,7 +3209,9 @@
+@@ -3190,7 +3190,9 @@
  	lim.max_hw_wzeroes_unmap_sectors = 0;
  #endif
  	lim.logical_block_size = mddev->logical_block_size;
