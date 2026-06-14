@@ -14,7 +14,7 @@ parameter is already const.
 
 --- a/md.c
 +++ b/md.c
-@@ -10692,7 +10692,9 @@
+@@ -10745,7 +10745,9 @@
  	mdp_major = ret;
  
  	register_reboot_notifier(&md_notifier);

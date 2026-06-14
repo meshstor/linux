@@ -1,6 +1,6 @@
 --- a/raid10.c
 +++ b/raid10.c
-@@ -3935,7 +3935,9 @@
+@@ -4251,7 +4251,9 @@
  
  	md_init_stacking_limits(&lim);
  	lim.max_write_zeroes_sectors = 0;
@@ -8,11 +8,11 @@
  	lim.max_hw_wzeroes_unmap_sectors = 0;
 +#endif
  	lim.logical_block_size = mddev->logical_block_size;
- 	lim.io_min = mddev->chunk_sectors << 9;
- 	lim.chunk_sectors = mddev->chunk_sectors;
+ 	lim.io_min = chunk_sectors << 9;
+ 	lim.chunk_sectors = chunk_sectors;
 --- a/raid1.c
 +++ b/raid1.c
-@@ -3205,7 +3205,9 @@
+@@ -3186,7 +3186,9 @@
  
  	md_init_stacking_limits(&lim);
  	lim.max_write_zeroes_sectors = 0;
