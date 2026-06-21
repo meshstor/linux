@@ -413,36 +413,90 @@ dkms_remove_safe() {
     fi
 }
 
+# Is $1 one of the ephemeral perf-compare variant versions (0.1.0-baseline,
+# 0.1.0-pba, …)? Lets us tell a real deployed system meshstor-ms (e.g. 0.1.0)
+# apart from a variant package a prior aborted run left behind.
+# VARIANT_LABELS/VARIANT_VER are defined by the calling tool (perf-compare /
+# perf-bitmap-compare) and sourced into this shell; guard for the unset case.
+is_variant_version() {
+    local v="$1" label
+    for label in "${VARIANT_LABELS[@]-}"; do
+        [[ -n "$label" ]] || continue
+        [[ "${VARIANT_VER[$label]-}" == "$v" ]] && return 0
+    done
+    return 1
+}
+
+# Fully purge an EPHEMERAL meshstor-ms variant version: `dkms remove` (best
+# effort) then a force-clear of the registry dir. `dkms remove … --all` deletes
+# the built .ko but leaves /var/lib/dkms/<m>/<v> in place (source link + build
+# dir), and a lingering dir makes the next `dkms ldtarball` die with
+#   Error! DKMS tree already contains: <m>/<v>
+# (`ldtarball --force` does NOT bypass that check) — the failure that strands
+# every repeat perf-compare run. Use ONLY for throwaway variant versions, never
+# the saved system version: restore_system rebuilds that from its source.
+purge_dkms_version() {
+    local m="$1" v="$2"
+    [[ -n "$m" && -n "$v" ]] || { warn "purge_dkms_version: empty module/version"; return 0; }
+    dkms_remove_safe "$m/$v"
+    if [[ -e "/var/lib/dkms/$m/$v" || -L "/var/lib/dkms/$m/$v" ]]; then
+        warn "force-clearing leftover dkms registry dir /var/lib/dkms/$m/$v"
+        rm -rf "/var/lib/dkms/${m:?}/${v:?}"
+    fi
+    # Drop any now-dangling kernel-<ver> originals symlink that pointed into the
+    # version we just removed (dkms recreates the live one on the next install).
+    [[ -d "/var/lib/dkms/$m" ]] && find "/var/lib/dkms/$m" -maxdepth 1 -xtype l -delete 2>/dev/null || true
+}
+
 remove_existing_pkg() {
-    # Split on /, , and : so the version parses cleanly from both `installed` (",")
-    # and `added` (":") output forms.
-    #
-    # Don't use `exit` in awk: with `set -o pipefail`, awk closing stdin on
-    # first match causes `dkms status` to die with SIGPIPE, the pipeline
-    # returns 141, and `set -e` then aborts the whole script before
-    # remove_existing_pkg even finishes. Consume all input and emit at END.
-    SYSTEM_DKMS_VER="$(dkms status | awk -F'[/,:]' '/^meshstor-ms\// && !v{gsub(/ /,"",$2); v=$2} END{print v}')"
-    if [[ -n "$SYSTEM_DKMS_VER" ]]; then
-        log "saving system meshstor-ms version: $SYSTEM_DKMS_VER (will restore at end)"
+    # Collect every installed/added meshstor-ms version. Split on /, , and : so
+    # the version parses from both `installed` ("meshstor-ms/0.1.0, k, a: installed")
+    # and `added` ("meshstor-ms/0.1.0: added") forms. awk consumes all input
+    # (no early exit) so `set -o pipefail` can't trip on a SIGPIPE'd dkms status.
+    local -a vers=()
+    mapfile -t vers < <(dkms status | awk -F'[/,:]' '/^meshstor-ms\//{gsub(/ /,"",$2); print $2}' | sort -u)
+    SYSTEM_DKMS_VER=""
+    if (( ${#vers[@]} )); then
         unload_ms_modules
-        dkms_remove_safe "meshstor-ms/$SYSTEM_DKMS_VER"
+        local v
+        for v in "${vers[@]}"; do
+            [[ -n "$v" ]] || continue
+            if is_variant_version "$v"; then
+                # A perf variant version installed as the "system" package is the
+                # leftover of a run that aborted before restore (or whose restore
+                # reinstalled a variant). It is NOT a real deployment — saving it
+                # would perpetuate it forever AND make this run's same-versioned
+                # variant collide in the dkms tree. Purge it, don't restore it.
+                warn "stale perf variant installed as system: meshstor-ms/$v — purging, not restoring"
+                purge_dkms_version "meshstor-ms" "$v"
+            elif [[ -z "$SYSTEM_DKMS_VER" ]]; then
+                SYSTEM_DKMS_VER="$v"
+                log "saving system meshstor-ms version: $v (will restore at end)"
+                # Gentle remove only: the dkms source for $v is left intact so
+                # restore_system can rebuild it from /usr/src at the end.
+                dkms_remove_safe "meshstor-ms/$v"
+            else
+                warn "extra system meshstor-ms/$v present; removing (only $SYSTEM_DKMS_VER restored)"
+                dkms_remove_safe "meshstor-ms/$v"
+            fi
+        done
     else
         log "no existing system meshstor-ms found"
     fi
     # Sweep ghost .ko unconditionally: a stale module set can be present even
-    # when the dkms registry disagrees (the registry pointed at one version
-    # while the on-disk ms_mod was a higher-versioned leftover) — the exact
-    # state that makes every variant fail with LOAD_FAILED. Removing the
-    # dkms-source for SYSTEM_DKMS_VER is left intact, so restore_system can
-    # rebuild it from /usr/src at the end.
+    # when the dkms registry disagrees (registry on one version, on-disk ms_mod
+    # a higher-versioned leftover) — the exact state that fails every variant
+    # with LOAD_FAILED.
     purge_ms_kmods
 }
 
 install_variant() {
     local label="$1" ver="$2" tarball="$3"
-    # Clear any stale entry for this slot — a prior failed run may have left
-    # the version in `added` state, which makes ldtarball below refuse.
-    dkms_remove_safe "meshstor-ms/$ver"
+    # Guarantee a clean dkms slot for $ver before ldtarball. A prior run (or the
+    # saved system package sharing this version) leaves /var/lib/dkms/meshstor-ms/$ver
+    # behind even after `dkms remove`, and `dkms ldtarball` then dies with
+    # "DKMS tree already contains" — so force-clear it, don't just `dkms remove`.
+    purge_dkms_version "meshstor-ms" "$ver"
     log "dkms ldtarball $tarball"
     # Explicitly propagate ldtarball failure: install_variant is invoked from
     # `if ! install_variant ...` (which suppresses set -e), and a corrupt
@@ -472,7 +526,7 @@ restore_system() {
     log "restore: cleaning up per-variant pkgs and reinstalling system meshstor-ms"
     unload_ms_modules || true
     for label in "${VARIANT_LABELS[@]}"; do
-        dkms_remove_safe "meshstor-ms/${VARIANT_VER[$label]}"
+        purge_dkms_version "meshstor-ms" "${VARIANT_VER[$label]}"
     done
     # Clear any ghost .ko the per-variant removals could not (foreign/mismatched
     # files dkms won't touch) so the system pkg reinstalls into a clean tree.
