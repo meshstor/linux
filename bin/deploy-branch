@@ -222,11 +222,21 @@ for kd in /lib/modules/*/; do
     for m in ms_mod raid1_ms raid10_ms; do
         for f in "$kd"extra/"$m".ko* "$kd"updates/dkms/"$m".ko* \
                  "$kd"weak-updates/"$m".ko* "$kd"weak-updates/*/"$m".ko*; do
-            [ -e "$f" ] || continue
+            # -L also matches a DANGLING symlink (a weak-updates link whose
+            # extra/ target was already deleted); plain -e is false for those and
+            # would leak them, leaving modules.dep pointing at a missing .ko.
+            [ -e "$f" ] || [ -L "$f" ] || continue
             rm -f "$f"; rmd=1
         done
     done
-    if [ -n "$rmd" ]; then echo "   purged stale ms_* .ko from $kd"; depmod "$(basename "$kd")" 2>/dev/null || true; fi
+    # Regenerate depmod if we deleted a .ko OR stale ms_* lines still linger in
+    # modules.dep — a prior partial purge can strand entries with nothing left to
+    # remove, and those break `dracut --regenerate-all` ("weak-updates/ms_mod.ko.xz:
+    # No such file … installkernel failed"). depmod, NOT weak-modules (it can hang).
+    if [ -n "$rmd" ] || grep -qsE 'ms_mod|raid1_ms|raid10_ms' "$kd"modules.dep; then
+        [ -n "$rmd" ] && echo "   purged stale ms_* .ko from $kd"
+        depmod "$(basename "$kd")" 2>/dev/null || true
+    fi
 done
 
 echo ">> dkms ldtarball + install meshstor-ms/$PKG_VERSION"
@@ -276,11 +286,21 @@ for kd in /lib/modules/*/; do
     for m in ms_mod raid1_ms raid10_ms; do
         for f in "$kd"extra/"$m".ko* "$kd"updates/dkms/"$m".ko* \
                  "$kd"weak-updates/"$m".ko* "$kd"weak-updates/*/"$m".ko*; do
-            [ -e "$f" ] || continue
+            # -L also matches a DANGLING symlink (a weak-updates link whose
+            # extra/ target was already deleted); plain -e is false for those and
+            # would leak them, leaving modules.dep pointing at a missing .ko.
+            [ -e "$f" ] || [ -L "$f" ] || continue
             rm -f "$f"; rmd=1
         done
     done
-    if [ -n "$rmd" ]; then echo "   purged stale ms_* .ko from $kd"; depmod "$(basename "$kd")" 2>/dev/null || true; fi
+    # Regenerate depmod if we deleted a .ko OR stale ms_* lines still linger in
+    # modules.dep — a prior partial purge can strand entries with nothing left to
+    # remove, and those break `dracut --regenerate-all` ("weak-updates/ms_mod.ko.xz:
+    # No such file … installkernel failed"). depmod, NOT weak-modules (it can hang).
+    if [ -n "$rmd" ] || grep -qsE 'ms_mod|raid1_ms|raid10_ms' "$kd"modules.dep; then
+        [ -n "$rmd" ] && echo "   purged stale ms_* .ko from $kd"
+        depmod "$(basename "$kd")" 2>/dev/null || true
+    fi
 done
 echo ">> purged. ms_mod loaded=$([ -d /sys/module/ms_mod ] && echo yes || echo no)"
 EOS
