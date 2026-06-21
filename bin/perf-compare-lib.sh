@@ -357,8 +357,8 @@ unload_ms_modules() {
     done
 }
 
-# Remove any meshstor-ms .ko physically present in the RUNNING kernel's module
-# tree, then refresh depmod. This is the cleanup `dkms remove` cannot do:
+# Remove any meshstor-ms .ko physically present in EVERY installed kernel's
+# module tree, then refresh depmod. This is the cleanup `dkms remove` cannot do:
 # dkms only deletes files it still tracks, so a .ko left by a prior install
 # survives in two situations that both break the next run —
 #   1. a higher-versioned ms_mod from an earlier deploy-branch: dkms install's
@@ -367,25 +367,38 @@ unload_ms_modules() {
 #      that fails to modprobe ("disagrees about version of symbol …");
 #   2. a "Differences between built and installed modules" state where the
 #      on-disk .ko no longer matches what dkms believes it installed.
+# It must sweep ALL kernels, not just the running one: dkms install fans
+# weak-updates/ symlinks into every ABI-compatible kernel, and a stale one left
+# in a non-running kernel's modules.dep makes `dracut --regenerate-all` abort
+# ("weak-updates/ms_mod.ko.xz: No such file … installkernel failed").
 # Purging the ghost .ko guarantees the next `dkms install` lands a coherent
-# module set. Idempotent; only runs depmod if it actually removed something.
+# module set. Idempotent.
 purge_ms_kmods() {
-    local kver moddir removed=0 m f
-    kver="$(uname -r)"
-    moddir="/lib/modules/$kver"
-    for m in ms_mod raid1_ms raid10_ms; do
-        for f in "$moddir"/extra/"$m".ko* \
-                 "$moddir"/updates/dkms/"$m".ko* \
-                 "$moddir"/weak-updates/"$m".ko* \
-                 "$moddir"/weak-updates/*/"$m".ko*; do
-            [[ -e "$f" ]] || continue
-            rm -f "$f" && removed=1
+    local kd kver rmd m f
+    for kd in /lib/modules/*/; do
+        kver="$(basename "$kd")"
+        rmd=
+        for m in ms_mod raid1_ms raid10_ms; do
+            for f in "$kd"extra/"$m".ko* \
+                     "$kd"updates/dkms/"$m".ko* \
+                     "$kd"weak-updates/"$m".ko* \
+                     "$kd"weak-updates/*/"$m".ko*; do
+                # -L also matches a DANGLING symlink (a weak-updates link whose
+                # extra/ target was already deleted); plain -e is false for those
+                # and would leak them, stranding the modules.dep entry.
+                [[ -e "$f" || -L "$f" ]] || continue
+                rm -f "$f" && rmd=1
+            done
         done
+        # Regenerate depmod if we removed a .ko OR stale ms_* lines still linger
+        # in modules.dep — a prior partial purge can strand entries with nothing
+        # left to delete, and those break `dracut --regenerate-all`. Use depmod,
+        # NOT `weak-modules --remove-modules` (it can hang indefinitely).
+        if [[ -n "$rmd" ]] || grep -qsE 'ms_mod|raid1_ms|raid10_ms' "$kd"modules.dep; then
+            [[ -n "$rmd" ]] && log "purged stale ms_* .ko from $kd"
+            depmod "$kver" 2>/dev/null || true
+        fi
     done
-    if (( removed )); then
-        log "purged stale ms_* .ko from $moddir; depmod $kver"
-        depmod "$kver" 2>/dev/null || true
-    fi
 }
 
 dkms_remove_safe() {
