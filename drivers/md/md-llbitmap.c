@@ -1559,26 +1559,46 @@ static int llbitmap_resize(struct mddev *mddev, sector_t blocks, int chunksize)
 	llbitmap->chunks = chunks;
 
 	/*
-	 * Initialise the newly-grown chunks to BitUnwritten.  Freshly added
-	 * pages come from alloc_page(__GFP_ZERO) and BitUnwritten == 0, so they
-	 * are already correct; only the tail of the previous last page needs
-	 * clearing -- its bytes beyond the old chunk count are stale on disk and
-	 * would otherwise read back as an invalid state and force a spurious
-	 * resync.  Existing chunks [0, old_chunks) are never touched, preserving
-	 * written-data state.  This is a single sub-page memset rather than an
-	 * O(grow-chunks) loop under the quiesce window.  On shrink the range is
-	 * empty.  Unwritten is correct: grown space has no user data and must
-	 * not be resynced (skip_sync_blocks skips Unwritten).
+	 * Initialise every newly-grown chunk [old_chunks, chunks) to
+	 * BitUnwritten, clearing the chunk-state byte on *every* page the grown
+	 * range spans -- not just the page that holds old_chunks:
+	 *
+	 *  - On a true grow (grow == true) the appended pages come from
+	 *    alloc_page(__GFP_ZERO) (BitUnwritten == 0) and are already correct,
+	 *    but the tail of the previous last page still holds bytes that are
+	 *    stale on disk and must be cleared.
+	 *  - On a grow-within-the-high-water-mark (grow == false -- a regrow
+	 *    after an earlier shrink: a shrink lowers chunks but leaves nr_pages
+	 *    at its high-water value) no page is reallocated, so an intermediate
+	 *    or final spanned page may still carry BitClean/BitDirty state left
+	 *    over from when the array was larger.  Clamping the memset to the
+	 *    first page would leave that stale state in place; the flush below
+	 *    would persist it, and skip_sync_blocks()/blocks_synced() would then
+	 *    treat the grown region as written (Clean/Dirty) rather than as
+	 *    Unwritten, diverging from the intended grow semantics.
+	 *
+	 * Existing chunks [0, old_chunks) are never touched, preserving
+	 * written-data state.  On a shrink the range is empty.  The memset is
+	 * O(grown chunks), bounded by the same range the flush below rewrites,
+	 * so it adds no asymptotic cost.  Unwritten is correct: grown space has
+	 * no user data and must not be resynced (skip_sync_blocks skips
+	 * Unwritten).
 	 */
 	if (chunks > old_chunks) {
-		unsigned long first = old_chunks + BITMAP_DATA_OFFSET;
+		unsigned long pos = old_chunks + BITMAP_DATA_OFFSET;
 		unsigned long last = chunks + BITMAP_DATA_OFFSET;
-		unsigned int idx = first >> PAGE_SHIFT;
-		unsigned int off = offset_in_page(first);
-		unsigned long page_end = ((unsigned long)idx + 1) << PAGE_SHIFT;
 
-		memset(llbitmap->pctl[idx]->state + off, BitUnwritten,
-		       min(last, page_end) - first);
+		while (pos < last) {
+			unsigned int idx = pos >> PAGE_SHIFT;
+			unsigned int off = offset_in_page(pos);
+			unsigned long page_end = ((unsigned long)idx + 1) <<
+						 PAGE_SHIFT;
+			unsigned long end = min(last, page_end);
+
+			memset(llbitmap->pctl[idx]->state + off, BitUnwritten,
+			       end - pos);
+			pos = end;
+		}
 	}
 	mutex_unlock(&mddev->bitmap_info.mutex);
 
