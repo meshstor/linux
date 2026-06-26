@@ -34,7 +34,20 @@ a way no header trick can cover:
 
 ## Listing
 
+All patches are pure cross-kernel-compat shims — every one is gated on a
+`HAVE_*` feature flag (or `#ifdef`/`#ifndef`) and is a no-op on kernels that
+have the feature natively. None of them change md/RAID behavior or fix a
+meshstor bug; they only keep the upstream-canonical `drivers/md/` source
+compiling and running correctly across the four target kernels. Note the
+direction is two-way: some gate out fields that are too *new* for the base
+tree (6.18), others fill in for kernels too *old* to have a feature.
+
 | Patch | What it fixes | Why a patch (not compat.h) |
 |---|---|---|
 | `0001-md-getgeo-feature-gated.patch` | `block_device_operations.getgeo` callback signature changed in 6.14 | Wrapper function + conditional `.getgeo =` assignment (gated by `HAVE_GETGEO_GENDISK`) |
 | `0002-wzeroes-unmap-field-feature-gated.patch` | `struct queue_limits.max_hw_wzeroes_unmap_sectors` (added upstream in 6.18, backported into vendor kernels e.g. Ubuntu HWE 6.17) | `#ifdef HAVE_MAX_HW_WZEROES_UNMAP_SECTORS` gates the assignment — a `LINUX_VERSION_CODE < 6.18` check would incorrectly skip the backported kernels and leave the field stacked from the rdev, which fails `blk_validate_limits` |
+| `0003-pre-6.18-no-mdp-superblock-1-logical-block-size.patch` | `struct mdp_superblock_1.logical_block_size` (added upstream in 6.18) — load and store paths reference a field absent from older UAPI headers | `#ifdef HAVE_MDP_SB1_LOGICAL_BLOCK_SIZE` gates two source-level field accesses; can't add a field to the kernel-owned on-disk struct from a header |
+| `0004-sysctl-table-sentinel-pre-6.4-compat.patch` | Pre-6.4 kernels (incl. RHEL 9.x's 5.14) walk the sysctl table until a NULL `procname`; without a trailing `{}` sentinel `register_sysctl` runs off the end and `sysctl_check_table` panics on first `modprobe` | `#ifndef HAVE_SYSCTL_REGISTER_TABLE_NO_SENTINEL` adds an array element — a structural change to a static initializer, not expressible as a header shim |
+| `0005-pre-6.11-no-queue-limits-features.patch` | `struct queue_limits.features` (added in 6.11) — `lim->features`/`lim.features \|=` assignments reference a field that doesn't exist pre-6.11 | `#ifdef HAVE_QUEUE_LIMITS_FEATURES` excludes the assignments at source level; equivalent WRITE_CACHE/FUA/IO_STAT/NOWAIT flags are applied via the `queue_limits_set` shim in compat.h, so cache-flush semantics stay correct |
+| `0006-bdev-file-release-via-compat-helper.patch` | `fput(rdev->bdev_file)` must become `bdev_release()` on 6.8, where `bdev_file` is really a reinterpreted `struct bdev_handle *` | Routes only the bdev_file path through `ms_bdev_file_release()` (compat.h) — can't shim `fput()` globally because md.c also `fput()`s real bitmap files in the same TU |
+| `0007-register-sysctl-non-const-cast.patch` | Pre-6.6 `register_sysctl_sz` takes non-const `struct ctl_table *`; `raid_table` is `static const`, so the implicit const-drop trips `-Werror=discarded-qualifiers` | Hand-expands the `register_sysctl` macro to cast only the table arg while keeping `raid_table` an array for `ARRAY_SIZE` — a casting trick a header can't apply |
