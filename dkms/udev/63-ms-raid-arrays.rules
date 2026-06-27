@@ -1,0 +1,94 @@
+# 63-ms-raid-arrays.rules — meshstor-ms parallel of mdadm's 63-md-raid-arrays.rules
+#
+# WHY THIS EXISTS
+#   NVIDIA cuFile (GPUDirect Storage) does not decide "this is a RAID volume"
+#   from any kernel block-queue capability flag. It classifies the backing
+#   device in userspace by reading the udev *properties* MD_LEVEL / MD_DEVNAME /
+#   MD_UUID / MD_DEVICE_* (populated by `mdadm --detail --export`). Those
+#   properties are emitted ONLY by the stock rule, which bails out on its very
+#   first match line:
+#
+#       KERNEL!="md*", GOTO="md_end"
+#
+#   meshstor renames the array node to /dev/msN and its sysfs subsystem dir to
+#   /sys/block/msN/ms/ (dkms/rename.sed: kobject "md"->"ms", "md%d"->"ms%d").
+#   So a meshstor array matches NOTHING in the stock rule: no MD_* properties
+#   are ever attached, and cuFile reports "cannot verify RAID members ... using
+#   cuFile posix read/write with compat mode enabled" — i.e. it silently falls
+#   back to the CPU bounce-buffer path and you get NO real GDS, even if the
+#   kernel-side P2PDMA plumbing is perfect.
+#
+#   This rule re-emits the SAME MD_* properties for ms* devices. The env-var
+#   NAMES stay MD_* on purpose — that is the contract cuFile reads, and the
+#   meshstor-patched mdadm still prints MD_LEVEL=/MD_DEVNAME=/MD_UUID= verbatim.
+#
+# DEPENDENCIES (both are hard requirements — verify with bin/probe-cufile-recognition)
+#   1. MSADM below MUST point at the meshstor-patched mdadm that accepts /dev/ms*.
+#      The *system* mdadm rejects /dev/msN, so the stock path will not work.
+#   2. cuFile may ALSO shell out to mdadm itself at cuFileHandleRegister time.
+#      If it does (the probe's strace step shows this), that invocation uses
+#      cuFile's own hard-coded path/name and this udev rule alone will not be
+#      enough — you would additionally need the ms-aware mdadm installed where
+#      cuFile looks for it. This rule fixes the udev-property half only.
+#
+# INSTALL: ship as /usr/lib/udev/rules.d/63-ms-raid-arrays.rules, then
+#   udevadm control --reload && udevadm trigger --subsystem-match=block
+# Adjust MSADM to the install path of the patched binary (e.g. /usr/sbin/msadm).
+
+SUBSYSTEM!="block", GOTO="ms_end"
+
+# handle ms arrays only
+ACTION=="remove", GOTO="ms_end"
+KERNEL!="ms*", GOTO="ms_end"
+
+# Skip array nodes that aren't actually assembled/active, mirroring the stock
+# rule. NOTE the sysfs dir is ms/ (not md/) on meshstor — see rename.sed.
+ENV{DEVTYPE}=="partition", GOTO="ms_ignore_state"
+ATTR{ms/metadata_version}=="external:[A-Za-z]*", ATTR{ms/array_state}=="inactive", GOTO="ms_ignore_state"
+TEST!="ms/array_state", ENV{SYSTEMD_READY}="0", GOTO="ms_end"
+ATTR{ms/array_state}=="clear*|inactive", ENV{SYSTEMD_READY}="0", GOTO="ms_end"
+LABEL="ms_ignore_state"
+
+# Populate MD_LEVEL / MD_DEVNAME / MD_UUID / MD_DEVICE_* into the udev DB.
+# This is the line cuFile's RAID detection depends on.
+#
+# NOTE: we intentionally do NOT pass `--no-devices` (which the stock md rule
+# uses for speed). cuFile verifies the RAID member set and fails with "cannot
+# verify RAID members, RAID group size empty" when it sees zero members, so the
+# per-member MD_DEVICE_<kname>_DEV / _ROLE properties must be present. Verified
+# empirically on a real ms raid1: `--no-devices` yields MD_LEVEL + MD_DEVICES
+# but no MD_DEVICE_*; the full export adds them. Trade-off: each uevent
+# re-reads member metadata (acceptable for a storage array).
+IMPORT{program}="/usr/sbin/msadm --detail --export $devnode"
+
+# Discovery symlinks. Keep the conventional by-id/md-uuid-* and md-name-* names
+# (tools, including cuFile-adjacent ones, look there), but namespace the
+# friendly node under /dev/ms/ to match the meshstor device family.
+# CAVEAT: meshstor on-disk superblocks are bit-identical to kernel md, so a host
+# running BOTH md and ms against re-attached disks could collide on these
+# by-id names. meshstor deployments run ms only, so this is normally moot.
+ENV{DEVTYPE}=="disk", ENV{MD_NAME}=="?*", SYMLINK+="disk/by-id/md-name-$env{MD_NAME}", OPTIONS+="string_escape=replace"
+ENV{DEVTYPE}=="disk", ENV{MD_UUID}=="?*", SYMLINK+="disk/by-id/md-uuid-$env{MD_UUID}"
+ENV{DEVTYPE}=="disk", ENV{MD_DEVNAME}=="?*", SYMLINK+="ms/$env{MD_DEVNAME}"
+ENV{DEVTYPE}=="partition", ENV{MD_NAME}=="?*", SYMLINK+="disk/by-id/md-name-$env{MD_NAME}-part%n", OPTIONS+="string_escape=replace"
+ENV{DEVTYPE}=="partition", ENV{MD_UUID}=="?*", SYMLINK+="disk/by-id/md-uuid-$env{MD_UUID}-part%n"
+ENV{DEVTYPE}=="partition", ENV{MD_DEVNAME}=="*[^0-9]", SYMLINK+="ms/$env{MD_DEVNAME}%n"
+ENV{DEVTYPE}=="partition", ENV{MD_DEVNAME}=="*[0-9]", SYMLINK+="ms/$env{MD_DEVNAME}p%n"
+
+# Filesystem-on-array discovery (cuFile registers a *file on a mounted ext4/xfs*,
+# never a raw node, so these by-uuid/by-label links matter for normal use).
+IMPORT{builtin}="blkid"
+OPTIONS+="link_priority=100"
+OPTIONS+="watch"
+OPTIONS+="db_persist"
+ENV{ID_FS_USAGE}=="filesystem|other|crypto", ENV{ID_FS_UUID_ENC}=="?*", SYMLINK+="disk/by-uuid/$env{ID_FS_UUID_ENC}"
+ENV{ID_FS_USAGE}=="filesystem|other", ENV{ID_PART_ENTRY_UUID}=="?*", SYMLINK+="disk/by-partuuid/$env{ID_PART_ENTRY_UUID}"
+ENV{ID_FS_USAGE}=="filesystem|other", ENV{ID_FS_LABEL_ENC}=="?*", SYMLINK+="disk/by-label/$env{ID_FS_LABEL_ENC}"
+
+# Deliberately OMITTED vs the stock rule: the mdmonitor.service /
+# mdmon@.service / mdadm-grow-continue@.service hooks. Those drive kernel-md's
+# monitoring daemons; pointing them at an ms array is wrong and could let md's
+# mdmon interfere. meshstor needs its own monitor wiring (out of scope here) or
+# none. Recognition by cuFile does not require them.
+
+LABEL="ms_end"
