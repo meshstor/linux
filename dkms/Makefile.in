@@ -58,6 +58,7 @@ feature_flags:
 	        bio_submit_split_bioset:linux/bio.h \
 	        bio_submit_split_bioset:linux/blkdev.h \
 	        bio_init_inline:linux/bio.h \
+	        bh_submit:linux/buffer_head.h \
 	        bdev_rot:linux/blkdev.h \
 	        bdev_count_inflight:linux/blkdev.h \
 	        bdev_count_inflight:linux/part_stat.h \

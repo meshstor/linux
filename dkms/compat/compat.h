@@ -516,4 +516,74 @@ static inline void ms_bdev_file_release(struct file *bdev_file)
 })
 #endif
 
+/*
+ * bh_submit() / bio_endio_bh() — buffer_head bio helpers (upstream ~7.2).
+ *
+ * Upstream factored the bitmap/metadata buffer_head submit+completion path out
+ * of fs/buffer.c into two small helpers: bh_submit() builds a single-page bio
+ * from a locked, mapped buffer_head and submits it; bio_endio_bh() recovers the
+ * buffer_head from a completed bio and reports success. md-bitmap.c
+ * (write_file_page / read_file_page / end_bitmap_write) uses both. The pre-7.2
+ * target kernels (RHEL 9/5.14, RHEL 10/6.12, Ubuntu 6.14/6.17) lack them, so
+ * port them here. They ship together upstream, so one HAVE_BH_SUBMIT gate
+ * (probed from <linux/buffer_head.h> in dkms/Makefile.in) covers both.
+ *
+ * Judgement calls vs. upstream fs/buffer.c, made for our pre-7.2 targets:
+ *  - guard_bio_eod() is DROPPED. It is declared in <linux/bio.h> but is NOT
+ *    EXPORT_SYMBOL'd (absent from Module.symvers on 6.12), so an out-of-tree
+ *    module cannot link against it. The bitmap buffer_head maps a single
+ *    in-file block that never straddles the device's end, so the EOD guard is
+ *    a no-op for this path.
+ *  - bh->b_page is used (not bh->b_folio): folio accessors may be absent on the
+ *    oldest target, while b_page is stable across all four kernels.
+ *  - The buffer-flag micro-optimizations are KEPT: test_set_buffer_req,
+ *    buffer_write_io_error, clear_buffer_write_io_error, buffer_meta and
+ *    buffer_prio are TAS_BUFFER_FNS/BUFFER_FNS-generated and present on every
+ *    target (their literal spellings don't appear in the header because the
+ *    names are token-pasted by those macros).
+ */
+#ifndef HAVE_BH_SUBMIT
+#include <linux/buffer_head.h>
+static inline bool bio_endio_bh(struct bio *bio, struct buffer_head **bhp)
+{
+    bool success = bio->bi_status == BLK_STS_OK;
+    struct buffer_head *bh = bio->bi_private;
+
+    if (unlikely(bio_flagged(bio, BIO_QUIET)))
+        set_bit(BH_Quiet, &bh->b_state);
+    bio_put(bio);
+    *bhp = bh;
+    return success;
+}
+
+static inline void bh_submit(struct buffer_head *bh, blk_opf_t opf,
+                             bio_end_io_t *end_io)
+{
+    struct bio *bio;
+
+    /* md-bitmap locks+maps the bh (set_buffer_locked/mapped) before calling. */
+    if ((opf & REQ_OP_MASK) == REQ_OP_WRITE &&
+        test_set_buffer_req(bh) && buffer_write_io_error(bh))
+        clear_buffer_write_io_error(bh);
+    if (buffer_meta(bh))
+        opf |= REQ_META;
+    if (buffer_prio(bh))
+        opf |= REQ_PRIO;
+
+    bio = bio_alloc(bh->b_bdev, 1, opf, GFP_NOIO);
+    bio->bi_iter.bi_sector = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
+    /* __bio_add_page() (void, no overflow check) matches upstream __bh_submit:
+     * the page is guaranteed to fit the freshly-allocated single-vec bio. The
+     * checked bio_add_page() is __must_check on some targets (-Wunused-result),
+     * and predating it, __bio_add_page exists wherever the 4-arg bio_alloc()
+     * this shim already requires exists. */
+    __bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+    bio->bi_end_io = end_io;
+    bio->bi_private = bh;
+    /* guard_bio_eod() dropped: not exported to modules; bitmap blocks never
+     * straddle EOD. */
+    submit_bio(bio);
+}
+#endif /* HAVE_BH_SUBMIT */
+
 #endif /* MESHSTOR_MD_COMPAT_H */
