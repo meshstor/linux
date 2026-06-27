@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+#
+# probe-cufile-recognition — does NVIDIA cuFile (GDS) recognize a meshstor /dev/ms
+# array as a RAID volume and take the *real* PCI-P2PDMA path, or does it silently
+# fall back to the CPU bounce-buffer ("compat") path?
+#
+# This answers the single biggest open question for GDS-over-ms-raid1: the kernel
+# queue flag (BLK_FEAT_PCI_P2PDMA) is necessary but NOT sufficient — cuFile does
+# its own userspace device classification via udev MD_* properties and (possibly)
+# by shelling out to mdadm. The /dev/msN rename + ms-namespaced sysfs/mdadm can
+# break that classification regardless of a perfect kernel side.
+#
+# Run it on a real GDS host (OpenRM 570+ open module, CUDA 12.8+, x86_64). It is
+# read-mostly: it only writes a temp file under your array's mountpoint, a temp
+# cufile.json, and (optionally) reloads udev rules.
+#
+# Usage:
+#   sudo bin/probe-cufile-recognition <mountpoint-on-ms-array> [--md <ref-mountpoint>]
+#   sudo bin/probe-cufile-recognition /mnt/ms0            # ext4/xfs on /dev/ms0
+#   sudo bin/probe-cufile-recognition /mnt/ms0 --md /mnt/md0   # also probe an md array as control
+#
+# Exit codes: 0 = real GDS confirmed, 1 = compat/no-GDS (recognition failed),
+#             4 = SKIP (missing prerequisite), 2 = usage error.
+
+set -u
+SELF=${0##*/}
+
+# ---- pretty status ---------------------------------------------------------
+c() { [ -t 1 ] && printf '\033[%sm' "$1" || true; }
+PASS() { printf '%s[ PASS ]%s %s\n' "$(c '1;32')" "$(c 0)" "$*"; }
+FAIL() { printf '%s[ FAIL ]%s %s\n' "$(c '1;31')" "$(c 0)" "$*"; FAILED=1; }
+WARN() { printf '%s[ WARN ]%s %s\n' "$(c '1;33')" "$(c 0)" "$*"; }
+INFO() { printf '%s[ .... ]%s %s\n' "$(c '1;34')" "$(c 0)" "$*"; }
+SKIP() { printf '%s[ SKIP ]%s %s\n' "$(c '1;35')" "$(c 0)" "$*"; exit 4; }
+hr()   { printf '%s\n' "----------------------------------------------------------------------"; }
+sec()  { hr; printf '== %s\n' "$*"; }
+FAILED=0
+
+[ "${1:-}" ] || { echo "usage: $SELF <mountpoint-on-ms-array> [--md <ref-mountpoint>]"; exit 2; }
+MNT=$1; shift
+REF_MNT=""
+[ "${1:-}" = "--md" ] && { REF_MNT=${2:-}; shift 2 || true; }
+[ "$(id -u)" = 0 ] || SKIP "must run as root (udevadm/strace/mdadm --detail need it)"
+[ -d "$MNT" ] || { echo "$SELF: '$MNT' is not a directory"; exit 2; }
+
+# Resolve the backing block device + its kernel name for the mountpoint.
+SRC=$(findmnt -no SOURCE --target "$MNT" 2>/dev/null) || SKIP "cannot resolve mount for $MNT"
+DEV=$(basename "$(readlink -f "$SRC")")           # e.g. ms0
+FSTYPE=$(findmnt -no FSTYPE --target "$MNT" 2>/dev/null)
+INFO "mountpoint $MNT  ->  source $SRC  (kernel dev: $DEV, fs: $FSTYPE)"
+
+# ---- locate tools ----------------------------------------------------------
+GDS_DIR=${GDS_DIR:-/usr/local/cuda/gds}
+GDSCHECK=$(command -v gdscheck || echo "$GDS_DIR/tools/gdscheck")
+GDSIO=$(command -v gdsio    || echo "$GDS_DIR/tools/gdsio")
+MSADM=${MSADM:-$(command -v msadm || echo /usr/sbin/msadm)}
+_devuser=${SUDO_USER:-${USER:-root}}                 # $SUDO_USER is empty when run as root directly
+[ -x "$MSADM" ] || MSADM=${MDADM_BIN:-/home/$_devuser/mdadm/mdadm}   # dev fallback
+[ -x "$GDSCHECK" ] || GDSCHECK=""
+[ -x "$GDSIO" ]    || GDSIO=""
+
+# ===========================================================================
+sec "1. Platform / kernel prerequisites"
+INFO "kernel: $(uname -r)"
+KSRC=/lib/modules/$(uname -r)/build
+# AUTHORITATIVE GATE: CONFIG_PCI_P2PDMA must be *enabled in this kernel build*.
+# Header tokens (BLK_FEAT_PCI_P2PDMA / FOLL_PCI_P2PDMA) are present in the headers
+# regardless of the build config, so they prove nothing on their own — e.g. Oracle
+# UEK 6.12 ships `# CONFIG_PCI_P2PDMA is not set` while stock RHEL/Rocky 6.12 sets
+# it =y. With the config off the feature is compiled out: no NVMe advertises it and
+# is_pci_p2pdma_page() is always false, so GDS-P2PDMA cannot work at all.
+KCONF=""
+for c in /proc/config.gz "/boot/config-$(uname -r)" "$KSRC/.config"; do
+	[ -e "$c" ] && { KCONF=$c; break; }
+done
+if [ -z "$KCONF" ]; then
+	WARN "kernel config not found (/proc/config.gz, /boot/config-*, \$KSRC/.config) — cannot confirm CONFIG_PCI_P2PDMA"
+elif { case "$KCONF" in *.gz) zcat "$KCONF";; *) cat "$KCONF";; esac; } 2>/dev/null | grep -q '^CONFIG_PCI_P2PDMA=y'; then
+	PASS "CONFIG_PCI_P2PDMA=y (feature is built into this kernel) [$KCONF]"
+else
+	FAIL "CONFIG_PCI_P2PDMA is NOT enabled in this kernel build [$KCONF] — GDS-P2PDMA impossible regardless of any md fork (e.g. Oracle UEK disables it). Use a kernel built with CONFIG_PCI_P2PDMA=y (stock RHEL/Rocky 10 has it)."
+fi
+# Secondary (necessary-but-not-sufficient): the source path must also exist.
+if grep -q 'BLK_FEAT_PCI_P2PDMA\|QUEUE_FLAG_PCI_P2PDMA' "$KSRC/include/linux/blkdev.h" 2>/dev/null; then
+	INFO "headers define a PCI-P2PDMA queue capability (necessary, not sufficient)"
+else
+	FAIL "no PCI-P2PDMA queue capability in $KSRC/include/linux/blkdev.h (kernel too old? need >= 6.2 path)"
+fi
+if grep -rq 'FOLL_PCI_P2PDMA' "$KSRC/include/linux/mm.h" "$KSRC/include/linux/mm_types.h" 2>/dev/null; then
+	INFO "FOLL_PCI_P2PDMA defined in headers (O_DIRECT P2PDMA path; merged mainline v6.2)"
+else
+	FAIL "FOLL_PCI_P2PDMA absent — this kernel lacks the GDS O_DIRECT P2PDMA path (e.g. RHEL9/5.14 base)"
+fi
+if [ -n "$GDSCHECK" ]; then
+	INFO "gdscheck -p (platform + p2pdma support):"
+	"$GDSCHECK" -p 2>&1 | grep -iE 'p2pdma|IOMMU|platform|cufile|properties|version' | sed 's/^/        /'
+else
+	WARN "gdscheck not found (looked in PATH and $GDS_DIR/tools) — skipping platform dump"
+fi
+
+# ===========================================================================
+sec "2. Array shape + filesystem (GDS requires ext4/xfs, O_DIRECT, ext4=data=ordered)"
+case "$FSTYPE" in
+	ext4|xfs) PASS "filesystem is $FSTYPE (GDS-supported)";;
+	*) FAIL "filesystem is '$FSTYPE' — GDS supports only ext4/xfs; raw block nodes are rejected";;
+esac
+if [ "$FSTYPE" = ext4 ]; then
+	if findmnt -no OPTIONS --target "$MNT" | grep -q 'data=ordered' || \
+	   tune2fs -l "$SRC" 2>/dev/null | grep -qi 'Default mount options.*ordered'; then
+		PASS "ext4 journaling is data=ordered"
+	else
+		WARN "could not confirm ext4 data=ordered (GDS requires it)"
+	fi
+fi
+# Naming-agnostic: works for an ms array (/proc/msstat, /sys/block/$DEV/ms/) AND
+# for a stock md array (/proc/mdstat, /sys/block/$DEV/md/) so the SAME probe can
+# be run against a real /dev/mdN as a positive control (see runbook).
+LEVEL=$(awk -v d="$DEV" '$1==d{for(i=1;i<=NF;i++)if($i ~ /^raid/)print $i}' /proc/msstat /proc/mdstat 2>/dev/null | head -1)
+[ -n "$LEVEL" ] || LEVEL=$(cat "/sys/block/$DEV/ms/level" "/sys/block/$DEV/md/level" 2>/dev/null | head -1)
+if [ "$LEVEL" = raid1 ]; then PASS "array $DEV is raid1"
+elif [ -n "$LEVEL" ];   then WARN "array $DEV is $LEVEL (this probe targets raid1)"
+else FAIL "could not determine RAID level of $DEV (is ms_mod/md loaded? /proc/{ms,md}stat present?)"; fi
+
+# ===========================================================================
+sec "3. udev classification — the cuFile RAID gate"
+# Make sure the ms udev rule is loaded (offer to install the repo copy).
+RULE=/usr/lib/udev/rules.d/63-ms-raid-arrays.rules
+REPO_RULE="$(cd "$(dirname "$0")/.." && pwd)/dkms/udev/63-ms-raid-arrays.rules"
+if [ ! -e "$RULE" ] && [ -e "$REPO_RULE" ]; then
+	WARN "$RULE not installed; installing repo copy for this probe"
+	install -m0644 "$REPO_RULE" "$RULE"
+	udevadm control --reload
+	udevadm trigger --subsystem-match=block --action=change "/dev/$DEV" 2>/dev/null
+	udevadm settle 2>/dev/null
+fi
+INFO "MSADM = $MSADM"
+if [ -x "$MSADM" ]; then
+	INFO "$MSADM --detail --export /dev/$DEV:"
+	"$MSADM" --detail --export "/dev/$DEV" 2>&1 | grep -E '^MD_' | sed 's/^/        /' \
+		|| WARN "msadm produced no MD_* export (does this mdadm accept /dev/ms*?)"
+else
+	FAIL "no ms-aware mdadm found (set MSADM=); cuFile cannot verify members without it"
+fi
+# The decisive check: does the udev DB carry MD_LEVEL for this device?
+UDEV_MD=$(udevadm info --query=property "/dev/$DEV" 2>/dev/null | grep -E '^MD_(LEVEL|DEVNAME|UUID|DEVICE)')
+if echo "$UDEV_MD" | grep -q '^MD_LEVEL='; then
+	PASS "udev DB exposes MD_LEVEL for /dev/$DEV (cuFile's udev probe can classify it):"
+	echo "$UDEV_MD" | sed 's/^/        /'
+else
+	FAIL "udev DB has NO MD_LEVEL for /dev/$DEV — cuFile will report 'cannot verify RAID members' and use compat mode"
+	WARN "fix: install dkms/udev/63-ms-raid-arrays.rules with MSADM pointing at the patched mdadm, then udevadm trigger"
+fi
+
+# ===========================================================================
+sec "4. cuFile config (force the P2PDMA path + TRACE logging)"
+WORK=$(mktemp -d /tmp/probe-cufile.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+CONF="$WORK/cufile.json"
+cat > "$CONF" <<JSON
+{
+  "logging": { "dir": "$WORK", "level": "TRACE" },
+  "properties": { "use_pci_p2pdma": true },
+  "fs": {
+    "generic": { "posix_unaligned_writes": false },
+    "block": {
+      "nvme":   { "use_pci_p2pdma": true },
+      "nvmeof": { "use_pci_p2pdma": true },
+      "raid":   { "use_pci_p2pdma": true }
+    }
+  }
+}
+JSON
+export CUFILE_ENV_PATH_JSON="$CONF"
+export CUFILE_LOGGING_LEVEL=TRACE
+PASS "wrote $CONF (use_pci_p2pdma=true incl. block.raid.use_pci_p2pdma=true)"
+LOG="$WORK/cufile.log"
+
+# ===========================================================================
+sec "5. Exercise cuFile against a file on the array (+ trace cuFile's own probing)"
+TESTFILE="$MNT/.gds-probe.$$"
+if [ -z "$GDSIO" ]; then
+	WARN "gdsio not found — cannot drive a real cuFile I/O automatically."
+	WARN "Run manually on a GPU host, then re-grep \$WORK/cufile.log:"
+	WARN "  CUFILE_ENV_PATH_JSON=$CONF $GDS_DIR/tools/gdsio -f $TESTFILE -d 0 -w 1 -s 64M -i 1M -x 0 -I 1"
+	VERDICT_UNKNOWN=1
+else
+	STRACE=$(command -v strace || true)
+	TRACE="$WORK/strace.log"
+	INFO "running gdsio (write, 64MiB, GPU 0) under strace to capture cuFile's userspace probing"
+	# -I 1 write, -x 0 = GDS (cuFileWrite); gdsio reports if it falls back.
+	CMD=("$GDSIO" -f "$TESTFILE" -d 0 -w 1 -s 64M -i 1M -x 0 -I 1)
+	if [ -n "$STRACE" ]; then
+		"$STRACE" -f -qq -e trace=execve,openat,stat,statx -o "$TRACE" "${CMD[@]}" \
+			> "$WORK/gdsio.out" 2>&1 || true
+	else
+		WARN "strace not found — running gdsio without execve/open tracing"
+		"${CMD[@]}" > "$WORK/gdsio.out" 2>&1 || true
+	fi
+	rm -f "$TESTFILE"
+	INFO "gdsio output:"; sed 's/^/        /' "$WORK/gdsio.out" | tail -20
+
+	# What did cuFile actually do? (strace reveals shell-outs + sysfs path guesses)
+	if [ -s "$TRACE" ]; then
+		sec "5a. cuFile's own device probing (from strace)"
+		if grep -qE 'execve\("[^"]*md?adm"' "$TRACE"; then
+			INFO "cuFile shelled out to an *adm tool:"; grep -E 'execve\("[^"]*md?adm"' "$TRACE" | sed 's/^/        /' | head
+			grep -qE 'execve\("[^"]*/(msadm)"' "$TRACE" && PASS "...and it used an ms-aware binary" \
+				|| WARN "...it likely used the SYSTEM mdadm, which rejects /dev/ms* — udev rule alone won't save this"
+		else
+			INFO "cuFile did not exec mdadm (relies on udev DB / sysfs only)"
+		fi
+		if grep -qE 'openat\([^)]*"/sys/block/'"$DEV"'/md/' "$TRACE"; then
+			FAIL "cuFile probed /sys/block/$DEV/md/ — WRONG path; meshstor uses /sys/block/$DEV/ms/"
+		fi
+		grep -qE '"/proc/mdstat"' "$TRACE" && WARN "cuFile read /proc/mdstat (meshstor exposes /proc/msstat) — possible blind spot"
+	fi
+fi
+
+# ===========================================================================
+sec "6. Verdict"
+if [ -s "$LOG" ]; then
+	INFO "cufile.log RAID/p2pdma lines:"
+	grep -iE 'raid|p2pdma|compat|not supported|verify' "$LOG" | sed 's/^/        /' | tail -25
+fi
+real=0; compat=0
+if [ -s "$LOG" ]; then
+	grep -qiE 'cannot verify RAID members|RAID member not supported|GDS not supported|compat mode' "$LOG" && compat=1
+	grep -qiE 'p2pdma.*(enabled|true|using)|using p2p|BUS_ADDR' "$LOG" && real=1
+fi
+# Corroborate with gdsio (it prints whether it used GDS or fell back).
+if [ -s "$WORK/gdsio.out" ]; then
+	grep -qiE 'compat|posix|fall.?back' "$WORK/gdsio.out" && compat=1
+fi
+hr
+if [ "${VERDICT_UNKNOWN:-0}" = 1 ]; then
+	WARN "INCONCLUSIVE — no gdsio on this host. Drive cuFile manually (see step 5) and inspect $WORK/cufile.log."
+	echo "Saved artifacts under: $WORK (copy out before exit removes it: cp -r $WORK /tmp/keep)"; trap - EXIT
+	exit 4
+elif [ "$compat" = 1 ] && [ "$real" != 1 ]; then
+	FAIL "cuFile did NOT use real GDS on /dev/$DEV — it fell back to compat/bounce-buffer mode."
+	echo "   Most likely cause (see steps 3 & 5a): cuFile could not classify the ms array as RAID."
+	exit 1
+elif [ "$real" = 1 ] && [ "$compat" != 1 ]; then
+	PASS "cuFile used the real PCI-P2PDMA GDS path on /dev/$DEV. 🎉"
+	exit 0
+else
+	WARN "AMBIGUOUS — could not classify from logs. Inspect $WORK/cufile.log and gdsio.out by hand."
+	echo "Saved artifacts under: $WORK"; trap - EXIT
+	exit 1
+fi
