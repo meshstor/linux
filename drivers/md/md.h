@@ -19,9 +19,29 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/raid/md_u.h>
+#include <linux/bio.h>
+#include <linux/memremap.h>
 #include <trace/events/block.h>
 
 #define MaxSector (~(sector_t)0)
+
+/*
+ * True if this bio carries PCI P2PDMA source pages (e.g. GPU memory for
+ * GPUDirect Storage). Used to keep md from CPU-touching, or cross-pgmap
+ * request-merging, those MMIO pages. Read bi_io_vec[0] directly (like the
+ * block layer) rather than bio_first_bvec_all(), which WARNs on BIO_CLONED
+ * bios -- md routinely handles split/cloned bios, which carry bi_vcnt==0 but a
+ * valid bi_io_vec pointing at the parent's bvecs. P2P-ness is uniform across a
+ * bio, so the first bvec is representative. Guard on bi_io_vec (always set when
+ * bio_has_data()) -- NOT bi_vcnt, which is 0 on split clones and would make the
+ * detector silently dead on any I/O above the split threshold. Use before
+ * completion, while bio_has_data() is still meaningful.
+ */
+static inline bool md_bio_is_p2pdma(struct bio *bio)
+{
+	return bio_has_data(bio) && bio->bi_io_vec &&
+	       is_pci_p2pdma_page(bio->bi_io_vec->bv_page);
+}
 /*
  * Number of guaranteed raid bios in case of extreme VM load:
  */
