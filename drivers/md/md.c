@@ -460,8 +460,16 @@ static void md_submit_bio(struct bio *bio)
 		return;
 	}
 
-	/* bio could be mergeable after passing to underlayer */
-	bio->bi_opf &= ~REQ_NOMERGE;
+	/*
+	 * bio could be mergeable after passing to the underlying member, so drop
+	 * the no-merge hint -- EXCEPT for P2PDMA bios. The member (e.g. NVMe)
+	 * resolves the P2P provider/bus mapping once per request, so merging P2P
+	 * bios from different pgmaps (or a P2P bio with a normal one) at the member
+	 * queue would map later segments with the wrong bus address -> silent DMA
+	 * corruption. REQ_NOMERGE keeps each request single-provider; preserve it.
+	 */
+	if (!md_bio_is_p2pdma(bio))
+		bio->bi_opf &= ~REQ_NOMERGE;
 
 	md_handle_request(mddev, bio);
 }
