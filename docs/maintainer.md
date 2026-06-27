@@ -458,6 +458,15 @@ Compare against the published baseline tables in
 
 If criteria 1–4 pass, the change is safe to merge into `meshstor-main`.
 
+## GDS / P2PDMA deployment note
+
+GDS over ms-RAID uses the kernel-native P2P path (which the `BLK_FEAT_PCI_P2PDMA`
+advertise gates) **only** when cuFile is configured with `block.raid.use_pci_p2pdma`
+(`use_pci_p2pdma: true` in `cufile.json`; default off). With the default config cuFile
+uses the proprietary nvidia-fs `nvidia_p2p_get_pages` path, which does not consume this
+flag. The three pieces compose: cuFile RAID recognition (`aed93dec`) +
+`block.raid.use_pci_p2pdma` + this advertisement.
+
 ## See also
 
 - [architecture.md](architecture.md) — vocabulary, rename pass mechanics

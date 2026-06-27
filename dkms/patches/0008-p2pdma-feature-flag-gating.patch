@@ -1,0 +1,76 @@
+P2PDMA feature-flag gating -- compile the P2P advertise out on pre-6.11 kernels.
+
+The P2P feature lives in drivers/md (feature branch p2pdma-fixes): the member-AND
+advertise, the raid1_can_advertise_p2pdma() helper, and md_bio_is_p2pdma(). On
+kernels without BLK_FEAT_PCI_P2PDMA (pre-6.11, e.g. RHEL9/5.14, which also lack the
+FOLL_PCI_P2PDMA O_DIRECT path) the whole feature must compile out. Gate every site
+on HAVE_BLK_FEAT_PCI_P2PDMA (dkms/Makefile.in feature_flags probe): the helper and
+both advertise sites #ifdef out entirely; md_bio_is_p2pdma() folds to a constant
+false so its callers (REQ_NOMERGE preserve, write-behind skip) still build.
+
+Source-level, not a header shim: it adds preprocessor structure to drivers/md.
+
+diff --git a/md.h b/md.h
+index d1c7fc08..050221d3 100644
+--- a/md.h
++++ b/md.h
+@@ -36,8 +36,12 @@
+  */
+ static inline bool md_bio_is_p2pdma(struct bio *bio)
+ {
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 	return bio_has_data(bio) && bio->bi_vcnt &&
+ 	       is_pci_p2pdma_page(bio->bi_io_vec->bv_page);
++#else
++	return false;
++#endif
+ }
+ /*
+  * Number of guaranteed raid bios in case of extreme VM load:
+diff --git a/raid1-10.c b/raid1-10.c
+index fa907a12..d938d532 100644
+--- a/raid1-10.c
++++ b/raid1-10.c
+@@ -304,6 +304,7 @@ static inline bool raid1_should_handle_error(struct bio *bio)
+ 		bio->bi_status != BLK_STS_INVAL;
+ }
+ 
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ /*
+  * Advertise PCI P2PDMA only when every non-faulty member can do it.
+  * BLK_FEAT_PCI_P2PDMA is excluded from BLK_FEAT_INHERIT_MASK, so md sets it
+@@ -325,3 +326,4 @@ static bool raid1_can_advertise_p2pdma(struct mddev *mddev)
+ 	}
+ 	return any;
+ }
++#endif /* HAVE_BLK_FEAT_PCI_P2PDMA */
+diff --git a/raid1.c b/raid1.c
+index dab72170..1ce30346 100644
+--- a/raid1.c
++++ b/raid1.c
+@@ -3234,8 +3234,10 @@ static int raid1_set_limits(struct mddev *mddev)
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+ 	if (err)
+ 		return err;
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 	if (raid1_can_advertise_p2pdma(mddev))
+ 		lim.features |= BLK_FEAT_PCI_P2PDMA;
++#endif
+ 	return queue_limits_set(mddev->gendisk->queue, &lim);
+ }
+ 
+diff --git a/raid10.c b/raid10.c
+index 7cb477cb..343d3679 100644
+--- a/raid10.c
++++ b/raid10.c
+@@ -3965,8 +3965,10 @@ static int raid10_set_queue_limits(struct mddev *mddev)
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+ 	if (err)
+ 		return err;
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 	if (raid1_can_advertise_p2pdma(mddev))
+ 		lim.features |= BLK_FEAT_PCI_P2PDMA;
++#endif
+ 	return queue_limits_set(mddev->gendisk->queue, &lim);
+ }
+ 
