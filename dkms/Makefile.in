@@ -78,6 +78,7 @@ feature_flags:
 	        queue_limits_commit_update:linux/blkdev.h \
 	        queue_limits_cancel_update:linux/blkdev.h \
 	        queue_limits_stack_bdev:linux/blkdev.h \
+	        BLK_FEAT_PCI_P2PDMA:linux/blkdev.h \
 	        queue_limits_stack_integrity_bdev:linux/blk-integrity.h \
 	        queue_limits_stack_integrity_bdev:linux/blkdev.h \
 	        bdev_file_open_by_dev:linux/blkdev.h \

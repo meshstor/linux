@@ -339,6 +339,24 @@ static inline int ms_badblocks_check_compat(struct badblocks *bb, sector_t s,
 #endif
 
 /*
+ * BLK_FEAT_PCI_P2PDMA queue_limits feature flag — the gate that lets the array
+ * advertise PCI peer-to-peer DMA (GPUDirect Storage) so userspace GUP against
+ * /dev/msN is allowed to fetch ZONE_DEVICE P2PDMA (GPU) pages. The flag moved
+ * from QUEUE_FLAG_PCI_P2PDMA into queue_limits.features in ~6.11 (Hellwig,
+ * "block: move the pci_p2pdma flag to queue_limits"); it is deliberately absent
+ * from BLK_FEAT_INHERIT_MASK, so a stacked device must set it explicitly. Like
+ * BLK_FEAT_ATOMIC_WRITES it is an enum value, not a macro, so gate on the HAVE_
+ * flag dkms/Makefile.in probes from <linux/blkdev.h>. Defining it to 0 makes a
+ * stray `lim.features |= BLK_FEAT_PCI_P2PDMA` a no-op on kernels without the
+ * feature (e.g. RHEL9/5.14, which also lacks the FOLL_PCI_P2PDMA O_DIRECT path
+ * entirely, merged mainline v6.2). The actual P2PDMA code paths are additionally
+ * gated on #ifdef HAVE_BLK_FEAT_PCI_P2PDMA — this define only protects a bare OR.
+ */
+#ifndef HAVE_BLK_FEAT_PCI_P2PDMA
+#define BLK_FEAT_PCI_P2PDMA 0
+#endif
+
+/*
  * BLK_STS_INVAL (added in 6.10, commit 7ba150834b04).
  *
  * Used by raid1_should_handle_error to skip retry/badblocks when the bio
