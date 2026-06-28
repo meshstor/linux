@@ -17,10 +17,12 @@ set -u
 # shellcheck source=tools/testing/selftests/dkms/lib.sh
 . "$(dirname "$0")/lib.sh"
 
-tree="$(dkms_flat_manifest_tree)"
+ktree="$(dkms_resolve_kernel_tree)" \
+	|| dkms_skip "no drivers/md tree (set KERNEL_TREE= or run bin/rebuild-meshstor-main first)"
+tree="$(dkms_flat_manifest_tree "$ktree")"
 
 if ! out="$(dkms_apply_all_patches "$tree")"; then
-	echo "FAIL: patches did not apply cleanly with --fuzz=0 (cannot check 0004 placement)" >&2
+	echo "FAIL: a patch was rejected under --fuzz=0 (cannot check 0004 placement)" >&2
 	echo "$out" >&2
 	exit 1
 fi

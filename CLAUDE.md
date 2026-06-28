@@ -68,11 +68,23 @@ the two personalities. RAID0/5/6 and md-cluster are intentionally out of scope
 - **`master`** tracks `upstream/master` verbatim — never carry local commits.
 - **`meshstor-harness`** (the usual working branch) carries packaging, `bin/`
   tooling, docs, and selftests — everything that is *not* a kernel md feature.
+  It carries **no `drivers/md/`** (kernel sources live on `master` + feature
+  branches). So tooling that needs the md sources must point `KERNEL_TREE=` at a
+  composed tree, never at this checkout — and source-dependent tests SKIP here.
 - **Feature branches** carry one md feature each, rebased on a torvalds master
   snapshot: `md-latency-ewma`, `per-bucket-arrays`, `takeover`,
-  `llbitmap-fixes`, etc.
-- `bin/rebuild-main` **composes** these into a working tree; it is the bridge
-  between the branch model and the build pipeline.
+  `llbitmap-fixes`, `p2pdma`, etc.
+- **`meshstor-main`** is the published, **kernel-tree-only** composition of
+  `master` + every feature branch (top-level `drivers/` + `tools/` only; no
+  `dkms/`, no `bin/`).
+- Two composers bridge the branch model and the build pipeline:
+  - `bin/rebuild-main` builds a *torvalds-based* buildable tree at
+    `build/linux-meshstor-rebuilt/` (filter-repo + `git am`).
+  - `bin/rebuild-meshstor-main` reconstructs the *`meshstor-main` branch itself*
+    by cherry-picking every `origin` feature branch onto `origin/master` in a
+    worktree (`llbitmap-fixes` first, then alphabetical), then optionally
+    builds / reloads modules / runs both selftest suites, and prints the
+    `git push --force` to publish. Run it from the harness checkout.
 
 ## Build pipeline (three stages)
 
@@ -230,15 +242,30 @@ wrapper is used when present) and csi-perf-test suites under
 
 ```bash
 bash tools/testing/selftests/dkms/run_all.sh   # tooling tests; exit-4 == SKIP, tolerated
-bash tools/testing/selftests/dkms/test_build_smoke.sh   # one test directly
+# source-dependent tests SKIP without a drivers/md tree — give them one:
+KERNEL_TREE=build/linux-meshstor-rebuilt bash tools/testing/selftests/dkms/run_all.sh
 ```
 
 - `selftests/dkms/` exercises the **real** assembly pipeline (patch apply →
-  rename → render → compile) and compat-flag gating — no array needed; SKIPs
-  cleanly without a kernel build tree.
-- `selftests/md/llbitmap/` are runtime tests; they require **root**, loaded
-  `ms_mod`+`raid1_ms`, and the patched mdadm. `/dev/msN` uses a dynamic major
-  (252 observed). Source `lib.sh`; never run a `test_*.sh` directly without it.
+  rename → render → compile) and compat-flag gating — no array needed. The
+  source-dependent tests (`test_build_smoke`, `test_patches_apply_clean`,
+  `test_0004`, `test_0008`) need a `drivers/md` tree: `dkms_resolve_kernel_tree`
+  picks one via `KERNEL_TREE=` → in-repo `drivers/md` → composed-tree auto-detect
+  (`build/linux-meshstor-rebuilt`, `.worktrees/meshstor-main-rebuild`), and they
+  **SKIP** when none exists (so they skip on the bare harness branch — run them
+  with `KERNEL_TREE=` or after a reconstruction). The patch-apply guard requires
+  **no fuzz and no reject** but tolerates benign line offsets (the composed
+  tree's line numbers shift with the feature set/order).
+- `selftests/md/` runtime tests require **root**, the loaded `ms_*` modules, and
+  the patched mdadm (`/dev/msN`, dynamic major ~252). Source `lib.sh`; never run
+  a `test_*.sh` bare. They **default to native md** — override to the ms
+  subsystem or they exercise the *in-tree* driver: `MD_SUBSYS=ms` for the
+  top-level/llbitmap suites, and the `raid10/` suite *additionally* needs
+  `RAID10_DEV_PREFIX=ms RAID10_SYSFS_SUBDIR=ms RAID10_MDSTAT=/proc/msstat`. Left
+  at the `md` default, `raid10/test_recovery_freeze_deadlock.sh` reproduces the
+  genuine upstream raise_barrier/freeze_array deadlock and wedges **in-tree**
+  kthreads (D state, reboot to clear). `bin/rebuild-meshstor-main` exports this
+  whole env for the suite automatically.
 
 ## Verification before merging a rebase or compat change
 
