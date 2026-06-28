@@ -51,6 +51,7 @@ FAIL_FAST=0
 KEEP=0
 PIN_GOV=1
 ENGINE="$DEFAULT_ENGINE"
+ZERO_MEMBERS=1
 
 die() { echo "error: $*" >&2; exit "$EXIT_USAGE"; }
 
@@ -69,7 +70,7 @@ run_log() {
 }
 
 # ---- preflight ----
-REQUIRED_TOOLS=(mdadm nvme fio lsblk jq udevadm awk modprobe ss)
+REQUIRED_TOOLS=(mdadm nvme fio lsblk jq udevadm awk modprobe ss shred)
 REQUIRED_MODULES_BASE=(nvmet nvmet-tcp nvme-tcp)
 REQUIRED_MODULES_MS=(ms-mod)
 
@@ -325,6 +326,12 @@ array_assemble() {
     # Pre-flight: drop any leftover state from a prior session (killed
     # mid-run, OOM'd, or whose teardown was skipped). See wipe_array_state.
     wipe_array_state
+    # Re-zero every leg so this run's --assume-clean create starts from a
+    # brand-new-volume state: all-zero legs are byte-identical, so the array
+    # comes up clean AND genuinely in-sync, carrying over no data from a prior
+    # bench. Without this, only the first bench after a fresh carve sees zeroed
+    # members. Disabled with --no-zero-members.
+    zero_array_members
     log "array: assemble $ARRAY_DEV engine=$ENGINE level=$LEVEL devices=$RAID_DEVICES bitmap=$BITMAP members=${ARRAY_MEMBERS[*]}"
     # Create flags mirror the CSI driver's mdraid.buildCreateArgs so the
     # benchmark measures the same on-disk array geometry the driver deploys in
@@ -461,6 +468,69 @@ wipe_array_state() {
     udevadm settle >/dev/null 2>&1 || true
     for m in "${LOCALS[@]}" "${IMPORTEDS[@]}"; do
         safe_zero_superblock "$m"
+    done
+}
+
+# member_sample_is_zero DEV -> 0 if DEV reads back all-zero at a couple of
+# sampled windows. Reads with iflag=direct so it reflects the device itself, not
+# stale page cache. This is how zero_array_members confirms a zeroing actually
+# took: `blkdiscard -z` cannot be trusted by exit code on an nvme-tcp import
+# (see below), so we check the bytes. Window at offset 0 catches a leftover
+# superblock/header; the deep window catches stale data a fabric no-op left in
+# the body. A read past the device end returns nothing and is treated as zero.
+member_sample_is_zero() {
+    local dev="$1" off
+    for off in 0 64; do
+        if [[ -n "$(dd if="$dev" bs=1M skip="$off" count=4 iflag=direct status=none 2>/dev/null | tr -d '\0')" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# zero_array_members -> make every member read back all-zero so this run's
+# `--create --assume-clean` starts from a brand-new-volume state: all-zero legs
+# are byte-identical, so the array is created clean AND genuinely in-sync (no
+# pending resync, no data carried over from a prior bench). This is the per-run
+# analogue of the carve-time shred in perf-make-test-partitions: the driver
+# zeroes a member once at create and then only ever --assembles, but this
+# harness re-creates the array every run, so each run must re-establish the
+# zeroed-members invariant the driver's --assume-clean relies on. Skipped when
+# ZERO_MEMBERS=0 (--no-zero-members) for a faster, prior-state-reusing run.
+#
+# Method: try `blkdiscard -z` first (fast BLKZEROOUT — near-instant on a local
+# NVMe partition), then VERIFY with a direct read-back. blkdiscard's exit code
+# cannot be trusted on an nvme-tcp import: nvmet reports the host's BLKZEROOUT
+# as a successful deallocate but the backing partition keeps its old bytes, so
+# the imported leg would carry the previous bench's data into the array while
+# its zeroed local twin holds zeros — an --assume-clean array with silently
+# diverged mirrors. When the read-back shows non-zero, fall back to an explicit
+# zero-WRITE (shred), which lands as real zero bytes over any transport exactly
+# as the array's own writes do, then re-verify and fail closed if still not zero.
+#
+# Data safety: acts ONLY on the configured leg devices, each gated by
+# is_whole_disk_with_gpt exactly like safe_zero_superblock, so it can never
+# overwrite a GPT-bearing whole disk. It runs after wipe_array_state has stopped
+# any stale array and released holders, so the legs are idle; an interrupted
+# zero is harmless because the next run's preflight re-zeros before the create.
+zero_array_members() {
+    [[ "$ZERO_MEMBERS" -eq 1 ]] || { log "array: skip member zeroing (--no-zero-members)"; return 0; }
+    local m
+    for m in "${LOCALS[@]}" "${IMPORTEDS[@]}"; do
+        [[ -b "$m" ]] || continue
+        # audit-ignore: H5 — gated by is_whole_disk_with_gpt before any write
+        if is_whole_disk_with_gpt "$m"; then
+            warn "refusing to zero member $m: whole-disk node has a partition table"
+            continue
+        fi
+        log "array: zero member $m (brand-new-volume reset)"
+        blkdiscard -z "$m" >/dev/null 2>&1 || true
+        if member_sample_is_zero "$m"; then
+            continue
+        fi
+        warn "blkdiscard -z left $m non-zero (nvme-tcp deallocate no-op?); writing zeros explicitly"
+        shred -f -n 0 -z "$m" || die_setup "failed to zero member $m"
+        member_sample_is_zero "$m" || die_setup "member $m still non-zero after explicit zero-write"
     done
 }
 
@@ -612,6 +682,7 @@ write_manifest() {
         --arg engine         "$ENGINE" \
         --arg level          "$LEVEL" \
         --argjson raid_devs  "$RAID_DEVICES" \
+        --argjson zero_mem   "$ZERO_MEMBERS" \
         --arg cmdline        "$cmdline" \
         --arg ms_params      "$ms_params" \
         --arg gov_orig       "${ORIG_GOVERNOR:-unknown}" \
@@ -633,7 +704,7 @@ write_manifest() {
           imported_paths:    $imports,
           member_order:      $members,
           nvmet: { nqn: $nqn, addr: $addr, port: ($port|tonumber? // $port) },
-          array: { device: $array_dev, engine: $engine, bitmap: $bitmap, level: $level, raid_devices: $raid_devs },
+          array: { device: $array_dev, engine: $engine, bitmap: $bitmap, level: $level, raid_devices: $raid_devs, zero_members: ($zero_mem == 1) },
           kernel_cmdline: $cmdline,
           ms_module_params: $ms_params,
           cpu_governor: { original: $gov_orig, pinned: $gov_pinned },
@@ -1005,6 +1076,7 @@ parse_args() {
     KEEP=0
     PIN_GOV=1
     ENGINE="$DEFAULT_ENGINE"
+    ZERO_MEMBERS=1
 
     local pos=()
     while [[ $# -gt 0 ]]; do
@@ -1021,6 +1093,7 @@ parse_args() {
             --fail-fast)  FAIL_FAST=1 ;;
             --keep)       KEEP=1 ;;
             --no-pin)     PIN_GOV=0 ;;
+            --no-zero-members) ZERO_MEMBERS=0 ;;
             -h|--help)    usage; exit 0 ;;
             --) shift; pos+=("$@"); break ;;
             -*) die "unknown flag: $1" ;;
@@ -1121,6 +1194,9 @@ Flags:
   --msadm=PATH          msadm binary (default: build/msadm if exists, else PATH)
   --fail-fast           stop after first failing suite (default: continue)
   --keep                skip teardown on success (debugging only)
+  --no-zero-members     skip the per-run zeroing of array members; each bench
+                        then reuses the prior run's on-leg data (faster, but
+                        not a brand-new-volume start)
   -h, --help            this message
 
 Constraints:
