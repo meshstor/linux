@@ -1,0 +1,10 @@
+# Hand-maintained marker for dkms/patches/regenerate.sh.
+#
+# 0002 is authored to apply to BOTH the composed meshstor-main tree and verbatim
+# upstream `master` at --fuzz=0. Its hunks deliberately carry minimal, symmetric
+# context (one leading line, one trailing line) anchored on lines common to both
+# shapes — the wzeroes field's neighbours diverge between the two trees
+# (meshstor-main's raid10 limits use a local `chunk_sectors`; bare upstream uses
+# `mddev->chunk_sectors`). diff(1)'s default 3-line context would re-anchor the
+# hunk on shape-specific lines and break the other tree, so regenerate.sh applies
+# this patch but never re-diffs it. Edit it by hand if it drifts.

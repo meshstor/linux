@@ -172,13 +172,45 @@ dkms_flat_manifest_tree() {
 	echo "$tree"
 }
 
+# dkms_patch_guard_skips PATCH TREE -> returns 0 (skip this patch) when PATCH
+# carries a `<name>.patch.when` sidecar guard that is NOT satisfied against TREE,
+# else 1 (apply). Each guard line is `[!]<relpath>:<grep -E regex>` evaluated
+# against TREE (a leading `!` requires the pattern to be ABSENT); the patch
+# applies only when every predicate holds. Mirrors bin/build-tarball's loop so
+# the production pipeline and the selftests select the same patch subset.
+dkms_patch_guard_skips() {
+	local p="$1" tree="$2" when="$1.when" cond neg file rx
+	[ -f "$when" ] || return 1
+	while IFS= read -r cond; do
+		cond="${cond%%$'\r'}"
+		[ -z "$cond" ] && continue
+		case "$cond" in \#*) continue ;; esac
+		neg=
+		case "$cond" in !*) neg=1; cond="${cond#!}" ;; esac
+		file="${cond%%:*}"
+		rx="${cond#*:}"
+		if grep -Eq -- "$rx" "$tree/$file" 2>/dev/null; then
+			[ -n "$neg" ] && return 0
+		else
+			[ -z "$neg" ] && return 0
+		fi
+	done < "$when"
+	return 1
+}
+
 # dkms_apply_all_patches TREE -> applies every dkms/patches/*.patch in glob
-# order into TREE with `patch -p1 --fuzz=0`. Prints the combined patch(1)
-# output (each hunk prefixed with its patch filename). Returns the exit
-# status of the first failing patch, or 0 if all applied cleanly.
+# order into TREE with `patch -p1 --fuzz=0`, honoring `.patch.when` guards so
+# composition-dependent variants self-select (e.g. the raid queue-limits gating
+# 0009 vs 0010). Prints the combined patch(1) output (each hunk prefixed with
+# its patch filename). Returns the exit status of the first failing patch, or 0
+# if all applied cleanly.
 dkms_apply_all_patches() {
 	local tree="$1" p out rc=0
 	for p in "$REPO_ROOT"/dkms/patches/*.patch; do
+		if dkms_patch_guard_skips "$p" "$tree"; then
+			printf '### %s (skipped: guard not satisfied)\n' "$(basename "$p")"
+			continue
+		fi
 		if out="$(patch -p1 --fuzz=0 --no-backup-if-mismatch -d "$tree" < "$p" 2>&1)"; then
 			printf '### %s\n%s\n' "$(basename "$p")" "$out"
 		else

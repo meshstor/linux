@@ -1,0 +1,10 @@
+# Guard for build-tarball / dkms_apply_all_patches conditional patch application.
+# Format: [!]<relpath-in-tarball>:<grep -E regex>   (ALL lines must hold)
+# A leading '!' negates (the pattern must NOT be present).
+#
+# 0010 is the verbatim-upstream raid variant: it applies ONLY to bare upstream
+# trees, where the meshstor p2pdma-fixes feature (and therefore the member-AND
+# helper raid1_can_advertise_p2pdma()) is absent and upstream's raw adjacent
+# BLK_FEAT_PCI_P2PDMA assignment is present. On meshstor-main the helper exists
+# and 0009 handles the gating instead.
+!raid1-10.c:raid1_can_advertise_p2pdma

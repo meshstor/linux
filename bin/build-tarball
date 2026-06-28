@@ -65,8 +65,36 @@ cp -r dkms/compat "$OUT/"
 # the source compiles correctly under either present-or-absent path.
 
 # 3. Apply pre-rename compat patches (kernel-API gaps). See dkms/patches/README.md.
+#    A patch may carry an optional sidecar guard `<name>.patch.when`. Each line is a
+#    predicate `[!]<relpath>:<grep -E regex>` evaluated against the just-copied tree
+#    (a leading `!` requires the pattern to be ABSENT). The patch is applied only
+#    when every predicate holds; otherwise it is skipped. This lets composition-
+#    dependent patches self-select — e.g. the P2PDMA gating differs between a
+#    composed meshstor-main tree and verbatim upstream `master`, so 0008 applies
+#    only when the member-AND helper is present and 0009 only when it is absent.
 shopt -s nullglob
 for p in dkms/patches/*.patch; do
+    when="$p.when"
+    if [[ -f "$when" ]]; then
+        skip=
+        while IFS= read -r cond; do
+            cond="${cond%%$'\r'}"
+            [[ -z "$cond" || "$cond" == \#* ]] && continue
+            neg=
+            [[ "$cond" == !* ]] && { neg=1; cond="${cond#!}"; }
+            file="${cond%%:*}"
+            rx="${cond#*:}"
+            if grep -Eq -- "$rx" "$OUT/$file" 2>/dev/null; then
+                [[ -n "$neg" ]] && { skip="present: $file:$rx"; break; }
+            else
+                [[ -z "$neg" ]] && { skip="absent: $file:$rx"; break; }
+            fi
+        done < "$when"
+        if [[ -n "$skip" ]]; then
+            echo "Skipping $(basename "$p") (guard not satisfied: $skip)"
+            continue
+        fi
+    fi
     echo "Applying $(basename "$p")"
     patch -p1 -d "$OUT" --no-backup-if-mismatch < "$p"
 done

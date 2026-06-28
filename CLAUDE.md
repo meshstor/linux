@@ -172,6 +172,17 @@ Decision tree for a new break:
   `NNNN-description.patch`, `-p1` paths (`a/raid1.c`), use **pre-rename `md_*`
   names**, and prefer `#ifdef HAVE_FOO` over `#if LINUX_VERSION_CODE`. Document
   each in `dkms/patches/README.md`.
+  - The patch set is applied to **two** trees: composed `meshstor-main` and
+    verbatim upstream `master` (`deploy-branch master` baseline). When a patch
+    must differ by composition, add a `<name>.patch.when` guard (lines
+    `[!]<relpath>:<regex>`, all must hold; `!`=absent) so mutually-exclusive
+    variants self-select — e.g. the queue-limits/P2PDMA gating splits into
+    `0009` (helper present) and `0010` (helper absent). A patch that must apply
+    to *both* shapes keeps **minimal symmetric context** (one leading + one
+    trailing anchor line, both common to the two trees; GNU `patch` rejects
+    asymmetric short hunks at `--fuzz=0`) and is marked `<name>.patch.keep` so
+    `regenerate.sh` preserves rather than re-diffs it. Guards are honored by
+    `bin/build-tarball`, `lib.sh::dkms_apply_all_patches`, and `regenerate.sh`.
 
 Two gotchas already paid for in engineering time (full write-ups in
 `docs/maintainer.md`):

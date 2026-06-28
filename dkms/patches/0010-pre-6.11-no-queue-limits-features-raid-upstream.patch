@@ -1,0 +1,43 @@
+Gate the raid1/raid10 `lim.features |=` assignments on the pre-6.11
+queue_limits.features field — verbatim upstream `master` variant.
+
+Companion to 0005 (md.c) and the counterpart of 0009. On bare upstream the
+raid1_set_limits / raid10_set_queue_limits bodies carry TWO adjacent feature
+touches: `lim.features |= BLK_FEAT_ATOMIC_WRITES` and, since upstream commit
+b8764f3 ("md: propagate BLK_FEAT_PCI_P2PDMA from member devices to RAID device",
+block-7.2 merge window), an unconditional `lim.features |= BLK_FEAT_PCI_P2PDMA`,
+both sitting immediately before mddev_stack_rdev_limits(). Both reference the
+struct field absent before kernel 6.11, so both must be excluded at source level.
+
+This wraps the two adjacent assignments in a single
+`#ifdef HAVE_QUEUE_LIMITS_FEATURES` block (the BLK_FEAT_PCI_P2PDMA token itself
+further resolves via compat.h's no-op fallback when the kernel has the features
+field but not that specific bit). The result is the plain upstream P2PDMA
+behaviour, correctly compiled out pre-6.11 — the intended pure-upstream baseline.
+
+On the composed meshstor-main tree the p2pdma-fixes feature deletes the adjacent
+BLK_FEAT_PCI_P2PDMA line and re-adds it past the stack call behind the member-AND
+helper (gated by 0008), so this variant does not match there. Selection is by the
+`.when` guard: 0010 applies only when raid1_can_advertise_p2pdma() is ABSENT.
+
+The hunks anchor on a leading line and on the trailing mddev_stack_rdev_limits()
+call, so they apply at --fuzz=0.
+
+--- a/raid10.c
++++ b/raid10.c
+@@ -3963,4 +3963,6 @@
+ 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
++#ifdef HAVE_QUEUE_LIMITS_FEATURES
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
+ 	lim.features |= BLK_FEAT_PCI_P2PDMA;
++#endif
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+--- a/raid1.c
++++ b/raid1.c
+@@ -3231,4 +3231,6 @@
+ 	lim.logical_block_size = mddev->logical_block_size;
++#ifdef HAVE_QUEUE_LIMITS_FEATURES
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
+ 	lim.features |= BLK_FEAT_PCI_P2PDMA;
++#endif
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);

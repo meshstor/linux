@@ -1,0 +1,9 @@
+# Guard for build-tarball's conditional patch application.
+# Format: [!]<relpath-in-tarball>:<grep -E regex>   (ALL lines must hold)
+# A leading '!' negates (the pattern must NOT be present).
+#
+# 0008 gates the meshstor p2pdma-fixes feature (member-AND advertise). It only
+# applies when that feature is composed into the tree (meshstor-main), i.e. when
+# the raid1_can_advertise_p2pdma() helper is present. On bare upstream `master`
+# the helper is absent and 0009 handles upstream's raw P2PDMA assignment instead.
+raid1-10.c:raid1_can_advertise_p2pdma

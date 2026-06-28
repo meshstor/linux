@@ -31,6 +31,39 @@ a way no header trick can cover:
   header in the Makefile.in `sym_hdr` loop; the conversion to
   `HAVE_<UPPER_SNAKE>` is automatic.
 - One patch per logical compat issue. Don't bundle.
+- Keep hunk context **minimal and symmetric** when a patch must apply to more
+  than one tree shape. `bin/build-tarball` applies patches with `patch`'s default
+  fuzz, but `test_patches_apply_clean.sh` enforces `--fuzz=0`; GNU `patch` rejects
+  a hunk at `--fuzz=0` when its leading context is *longer* than its trailing
+  context (an asymmetric short hunk), even if every context line matches. Anchor
+  on one stable leading line + one stable trailing line around the change.
+
+## Composition-dependent patches: `.when` guards and `.keep` markers
+
+The same `dkms/patches/` set is applied to two different source trees: the
+composed **meshstor-main** tree (`master` + every feature branch) and **verbatim
+upstream `master`** (`bin/deploy-branch master`, a pure-upstream-md baseline).
+Some patches must differ between the two — most visibly the queue-limits /
+P2PDMA gating, because upstream commit `b8764f3` landed its own raw
+`lim.features |= BLK_FEAT_PCI_P2PDMA`, which the meshstor `p2pdma-fixes` feature
+(commit `0ed31022`) supersedes with a member-AND gated form past the stack call.
+
+Two sidecar mechanisms make one patch set serve both trees:
+
+- **`<name>.patch.when`** — a guard evaluated by `bin/build-tarball`,
+  `lib.sh::dkms_apply_all_patches`, and `regenerate.sh`. Each line is
+  `[!]<relpath>:<grep -E regex>` (leading `!` = must be ABSENT); the patch is
+  applied only when **every** predicate holds against the just-copied tree.
+  This lets mutually-exclusive variants self-select: `0009` (and `0008`) apply
+  only when the member-AND helper `raid1_can_advertise_p2pdma()` is present;
+  `0010` only when it is absent.
+- **`<name>.patch.keep`** — marks a patch as hand-maintained: `regenerate.sh`
+  applies it (to keep cumulative state) but never re-diffs it. Used for
+  dual-shape patches whose minimal symmetric context would be clobbered by
+  diff(1)'s default 3-line context (e.g. `0002`).
+
+`regenerate.sh` auto-regenerates only patches that are neither guarded nor
+`.keep`-marked; guarded/keep patches drift-fix by hand.
 
 ## Listing
 
@@ -45,10 +78,12 @@ tree (6.18), others fill in for kernels too *old* to have a feature.
 | Patch | What it fixes | Why a patch (not compat.h) |
 |---|---|---|
 | `0001-md-getgeo-feature-gated.patch` | `block_device_operations.getgeo` callback signature changed in 6.14 | Wrapper function + conditional `.getgeo =` assignment (gated by `HAVE_GETGEO_GENDISK`) |
-| `0002-wzeroes-unmap-field-feature-gated.patch` | `struct queue_limits.max_hw_wzeroes_unmap_sectors` (added upstream in 6.18, backported into vendor kernels e.g. Ubuntu HWE 6.17) | `#ifdef HAVE_MAX_HW_WZEROES_UNMAP_SECTORS` gates the assignment — a `LINUX_VERSION_CODE < 6.18` check would incorrectly skip the backported kernels and leave the field stacked from the rdev, which fails `blk_validate_limits` |
+| `0002-wzeroes-unmap-field-feature-gated.patch` _(`.keep`)_ | `struct queue_limits.max_hw_wzeroes_unmap_sectors` (added upstream in 6.18, backported into vendor kernels e.g. Ubuntu HWE 6.17) | `#ifdef HAVE_MAX_HW_WZEROES_UNMAP_SECTORS` gates the assignment — a `LINUX_VERSION_CODE < 6.18` check would incorrectly skip the backported kernels and leave the field stacked from the rdev, which fails `blk_validate_limits`. Hand-maintained dual-shape hunk (minimal symmetric context) so it applies to both meshstor-main and bare upstream at `--fuzz=0` |
 | `0003-pre-6.18-no-mdp-superblock-1-logical-block-size.patch` | `struct mdp_superblock_1.logical_block_size` (added upstream in 6.18) — load and store paths reference a field absent from older UAPI headers | `#ifdef HAVE_MDP_SB1_LOGICAL_BLOCK_SIZE` gates two source-level field accesses; can't add a field to the kernel-owned on-disk struct from a header |
 | `0004-sysctl-table-sentinel-pre-6.4-compat.patch` | Pre-6.4 kernels (incl. RHEL 9.x's 5.14) walk the sysctl table until a NULL `procname`; without a trailing `{}` sentinel `register_sysctl` runs off the end and `sysctl_check_table` panics on first `modprobe` | `#ifndef HAVE_SYSCTL_REGISTER_TABLE_NO_SENTINEL` adds an array element — a structural change to a static initializer, not expressible as a header shim |
-| `0005-pre-6.11-no-queue-limits-features.patch` | `struct queue_limits.features` (added in 6.11) — `lim->features`/`lim.features \|=` assignments reference a field that doesn't exist pre-6.11 | `#ifdef HAVE_QUEUE_LIMITS_FEATURES` excludes the assignments at source level; equivalent WRITE_CACHE/FUA/IO_STAT/NOWAIT flags are applied via the `queue_limits_set` shim in compat.h, so cache-flush semantics stay correct |
+| `0005-pre-6.11-no-queue-limits-features.patch` | `struct queue_limits.features` (added in 6.11) — the `lim->features` assignment in `md_init_stacking_limits()` references a field that doesn't exist pre-6.11 | `#ifdef HAVE_QUEUE_LIMITS_FEATURES` excludes the assignment at source level; equivalent WRITE_CACHE/FUA/IO_STAT/NOWAIT flags are applied via the `queue_limits_set` shim in compat.h, so cache-flush semantics stay correct. md.c hunk only — the raid1/raid10 `lim.features` touches are split into 0009/0010 because their surrounding code differs by composition |
 | `0006-bdev-file-release-via-compat-helper.patch` | `fput(rdev->bdev_file)` must become `bdev_release()` on 6.8, where `bdev_file` is really a reinterpreted `struct bdev_handle *` | Routes only the bdev_file path through `ms_bdev_file_release()` (compat.h) — can't shim `fput()` globally because md.c also `fput()`s real bitmap files in the same TU |
 | `0007-register-sysctl-non-const-cast.patch` | Pre-6.6 `register_sysctl_sz` takes non-const `struct ctl_table *`; `raid_table` is `static const`, so the implicit const-drop trips `-Werror=discarded-qualifiers` | Hand-expands the `register_sysctl` macro to cast only the table arg while keeping `raid_table` an array for `ARRAY_SIZE` — a casting trick a header can't apply |
-| `0008-p2pdma-feature-flag-gating.patch` | gates the P2P feature (which lives in `drivers/md` on feature branch `p2pdma-fixes`: member-AND advertise + `raid1_can_advertise_p2pdma()`, `md_bio_is_p2pdma()`, `REQ_NOMERGE` preserve, write-behind skip) so it compiles out on pre-6.11 kernels | Source-level, `#ifdef HAVE_BLK_FEAT_PCI_P2PDMA`. On kernels without the flag (e.g. RHEL9/5.14) the helper and both advertise sites `#ifdef` out and `md_bio_is_p2pdma()` folds to false. The feature *logic* is a feature branch, not a patch; only this capability-gating is compat |
+| `0008-p2pdma-feature-flag-gating.patch` _(`.when`: helper present)_ | gates the P2P feature (which lives in `drivers/md` on feature branch `p2pdma-fixes`: member-AND advertise + `raid1_can_advertise_p2pdma()`, `md_bio_is_p2pdma()`, `REQ_NOMERGE` preserve, write-behind skip) so it compiles out on pre-6.11 kernels | Source-level, `#ifdef HAVE_BLK_FEAT_PCI_P2PDMA`. On kernels without the flag (e.g. RHEL9/5.14) the helper and both advertise sites `#ifdef` out and `md_bio_is_p2pdma()` folds to false. The feature *logic* is a feature branch, not a patch; only this capability-gating is compat. Guarded to the composed meshstor-main tree (member-AND helper present) |
+| `0009-pre-6.11-no-queue-limits-features-raid-meshstor.patch` _(`.when`: helper present)_ | raid1/raid10 `lim.features \|= BLK_FEAT_ATOMIC_WRITES` gating — composed meshstor-main shape, where the assignment sits immediately before `mddev_stack_rdev_limits()` (the P2PDMA advertise having moved past the stack call, gated by 0008) | `#ifdef HAVE_QUEUE_LIMITS_FEATURES`. Companion to 0005's md.c hunk. Split from 0010 because meshstor-main and bare upstream place the surrounding `lim.features` lines differently — one fuzz-0 hunk can't anchor on both |
+| `0010-pre-6.11-no-queue-limits-features-raid-upstream.patch` _(`.when`: helper absent)_ | raid1/raid10 `lim.features` gating — **verbatim upstream `master`** shape, where ATOMIC_WRITES and upstream's raw `BLK_FEAT_PCI_P2PDMA` (commit `b8764f3`) sit adjacent before the stack call | `#ifdef HAVE_QUEUE_LIMITS_FEATURES` wraps both assignments together, yielding the plain upstream P2PDMA baseline correctly compiled out pre-6.11. Guarded to bare upstream (member-AND helper absent); on meshstor-main 0008+0009 handle it instead |
