@@ -1,24 +1,46 @@
 # SPDX-License-Identifier: GPL-2.0
 # Shared helpers for raid10 selftests.
 #
-# These tests target the in-tree md/raid10 driver via stock /dev/mdN
-# devices by default.  They can also target the out-of-tree meshstor-ms
-# variant (raid10_ms.ko under ms_mod.ko, major 252, devices /dev/msN)
-# by exporting:
-#   MDADM=/home/mykola/mdadm/mdadm   # patched mdadm that knows /dev/msN
-#   RAID10_DEV_PREFIX=ms             # device basename prefix (default md)
-#   RAID10_SYSFS_SUBDIR=ms           # /sys/block/<dev>/<subdir> (default md)
-#   RAID10_MDSTAT=/proc/msstat       # personality file (default /proc/mdstat)
+# A single knob, MD_SUBSYS, selects the subsystem and derives the device
+# prefix, sysfs subdir, personality file and mdadm -- matching ../lib.sh.
+#
+#   MD_SUBSYS=ms (default) -> out-of-tree meshstor-ms raid10_ms.ko (under
+#                ms_mod.ko, major 252, devices /dev/msN, /sys/block/msN/ms,
+#                /proc/msstat, patched mdadm).
+#   MD_SUBSYS=md           -> in-tree md/raid10 driver (stock /dev/mdN).
+#
+# ms is the default so a bare run validates the meshstor product.  md is
+# opt-in: test_recovery_freeze_deadlock.sh HARD-WEDGES the in-tree driver
+# (unkillable D-state kthreads, reboot to clear) because it lacks the
+# per-bucket-arrays fix; raid10_ms carries that fix and survives the test.
+#
+# The individual RAID10_DEV_PREFIX / RAID10_SYSFS_SUBDIR / RAID10_MDSTAT /
+# MDADM vars below still override the derived values when set explicitly.
 #
 # Loop devices on tmpfs back the array so storage is fast enough that
 # barrier-path lock contention is the dominant cost.
 
 set -u
 
-MDADM="${MDADM:-mdadm}"
-RAID10_DEV_PREFIX="${RAID10_DEV_PREFIX:-md}"
-RAID10_SYSFS_SUBDIR="${RAID10_SYSFS_SUBDIR:-md}"
-RAID10_MDSTAT="${RAID10_MDSTAT:-/proc/mdstat}"
+MD_SUBSYS="${MD_SUBSYS:-ms}"
+case "$MD_SUBSYS" in
+	ms)
+		RAID10_DEV_PREFIX="${RAID10_DEV_PREFIX:-ms}"
+		RAID10_SYSFS_SUBDIR="${RAID10_SYSFS_SUBDIR:-ms}"
+		RAID10_MDSTAT="${RAID10_MDSTAT:-/proc/msstat}"
+		MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
+		;;
+	md)
+		RAID10_DEV_PREFIX="${RAID10_DEV_PREFIX:-md}"
+		RAID10_SYSFS_SUBDIR="${RAID10_SYSFS_SUBDIR:-md}"
+		RAID10_MDSTAT="${RAID10_MDSTAT:-/proc/mdstat}"
+		MDADM="${MDADM:-mdadm}"
+		;;
+	*)
+		echo "FAIL: unknown MD_SUBSYS=$MD_SUBSYS (want 'ms' or 'md')" >&2
+		exit 1
+		;;
+esac
 
 RAID10_TEST_LOOPS=()
 RAID10_TEST_FILES=()
