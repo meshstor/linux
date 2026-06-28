@@ -326,22 +326,38 @@ array_assemble() {
     # mid-run, OOM'd, or whose teardown was skipped). See wipe_array_state.
     wipe_array_state
     log "array: assemble $ARRAY_DEV engine=$ENGINE level=$LEVEL devices=$RAID_DEVICES bitmap=$BITMAP members=${ARRAY_MEMBERS[*]}"
+    # Create flags mirror the CSI driver's mdraid.buildCreateArgs so the
+    # benchmark measures the same on-disk array geometry the driver deploys in
+    # production rather than mdadm's defaults:
+    #   --metadata=1.2 --homehost=any --assume-clean   (already matched below)
+    #   --bitmap-chunk=128M          dirty-region granularity; mdadm's default
+    #                                scales with array size, so omitting it
+    #                                benchmarks a different bitmap than prod.
+    #   --consistency-policy=bitmap  explicit (implied by --bitmap for internal,
+    #                                but the driver always states it).
+    #   --failfast                   fail a member fast on I/O error instead of
+    #                                retrying through block-layer timeouts.
+    #   --chunk=64 --layout=n2       raid10 only: 64 KiB stripe unit (mdadm's
+    #                                512 KiB default is too coarse for 100 GbE
+    #                                NVMe/TCP) and explicit near=2. raid1 omits
+    #                                both, exactly as DetermineRAIDLevel does.
+    # --uuid is intentionally NOT mirrored: the driver derives it from the
+    # volume name for relocation; the perf harness never relocates.
+    local -a create_args=(
+        --create "$ARRAY_DEV"
+        --level="$LEVEL" --raid-devices="$RAID_DEVICES"
+        --metadata=1.2 --homehost=any --assume-clean
+        --bitmap="$BITMAP" --bitmap-chunk=128M --consistency-policy=bitmap
+        --failfast --run
+    )
+    if [[ "$LEVEL" == "raid10" ]]; then
+        create_args+=( --chunk=64 --layout=n2 )
+    fi
+    create_args+=( "${ARRAY_MEMBERS[@]}" )
     case "$ENGINE" in
-        ms)
-            run_log "$MSADM" --create "$ARRAY_DEV" \
-                --level="$LEVEL" --raid-devices="$RAID_DEVICES" \
-                --bitmap="$BITMAP" --metadata=1.2 \
-                --run --assume-clean \
-                "${ARRAY_MEMBERS[@]}"
-            ;;
-        md)
-            run_log mdadm --create "$ARRAY_DEV" \
-                --level="$LEVEL" --raid-devices="$RAID_DEVICES" \
-                --bitmap="$BITMAP" --metadata=1.2 \
-                --run --assume-clean \
-                "${ARRAY_MEMBERS[@]}"
-            ;;
-        *) die_setup "array_assemble: unknown engine: $ENGINE" ;;
+        ms) run_log "$MSADM" "${create_args[@]}" ;;
+        md) run_log mdadm    "${create_args[@]}" ;;
+        *)  die_setup "array_assemble: unknown engine: $ENGINE" ;;
     esac
 }
 
