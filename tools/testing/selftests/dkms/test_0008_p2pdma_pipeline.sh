@@ -112,9 +112,10 @@ assert_file_matches "$OUT/raid10_ms.c" 'raid1_can_advertise_p2pdma\(mssev\)' \
 # --- write-behind skip survives, on the ORIGINAL bio helper -------------
 assert_file_matches "$OUT/raid1_ms.c" '!ms_bio_is_p2pdma\(bio\)' \
 	"raid1 write-behind must skip P2P bios"
-# 0010 is deleted: raid1_should_handle_error stays upstream (no P2P special-case).
+# An experimental raid1_should_handle_error P2P special-case was dropped from the
+# feature branch: it stays upstream, with no is_pci_p2pdma_page check there.
 assert_file_not_matches "$OUT/raid1-10_ms.c" 'is_pci_p2pdma_page' \
-	"raid1_should_handle_error must carry NO P2P change (0010 deleted)"
+	"raid1_should_handle_error must carry NO P2P change"
 # base must NOT contain the deferred error-path/self-heal code (separate checks,
 # regex-dialect-agnostic):
 assert_file_not_matches "$OUT/raid1_ms.c" 'R1BIO_P2P' \

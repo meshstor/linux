@@ -1,0 +1,35 @@
+Gate the raid1/raid10 `lim.features |= BLK_FEAT_ATOMIC_WRITES` assignment on the
+pre-6.11 queue_limits.features field — composed meshstor-main variant.
+
+Companion to 0005 (which gates the md.c md_init_stacking_limits assignment). The
+per-personality `lim.features` touch lives in raid1_set_limits /
+raid10_set_queue_limits and likewise references a struct field absent before
+kernel 6.11, so it must be excluded at source level.
+
+This variant matches the COMPOSED meshstor-main tree shape, where the ATOMIC_WRITES
+assignment is immediately followed by mddev_stack_rdev_limits() — the member-AND
+P2PDMA advertise (commit 0ed31022) having been moved PAST the stack call, where it
+is gated separately by 0008. On verbatim upstream `master` an extra
+`lim.features |= BLK_FEAT_PCI_P2PDMA` sits between ATOMIC_WRITES and the stack call,
+so that shape is handled by 0010 instead. Selection is by the `.when` guard:
+0009 applies only when the meshstor helper raid1_can_advertise_p2pdma() is present.
+
+The hunks anchor on a leading line common to both raid personalities' variants and
+on the trailing mddev_stack_rdev_limits() call, so they apply at --fuzz=0.
+
+--- a/raid10.c
++++ b/raid10.c
+@@ -4391,3 +4391,5 @@
+ 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
++#ifdef HAVE_QUEUE_LIMITS_FEATURES
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
++#endif
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+--- a/raid1.c
++++ b/raid1.c
+@@ -3339,3 +3339,5 @@
+ 	lim.logical_block_size = mddev->logical_block_size;
++#ifdef HAVE_QUEUE_LIMITS_FEATURES
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
++#endif
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);

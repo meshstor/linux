@@ -1,0 +1,9 @@
+# Guard for build-tarball / dkms_apply_all_patches conditional patch application.
+# Format: [!]<relpath-in-tarball>:<grep -E regex>   (ALL lines must hold)
+# A leading '!' negates (the pattern must NOT be present).
+#
+# 0009 is the composed meshstor-main raid variant: it applies only when the
+# member-AND helper raid1_can_advertise_p2pdma() (added by the p2pdma-fixes
+# feature, commit 0ed31022) is present. On bare upstream `master` the helper is
+# absent and 0010 handles the upstream raid shape instead.
+raid1-10.c:raid1_can_advertise_p2pdma

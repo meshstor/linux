@@ -1,13 +1,21 @@
-Gate `lim->features` / `lim.features |=` assignments on the queue_limits.features
-field (introduced in kernel 6.11). On older kernels the field doesn't exist at all,
-so the assignment can't be papered over by a header shim — it has to be excluded
-at source level. The equivalent flags (WRITE_CACHE | FUA | IO_STAT | NOWAIT) are
-applied via blk_queue_*-style calls inside the queue_limits_set compat shim
-(dkms/compat/compat.h), so 6.8 still gets correct cache-flush semantics.
+Gate `lim->features` assignment in md_init_stacking_limits() on the
+queue_limits.features field (introduced in kernel 6.11). On older kernels the
+field doesn't exist at all, so the assignment can't be papered over by a header
+shim — it has to be excluded at source level. The equivalent flags
+(WRITE_CACHE | FUA | IO_STAT | NOWAIT) are applied via blk_queue_*-style calls
+inside the queue_limits_set compat shim (dkms/compat/compat.h), so 6.8 still gets
+correct cache-flush semantics.
 
-ATOMIC_WRITES has no equivalent on pre-6.11 — the atomic-write infrastructure
-itself is absent (REQ_ATOMIC is shimmed to 0 in compat.h), so dropping the
-feature flag is consistent.
+This patch carries ONLY the md.c hunk, which is identical on every tree (the
+generic md core is untouched by the meshstor feature branches). The per-personality
+`lim.features |=` assignments in raid1.c / raid10.c are gated by 0009 (composed
+meshstor-main tree) and 0010 (verbatim upstream `master`) instead: those two files'
+queue-limits code differs by composition — meshstor-main refactored
+raid10_set_queue_limits to take a `conf` arg, and bare upstream carries a second
+`lim.features |= BLK_FEAT_PCI_P2PDMA` (commit b8764f3) between the ATOMIC_WRITES
+assignment and the stack call — so a single fuzz-0 hunk can't anchor on both. The
+0009/0010 split is selected by `.when` guards on the presence of the meshstor
+member-AND helper raid1_can_advertise_p2pdma().
 
 HAVE_QUEUE_LIMITS_FEATURES is set by dkms/Makefile.in's feature_flags target
 when the running kernel's <linux/blkdev.h> defines `features` inside
@@ -25,28 +33,3 @@ when the running kernel's <linux/blkdev.h> defines `features` inside
 +#endif
  }
  EXPORT_SYMBOL_GPL(md_init_stacking_limits);
- 
---- a/raid10.c
-+++ b/raid10.c
-@@ -4258,7 +4258,9 @@
- 	lim.io_min = chunk_sectors << 9;
- 	lim.chunk_sectors = chunk_sectors;
- 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);
-+#ifdef HAVE_QUEUE_LIMITS_FEATURES
- 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
-+#endif
- 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
- 	if (err)
- 		return err;
---- a/raid1.c
-+++ b/raid1.c
-@@ -3190,7 +3190,9 @@
- 	lim.max_hw_wzeroes_unmap_sectors = 0;
- #endif
- 	lim.logical_block_size = mddev->logical_block_size;
-+#ifdef HAVE_QUEUE_LIMITS_FEATURES
- 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
-+#endif
- 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
- 	if (err)
- 		return err;
