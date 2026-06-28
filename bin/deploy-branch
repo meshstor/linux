@@ -13,6 +13,13 @@
 #                  install kernel headers -> dkms ldtarball + install ->
 #                  modprobe ms_mod raid1_ms raid10_ms -> verify /proc/msstat
 #
+# --skip-rebuild trades the rebuild-main step for the branch's tree verbatim:
+# instead of re-applying the feature's patches onto a fresh torvalds master
+# (a rebase), it points bin/build-tarball at <branch>'s own drivers/md/ (via a
+# reused or temporary git worktree), so what ships is exactly what the branch
+# holds. Contrast --no-rebuild, which skips build-tarball too and reuses a
+# previously built tarball.
+#
 # Cleanup mode (--cleanup): the inverse. No build. Per host: unload the modules
 # (raid10_ms, raid1_ms, ms_mod) and dkms-remove every meshstor-ms version,
 # returning the host to a no-meshstor state. The <branch> arg is still accepted
@@ -35,6 +42,9 @@ BUILD_TARBALL="$REPO_ROOT/bin/build-tarball"
 SSH_USER="$(id -un)"
 VERSION=""
 NO_REBUILD=0
+SKIP_REBUILD=0
+SKIP_REBUILD_TREE=""       # resolved drivers/md/ source tree for --skip-rebuild
+SKIP_REBUILD_WORKTREE=""   # set when we create a throwaway worktree (for cleanup)
 CLEANUP=0
 BRANCH=""
 HOSTS=()
@@ -55,6 +65,10 @@ Options:
   -V, --version VER   override the derived DKMS version string
       --no-rebuild    skip rebuild-main + build-tarball; reuse an existing
                       build/meshstor-ms-<version>.dkms.tar.gz
+      --skip-rebuild  skip rebuild-main (no rebase onto fresh upstream); still
+                      build the tarball, packaging <branch>'s drivers/md/
+                      verbatim. Set KERNEL_TREE to override the source tree.
+                      Mutually exclusive with --no-rebuild.
       --cleanup       purge instead of deploy: unload the modules and
                       dkms-remove every meshstor-ms version on each host.
                       No build; <branch> is accepted but ignored.
@@ -63,11 +77,71 @@ Options:
 Examples:
   $(basename "$0") llbitmap-fixes 10.0.0.11 10.0.0.12
   $(basename "$0") -u admin llbitmap-fixes 10.0.0.11 root@10.0.0.13
+  $(basename "$0") --skip-rebuild llbitmap-fixes 10.0.0.11 10.0.0.12
   $(basename "$0") llbitmap-fixes 10.0.0.11 10.0.0.12 --cleanup
 EOF
 }
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# Remove the throwaway worktree we may have created for --skip-rebuild. Safe to
+# call unconditionally (no-op when we reused an existing worktree or honored a
+# user-supplied KERNEL_TREE). Runs on any exit so an interrupted build doesn't
+# leak a registered worktree.
+cleanup_skip_rebuild() {
+    [[ -n "$SKIP_REBUILD_WORKTREE" ]] || return 0
+    git -C "$REPO_ROOT" worktree remove --force "$SKIP_REBUILD_WORKTREE" 2>/dev/null \
+        || rm -rf "$SKIP_REBUILD_WORKTREE"
+    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+}
+trap cleanup_skip_rebuild EXIT
+
+# Resolve a drivers/md/ source tree for --skip-rebuild into the global
+# SKIP_REBUILD_TREE. The branch is taken *as it is* — no rebase onto a fresh
+# upstream:
+#   1. an explicit KERNEL_TREE from the environment always wins;
+#   2. otherwise an existing worktree already checked out on $BRANCH is reused;
+#   3. otherwise the branch is materialized into a temporary *detached* worktree
+#      (detached so it never claims the branch ref nor collides with a worktree
+#      that already has it checked out), recorded in SKIP_REBUILD_WORKTREE for
+#      cleanup on exit.
+# Results come back via globals — NOT stdout — because this must run in the
+# parent shell (not a $(...) subshell), or the SKIP_REBUILD_WORKTREE it sets
+# would be lost and the temporary worktree would leak past the cleanup trap.
+resolve_skip_rebuild_tree() {
+    if [[ -n "${KERNEL_TREE:-}" ]]; then
+        [[ -d "$KERNEL_TREE/drivers/md" ]] \
+            || die "--skip-rebuild: KERNEL_TREE=$KERNEL_TREE has no drivers/md/"
+        echo "==> skip-rebuild: using KERNEL_TREE=$KERNEL_TREE"
+        SKIP_REBUILD_TREE="$KERNEL_TREE"
+        return 0
+    fi
+
+    local wt
+    wt="$(git -C "$REPO_ROOT" worktree list --porcelain \
+            | awk -v want="branch refs/heads/$BRANCH" '
+                /^worktree /{p=substr($0,10)}
+                $0==want{print p; exit}')"
+    if [[ -n "$wt" && -d "$wt/drivers/md" ]]; then
+        echo "==> skip-rebuild: reusing worktree $wt (on branch $BRANCH)"
+        SKIP_REBUILD_TREE="$wt"
+        return 0
+    fi
+
+    local commit
+    commit="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${BRANCH}^{commit}")" \
+        || die "--skip-rebuild: ref '$BRANCH' not found in $REPO_ROOT (need a local branch, tag, or SHA)"
+    SKIP_REBUILD_WORKTREE="$REPO_ROOT/build/skip-rebuild-${BRANCH//[^A-Za-z0-9._-]/-}"
+    git -C "$REPO_ROOT" worktree remove --force "$SKIP_REBUILD_WORKTREE" 2>/dev/null || true
+    rm -rf "$SKIP_REBUILD_WORKTREE"
+    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+    mkdir -p "$REPO_ROOT/build"
+    echo "==> skip-rebuild: checking out $BRANCH ($commit) into a temporary worktree"
+    git -C "$REPO_ROOT" worktree add --detach "$SKIP_REBUILD_WORKTREE" "$commit"
+    [[ -d "$SKIP_REBUILD_WORKTREE/drivers/md" ]] \
+        || die "--skip-rebuild: branch '$BRANCH' has no drivers/md/"
+    SKIP_REBUILD_TREE="$SKIP_REBUILD_WORKTREE"
+}
 
 # ---- argument parsing ----
 # Options may be interspersed with or follow positionals, so we scan every arg
@@ -79,6 +153,7 @@ while [[ $# -gt 0 ]]; do
         -u|--user)    SSH_USER="${2:?--user needs a value}"; shift 2 ;;
         -V|--version) VERSION="${2:?--version needs a value}"; shift 2 ;;
         --no-rebuild) NO_REBUILD=1; shift ;;
+        --skip-rebuild) SKIP_REBUILD=1; shift ;;
         --cleanup)    CLEANUP=1; shift ;;
         -h|--help)    usage; exit 0 ;;
         --)           shift; ARGS+=("$@"); break ;;
@@ -89,6 +164,9 @@ done
 [[ ${#ARGS[@]} -lt 2 ]] && { usage >&2; die "need a <branch> and at least one <host>"; }
 BRANCH="${ARGS[0]}"
 HOSTS=("${ARGS[@]:1}")
+
+[[ "$NO_REBUILD" -eq 1 && "$SKIP_REBUILD" -eq 1 ]] \
+    && die "--no-rebuild and --skip-rebuild are mutually exclusive (see --help)"
 
 command -v ssh >/dev/null || die "ssh not found"
 command -v scp >/dev/null || die "scp not found"
@@ -105,6 +183,11 @@ else
     echo "==> mode:    DEPLOY"
     echo "==> branch:  $BRANCH"
     echo "==> version: $VERSION"
+    if [[ "$NO_REBUILD" -eq 1 ]]; then
+        echo "==> rebuild: SKIPPED (--no-rebuild; reuse existing tarball)"
+    elif [[ "$SKIP_REBUILD" -eq 1 ]]; then
+        echo "==> rebuild: SKIPPED (--skip-rebuild; package branch as-is)"
+    fi
 fi
 echo "==> hosts:   ${HOSTS[*]}"
 echo "==> ssh user (default): $SSH_USER"
@@ -115,6 +198,12 @@ if [[ "$CLEANUP" -eq 0 ]]; then
     if [[ "$NO_REBUILD" -eq 1 ]]; then
         [[ -f "$TARBALL" ]] || die "--no-rebuild but $TARBALL does not exist"
         echo "==> reusing existing tarball: $TARBALL"
+    elif [[ "$SKIP_REBUILD" -eq 1 ]]; then
+        echo "==> skip-rebuild: packaging branch '$BRANCH' as-is (no rebase onto upstream)"
+        resolve_skip_rebuild_tree   # sets SKIP_REBUILD_TREE (run in parent shell, not $(...))
+        echo "==> building DKMS tarball $VERSION from $SKIP_REBUILD_TREE"
+        KERNEL_TREE="$SKIP_REBUILD_TREE" "$BUILD_TARBALL" "$VERSION"
+        [[ -f "$TARBALL" ]] || die "build-tarball did not produce $TARBALL"
     else
         echo "==> building source tree from branch '$BRANCH'"
         "$REBUILD_MAIN" "$BRANCH"
