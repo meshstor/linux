@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# rebuild-meshstor-main — reconstruct the meshstor-main branch by cherry-picking
+# every feature branch's commits onto origin/master, then optionally build,
+# reload, and test the result.
+#
+# Unlike bin/rebuild-main (which composes a *torvalds-based* buildable tree via
+# filter-repo + git am), this script composes the *meshstor* meshstor-main
+# branch directly in this repo: it resets meshstor-main to origin/master in a
+# dedicated worktree and cherry-picks origin/master..origin/<branch> for each
+# feature branch, in order. The result is ready to force-push.
+#
+# Feature branches = every refs/remotes/origin/* EXCEPT master,
+# meshstor-harness, meshstor-main. Order: llbitmap-fixes first (if present),
+# then the rest alphabetically. Each branch must be based on the current
+# origin/master (validated up front) or the run aborts.
+#
+# Run from the meshstor-harness checkout — it needs that branch's dkms/ + bin/
+# tooling, which meshstor-main (kernel-tree-only) does not carry.
+#
+# See docs/superpowers/specs/2026-06-28-rebuild-meshstor-main-script-design.md
+#
+# Usage: bin/rebuild-meshstor-main [options]
+set -euo pipefail
+
+PROG="$(basename "$0")"
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+REMOTE="origin"
+BASE_REF="$REMOTE/master"
+TARGET_BRANCH="meshstor-main"
+EXCLUDE=(master meshstor-harness meshstor-main HEAD)
+PRIORITY_BRANCH="llbitmap-fixes"   # always cherry-picked first when present
+WORKTREE="$REPO_ROOT/.worktrees/meshstor-main-rebuild"
+
+# Defaults
+NO_FETCH=
+NO_BUILD=
+NO_LOAD=
+NO_TEST=
+KEEP=
+VERSION="0.1.0-mainrebuild"
+KDIR="${KDIR:-/lib/modules/$(uname -r)/build}"
+TEST_TIMEOUT=120   # per md test, seconds; 0 disables
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options]
+
+Reconstruct the $TARGET_BRANCH branch by cherry-picking every $REMOTE feature
+branch onto $BASE_REF, in a dedicated worktree, then optionally build, reload
+and test the modules. Run from the meshstor-harness checkout.
+
+Feature branches: all $REMOTE/* except ${EXCLUDE[*]}.
+Order: $PRIORITY_BRANCH first (if present), then the rest alphabetically.
+
+Stages (all on by default):
+  1. reconstruct  cherry-pick the feature branches onto $BASE_REF
+  2. build        KERNEL_TREE=<worktree> bin/build-tarball + make (compile check)
+  3. load         rmmod + insmod the freshly built modules (needs root/sudo)
+  4. test         dkms tooling selftests + reconstructed-tree md selftests
+
+Options:
+  --no-fetch        Skip 'git fetch $REMOTE'; use cached remote-tracking refs.
+  --no-build        Skip the build stage.
+  --no-load         Skip the module reload stage.
+  --no-test         Skip the selftest stage.
+  --version <v>     Version passed to bin/build-tarball (sets PACKAGE_VERSION /
+                    MS_VERSION / MODULE_VERSION and the tarball filename).
+                    Default: $VERSION
+  --test-timeout N  Per-md-test wall-clock limit in seconds (0 disables).
+                    A test that exceeds it is killed and marked failed so the
+                    suite continues. Default: $TEST_TIMEOUT
+  --keep            If the reconstruction worktree already exists, bail instead
+                    of wiping it (protects in-progress conflict resolution).
+                    A successful run always leaves the worktree in place so you
+                    can push from it.
+  -h, --help        Show this help.
+
+The script never pushes. On success it prints the exact force-push command.
+
+Notes:
+  * Both test suites GATE the exit. The dkms tooling selftests run against the
+    reconstructed tree (KERNEL_TREE=<worktree>); the md runtime selftests run
+    against the loaded modules. Either suite failing makes the script exit
+    non-zero. (Run standalone on a bare harness checkout with no composed tree,
+    the source-dependent dkms tests SKIP rather than fail.)
+  * Some md raid10 tests deliberately reproduce barrier deadlocks; if the kernel
+    code under test is affected they can wedge kernel threads (D state) that
+    a reboot clears. The per-test timeout bounds wall-clock but cannot kill
+    wedged in-kernel threads.
+EOF
+}
+
+log()  { printf '%s: %s\n' "$PROG" "$*"; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+while (($#)); do
+    case "$1" in
+        --no-fetch) NO_FETCH=1; shift ;;
+        --no-build) NO_BUILD=1; shift ;;
+        --no-load)  NO_LOAD=1; shift ;;
+        --no-test)  NO_TEST=1; shift ;;
+        --keep)     KEEP=1; shift ;;
+        --version)  VERSION="${2:?--version needs an argument}"; shift 2 ;;
+        --test-timeout) TEST_TIMEOUT="${2:?--test-timeout needs an argument}"; shift 2 ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------------
+# We need the harness tooling (dkms/, bin/) which meshstor-main does not carry.
+[[ -d "$REPO_ROOT/dkms" && -d "$REPO_ROOT/bin" ]] \
+    || die "must run from the meshstor-harness checkout (no dkms/ + bin/ here)"
+
+cd "$REPO_ROOT"
+
+# Resolve elevation strategy for kernel-side ops (load) and root-only md tests.
+# git/build run as the invoking user (avoids 'dubious ownership' on a user repo);
+# only rmmod/insmod and the md selftests are elevated.
+if [[ "$(id -u)" -eq 0 ]]; then
+    SUDO=()
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO=(sudo)
+else
+    SUDO=()
+fi
+need_priv() {  # die if we can neither be root nor sudo
+    [[ "$(id -u)" -eq 0 || ${#SUDO[@]} -gt 0 ]] \
+        || die "$1 needs root and no sudo is available; re-run as root or pass --no-load --no-test"
+}
+[[ -z "$NO_LOAD" ]] && need_priv "module reload (--no-load to skip)"
+
+# ---------------------------------------------------------------------------
+# Stage 1a: fetch + discover + order branches
+# ---------------------------------------------------------------------------
+if [[ -z "$NO_FETCH" ]]; then
+    log "fetching $REMOTE"
+    git fetch --prune "$REMOTE"
+else
+    log "--no-fetch: using cached remote-tracking refs"
+fi
+
+git rev-parse --verify --quiet "$BASE_REF" >/dev/null \
+    || die "$BASE_REF not found — fetch $REMOTE or drop --no-fetch"
+BASE_SHA="$(git rev-parse "$BASE_REF")"
+
+is_excluded() {
+    local b="$1" e
+    for e in "${EXCLUDE[@]}"; do [[ "$b" == "$e" ]] && return 0; done
+    return 1
+}
+
+# All candidate feature branches (leaf names), alphabetical. lstrip=3 drops
+# 'refs/remotes/<remote>/', so the symbolic refs/remotes/origin/HEAD yields the
+# leaf 'HEAD' (caught by EXCLUDE) rather than shortening to '<remote>'.
+mapfile -t CANDIDATES < <(
+    git for-each-ref --format='%(refname:lstrip=3)' "refs/remotes/$REMOTE" \
+        | sort -u
+)
+
+ORDERED=()
+have_priority=
+for b in "${CANDIDATES[@]}"; do
+    is_excluded "$b" && continue
+    [[ "$b" == "$PRIORITY_BRANCH" ]] && { have_priority=1; continue; }
+    ORDERED+=("$b")
+done
+# llbitmap-fixes first, then the alphabetical remainder.
+[[ -n "$have_priority" ]] && ORDERED=("$PRIORITY_BRANCH" "${ORDERED[@]}")
+
+((${#ORDERED[@]})) || die "no feature branches found under $REMOTE/ (excluding ${EXCLUDE[*]})"
+
+log "base: $BASE_REF = ${BASE_SHA:0:12}"
+log "feature branches to cherry-pick, in order:"
+for b in "${ORDERED[@]}"; do
+    printf '       %-22s (%s commits)\n' \
+        "$b" "$(git rev-list --count "$BASE_REF..$REMOTE/$b")"
+done
+
+# ---------------------------------------------------------------------------
+# Stage 1b: base validation — every branch must descend from current base
+# ---------------------------------------------------------------------------
+offenders=()
+for b in "${ORDERED[@]}"; do
+    if ! git merge-base --is-ancestor "$BASE_REF" "$REMOTE/$b"; then
+        mb="$(git merge-base "$BASE_REF" "$REMOTE/$b" 2>/dev/null || echo '(none)')"
+        offenders+=("$b  merge-base=${mb:0:12}  $BASE_REF=${BASE_SHA:0:12}")
+    fi
+done
+if ((${#offenders[@]})); then
+    {
+        echo "$PROG: error: the following branches are not based on current $BASE_REF:"
+        for o in "${offenders[@]}"; do echo "  $o"; done
+        echo "  rebase each onto $BASE_REF and re-run."
+    } >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 1c: prepare the reconstruction worktree
+# ---------------------------------------------------------------------------
+current_branch="$(git symbolic-ref --short -q HEAD || true)"
+[[ "$current_branch" == "$TARGET_BRANCH" ]] \
+    && die "the main checkout has $TARGET_BRANCH checked out; switch away first"
+
+if [[ -e "$WORKTREE" ]]; then
+    [[ -n "$KEEP" ]] && die "$WORKTREE already exists (remove it or run without --keep)"
+    log "wiping previous worktree at $WORKTREE"
+    git worktree remove --force "$WORKTREE" 2>/dev/null || rm -rf "$WORKTREE"
+fi
+git worktree prune
+mkdir -p "$(dirname "$WORKTREE")"
+
+log "creating worktree $WORKTREE on $TARGET_BRANCH @ $BASE_REF"
+git worktree add -B "$TARGET_BRANCH" "$WORKTREE" "$BASE_REF" >/dev/null
+
+# ---------------------------------------------------------------------------
+# Stage 1d: cherry-pick each branch's commits onto the worktree
+# ---------------------------------------------------------------------------
+declare -A PICKED
+for b in "${ORDERED[@]}"; do
+    n="$(git rev-list --count "$BASE_REF..$REMOTE/$b")"
+    if ((n == 0)); then
+        log "$b: 0 commits ahead of $BASE_REF — skipping"
+        PICKED["$b"]=0
+        continue
+    fi
+    log "cherry-picking $n commits from $REMOTE/$b"
+    if ! git -C "$WORKTREE" cherry-pick "$BASE_REF..$REMOTE/$b"; then
+        {
+            echo
+            echo "$PROG: error: cherry-pick conflict while applying '$b'"
+            echo "  worktree: $WORKTREE"
+            git -C "$WORKTREE" status --short | sed 's/^/    /'
+            echo "  resolve, then: git -C $WORKTREE cherry-pick --continue"
+            echo "  or abort:      git -C $WORKTREE cherry-pick --abort"
+            echo "  (then re-run $PROG to continue from a clean state)"
+        } >&2
+        exit 1
+    fi
+    PICKED["$b"]=$n
+done
+
+FINAL_SHA="$(git -C "$WORKTREE" rev-parse HEAD)"
+TOTAL="$(git -C "$WORKTREE" rev-list --count "$BASE_REF..HEAD")"
+log "reconstruction complete: $TOTAL commits on $TARGET_BRANCH (${FINAL_SHA:0:12})"
+
+# ---------------------------------------------------------------------------
+# Stage 2: build (tarball assembly + compile check)
+# ---------------------------------------------------------------------------
+BUILD_DIR="$REPO_ROOT/build/meshstor-ms-$VERSION"
+if [[ -z "$NO_BUILD" ]]; then
+    log "assembling tarball (KERNEL_TREE=$WORKTREE, version=$VERSION)"
+    KERNEL_TREE="$WORKTREE" "$REPO_ROOT/bin/build-tarball" "$VERSION"
+
+    log "compiling modules (make -C $BUILD_DIR KDIR=$KDIR)"
+    make -C "$BUILD_DIR" KDIR="$KDIR" -j"$(nproc)"
+
+    for ko in ms_mod raid1_ms raid10_ms; do
+        [[ -f "$BUILD_DIR/$ko.ko" ]] || die "build produced no $ko.ko"
+    done
+    log "built modules: ms_mod.ko raid1_ms.ko raid10_ms.ko"
+else
+    log "--no-build: skipping tarball + compile"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 3: reload modules
+# ---------------------------------------------------------------------------
+if [[ -z "$NO_LOAD" ]]; then
+    [[ -n "$NO_BUILD" ]] && die "--no-load is implied by --no-build (nothing freshly built to load)"
+    [[ -f "$BUILD_DIR/ms_mod.ko" ]] || die "no built modules at $BUILD_DIR — run without --no-build"
+
+    if [[ -f /proc/msstat ]] && grep -qE '^ms[0-9]+[[:space:]]*:' /proc/msstat; then
+        echo "$PROG: error: active ms arrays present — stop them first:" >&2
+        grep -E '^ms[0-9]+' /proc/msstat | sed 's/^/    /' >&2
+        exit 1
+    fi
+
+    log "unloading any currently-loaded ms modules"
+    "${SUDO[@]}" rmmod raid10_ms raid1_ms ms_mod 2>/dev/null || true
+
+    log "loading freshly built modules"
+    "${SUDO[@]}" insmod "$BUILD_DIR/ms_mod.ko"
+    "${SUDO[@]}" insmod "$BUILD_DIR/raid1_ms.ko"
+    "${SUDO[@]}" insmod "$BUILD_DIR/raid10_ms.ko"
+
+    log "verifying loaded srcversion matches the built modules"
+    for m in ms_mod raid1_ms raid10_ms; do
+        built="$(modinfo -F srcversion "$BUILD_DIR/$m.ko")"
+        loaded="$(cat "/sys/module/$m/srcversion" 2>/dev/null || true)"
+        [[ "$built" == "$loaded" ]] \
+            || die "srcversion mismatch for $m: built=$built loaded=${loaded:-<none>} (stale module?)"
+    done
+    log "modules loaded; /proc/msstat:"
+    head -1 /proc/msstat | sed 's/^/    /'
+else
+    log "--no-load: skipping module reload"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 4: tests
+# ---------------------------------------------------------------------------
+test_failures=()
+dkms_tooling_result="not run"
+if [[ -z "$NO_TEST" ]]; then
+    # 4a. dkms tooling selftests — validate the packaging pipeline (patch
+    #     apply, rename, build-tarball + compile) against the RECONSTRUCTED
+    #     tree, and GATE the exit. We pass KERNEL_TREE=$WORKTREE so the
+    #     source-dependent tests resolve the reconstruction's drivers/md
+    #     (on a bare harness checkout, with no composed tree, they SKIP).
+    dkms_runner="$REPO_ROOT/tools/testing/selftests/dkms/run_all.sh"
+    if [[ -x "$dkms_runner" ]]; then
+        log "running dkms tooling selftests (KERNEL_TREE=$WORKTREE)"
+        if KERNEL_TREE="$WORKTREE" bash "$dkms_runner"; then
+            dkms_tooling_result="ok"
+        else
+            dkms_tooling_result="FAILED (see output above)"
+            test_failures+=("dkms tooling selftests")
+        fi
+    else
+        warn "no dkms tooling runner at $dkms_runner — skipping"
+        dkms_tooling_result="skipped (no runner)"
+    fi
+
+    # 4b. md runtime selftests from the reconstructed worktree (the union of all
+    #     cherry-picked features). Each test_*.sh sources its sibling lib.sh and
+    #     self-skips (exit 4) without root / modules / patched mdadm.
+    md_dir="$WORKTREE/tools/testing/selftests/md"
+    if [[ -d "$md_dir" ]]; then
+        [[ "$(id -u)" -ne 0 && ${#SUDO[@]} -eq 0 ]] \
+            && warn "not root and no sudo — md runtime tests will SKIP"
+        log "running md runtime selftests from $md_dir"
+        mapfile -t md_tests < <(find "$md_dir" -type f -name '*.sh' ! -name 'lib.sh' | sort)
+        mpass=0 mfail=0 mskip=0 mfailed=()
+        # Force the ms subsystem across the WHOLE suite so every test exercises
+        # the reconstructed modules. Critical: the raid10/ suite defaults to the
+        # in-tree md/raid10 driver (RAID10_DEV_PREFIX=md, system mdadm). Left at
+        # that default, raid10/test_recovery_freeze_deadlock.sh reproduces the
+        # genuine upstream forced-raise vs freeze_array() deadlock and wedges
+        # IN-TREE kthreads (D state, only a reboot clears them) — instead of
+        # validating raid10_ms (which carries the per-bucket-arrays fix).
+        # MD_SUBSYS=ms covers the top-level/llbitmap suites. The raid10/ suite
+        # uses its OWN knobs and needs ALL THREE: RAID10_DEV_PREFIX=ms (device
+        # /dev/msN), RAID10_SYSFS_SUBDIR=ms (/sys/block/msN/ms/...), and
+        # RAID10_MDSTAT=/proc/msstat. Setting only DEV_PREFIX makes the array on
+        # raid10_ms but then polls /sys/block/msN/md/... (nonexistent) and
+        # reports spurious "sync_action never went idle" failures. All want the
+        # /dev/msN-aware (patched) mdadm.
+        if [[ -z "${MDADM:-}" ]]; then
+            if   [[ -x "$REPO_ROOT/build/msadm" ]]; then MDADM="$REPO_ROOT/build/msadm"
+            elif [[ -x "$HOME/mdadm/mdadm"       ]]; then MDADM="$HOME/mdadm/mdadm"
+            fi
+        fi
+        test_env=(MD_SUBSYS=ms
+                  RAID10_DEV_PREFIX=ms RAID10_SYSFS_SUBDIR=ms RAID10_MDSTAT=/proc/msstat)
+        [[ -n "${MDADM:-}" ]] && test_env+=(MDADM="$MDADM")
+        [[ -z "${MDADM:-}" ]] && warn "no patched mdadm found (set MDADM=…) — ms tests will SKIP"
+        ((TEST_TIMEOUT > 0)) \
+            && log "per-test timeout: ${TEST_TIMEOUT}s (override with --test-timeout)"
+        for t in "${md_tests[@]}"; do
+            rel="${t#"$md_dir"/}"
+            echo "=== md: $rel ==="
+            # Bound each test: SUDO -> timeout -> env -> bash. A hang is killed
+            # (TERM, then KILL after 15s) and counted as a failure so the suite
+            # finishes. timeout exits 124 on expiry.
+            tcmd=("${SUDO[@]}")
+            ((TEST_TIMEOUT > 0)) \
+                && tcmd+=(timeout --kill-after=15 --signal=TERM "$TEST_TIMEOUT")
+            tcmd+=(env "${test_env[@]}" bash "$t")
+            if "${tcmd[@]}"; then
+                mpass=$((mpass + 1))
+            else
+                rc=$?
+                case "$rc" in
+                    4)   mskip=$((mskip + 1)) ;;
+                    124) mfail=$((mfail + 1)); mfailed+=("$rel (timed out after ${TEST_TIMEOUT}s)") ;;
+                    *)   mfail=$((mfail + 1)); mfailed+=("$rel") ;;
+                esac
+            fi
+        done
+        log "md runtime selftests: pass=$mpass fail=$mfail skip=$mskip"
+        if ((mfail > 0)); then
+            printf '       FAILED: %s\n' "${mfailed[@]}" >&2
+            test_failures+=("md runtime selftests ($mfail failed)")
+        fi
+    else
+        warn "no md selftests at $md_dir — skipping"
+    fi
+else
+    log "--no-test: skipping selftests"
+fi
+
+# ---------------------------------------------------------------------------
+# Finish
+# ---------------------------------------------------------------------------
+echo
+echo "=============================================================="
+echo "$PROG: reconstruction summary"
+echo "=============================================================="
+echo "Base:          $BASE_REF (${BASE_SHA:0:12})"
+echo "Branch:        $TARGET_BRANCH @ ${FINAL_SHA:0:12} ($TOTAL commits)"
+echo "Worktree:      $WORKTREE"
+echo "Applied (in order):"
+for b in "${ORDERED[@]}"; do
+    printf '  %-22s %s commits\n' "$b" "${PICKED[$b]}"
+done
+[[ -z "$NO_BUILD" ]] && echo "Build:         OK ($BUILD_DIR)"
+[[ -z "$NO_LOAD"  ]] && echo "Load:          OK (srcversion verified)"
+if [[ -z "$NO_TEST" ]]; then
+    echo "dkms tooling:  $dkms_tooling_result"
+    if ((${#test_failures[@]} == 0)); then
+        echo "md runtime:    OK"
+    else
+        echo "md runtime:    FAILURES:"
+        printf '  - %s\n' "${test_failures[@]}"
+    fi
+fi
+echo "--------------------------------------------------------------"
+echo "Local $TARGET_BRANCH now points at the reconstruction."
+echo "To publish (force-push required):"
+echo "    git push --force $REMOTE $TARGET_BRANCH"
+echo "=============================================================="
+
+((${#test_failures[@]} == 0)) || exit 1

@@ -124,16 +124,50 @@ dkms_run_feature_flags() {
 
 # --- patch application ---------------------------------------------------
 
-# dkms_flat_manifest_tree -> echoes a temp dir holding the manifest sources
-# copied FLAT from drivers/md/ (mirrors bin/build-tarball step 1).
+# dkms_resolve_kernel_tree -> echoes the path to a tree that contains
+# drivers/md/ (the manifest sources the patches and build pipeline apply to).
+# Resolution order:
+#   1. $KERNEL_TREE        (explicit override, as bin/build-tarball uses)
+#   2. $REPO_ROOT          (a feature-composed checkout that carries drivers/md)
+#   3. build tooling outputs that carry a composed drivers/md:
+#        $REPO_ROOT/build/linux-meshstor-rebuilt     (bin/rebuild-main)
+#        $REPO_ROOT/.worktrees/meshstor-main-rebuild (bin/rebuild-meshstor-main)
+# Echoes the tree root and returns 0 on success; returns 1 (no output) when no
+# drivers/md is found. The meshstor-harness branch deliberately carries no
+# drivers/md, so callers must `dkms_skip` on a non-zero return — matching the
+# documented "SKIP cleanly without a kernel build tree" contract.
+dkms_resolve_kernel_tree() {
+	local cand
+	for cand in \
+		"${KERNEL_TREE:-}" \
+		"$REPO_ROOT" \
+		"$REPO_ROOT/build/linux-meshstor-rebuilt" \
+		"$REPO_ROOT/.worktrees/meshstor-main-rebuild"; do
+		[ -n "$cand" ] || continue
+		[ -d "$cand/drivers/md" ] || continue
+		echo "$cand"
+		return 0
+	done
+	return 1
+}
+
+# dkms_flat_manifest_tree [SRC_TREE] -> echoes a temp dir holding the manifest
+# sources copied FLAT from SRC_TREE/drivers/md (mirrors bin/build-tarball step 1).
+# SRC_TREE defaults to dkms_resolve_kernel_tree. Callers that want SKIP-on-absent
+# behaviour should resolve + dkms_skip THEMSELVES before calling (dkms_skip from
+# within this $(...)-captured function would only exit the subshell).
 dkms_flat_manifest_tree() {
-	local tree entry
+	local src="${1:-}" tree entry
+	if [ -z "$src" ]; then
+		src="$(dkms_resolve_kernel_tree)" \
+			|| dkms_fail "no drivers/md tree found (set KERNEL_TREE=)"
+	fi
 	tree="$(dkms_mktemp_dir)"
 	while IFS= read -r entry; do
 		[ -z "$entry" ] && continue
 		case "$entry" in \#*) continue ;; esac
 		# shellcheck disable=SC2086
-		cp "$REPO_ROOT"/drivers/md/$entry "$tree/"
+		cp "$src"/drivers/md/$entry "$tree/"
 	done < "$REPO_ROOT/dkms/manifest.txt"
 	echo "$tree"
 }

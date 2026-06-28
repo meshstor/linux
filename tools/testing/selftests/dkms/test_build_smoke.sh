@@ -26,18 +26,22 @@ KDIR="${KDIR:-/lib/modules/$(uname -r)/build}"
 OUT="$REPO_ROOT/build/meshstor-ms-$VER"
 TARBALL="$REPO_ROOT/build/meshstor-ms-$VER.dkms.tar.gz"
 
-# --- preconditions: missing toolchain/kernel tree is a SKIP, not a FAIL --
+# --- preconditions: missing toolchain/kernel tree/sources is a SKIP -------
 command -v make >/dev/null 2>&1 || dkms_skip "make not available"
 command -v gcc  >/dev/null 2>&1 || dkms_skip "gcc not available"
 [ -d "$KDIR" ]          || dkms_skip "kernel build tree not found: $KDIR"
 [ -f "$KDIR/Makefile" ] || dkms_skip "kernel build tree incomplete: $KDIR"
+# drivers/md to assemble from: KERNEL_TREE override, in-repo, or a composed
+# tree. The harness branch has no drivers/md, so SKIP unless one is available.
+KTREE="$(dkms_resolve_kernel_tree)" \
+	|| dkms_skip "no drivers/md tree (set KERNEL_TREE= or run bin/rebuild-meshstor-main first)"
 
 smoke_cleanup() { rm -rf "$OUT" "$TARBALL"; }
 trap 'smoke_cleanup; dkms_cleanup' EXIT
 smoke_cleanup   # clear any stale artifact from a previous run
 
 # --- 1. assemble the DKMS source via the production pipeline ------------
-if ! tb_out="$(KERNEL_TREE="$REPO_ROOT" KDIR="$KDIR" \
+if ! tb_out="$(KERNEL_TREE="$KTREE" KDIR="$KDIR" \
 		bash "$REPO_ROOT/bin/build-tarball" "$VER" 2>&1)"; then
 	echo "FAIL: bin/build-tarball failed" >&2
 	echo "$tb_out" >&2
