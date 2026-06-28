@@ -8,6 +8,7 @@
 # (exit 4) when they are absent.
 
 TEST_PROGS := \
+	test_torn_state_write_error_llbitmap.sh \
 	test_torn_state_write_error_md_bitmap.sh
 
 TEST_FILES := lib.sh
