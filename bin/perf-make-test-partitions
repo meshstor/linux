@@ -12,10 +12,13 @@
 # Create mode also requires:
 #   - at least COUNT * SIZE_GIB of contiguous unallocated free space
 #
-# Created partitions:
+# Created partitions (matched to the CSI driver's goparted member layout so
+# the array built on them benchmarks what production deploys):
 #   - COUNT × SIZE_GIB (default 2 × 25 GiB; configurable via env)
-#   - aligned to max(1 MiB, optimal_io_size from sysfs) — covers 4 KiB
-#     physical blocks and honors enterprise-NVMe optimal-io hints
+#   - aligned to a fixed 1 MiB (driver goparted alignBytes) — covers 4 KiB
+#     physical blocks on both 4Kn and 512e disks
+#   - GPT type Linux RAID (driver gpt.LinuxRAID), and the body is zero-filled
+#     (shred -z) so a later --assume-clean array starts from identical mirrors
 #   - GPT names: <devbasename>-test1 … <devbasename>-test<COUNT>
 #     (e.g. with COUNT=2: nvme0n1-test1, nvme0n1-test2)
 #
@@ -50,17 +53,16 @@ round_up() {
     printf '%s\n' "$(( ((x + y - 1) / y) * y ))"
 }
 
-# compute_align_bytes PHYS OPT -> max(1 MiB, OPT). PHYS is accepted for
-# call-site self-documentation but the 1 MiB floor always covers it.
+# compute_align_bytes PHYS OPT -> a fixed 1 MiB, matching the CSI driver's
+# goparted alignBytes (a hard-coded 1 MiB). PHYS/OPT are accepted for call-site
+# symmetry but deliberately ignored: the 1 MiB floor already covers every 4 KiB
+# physical block, and honoring a larger optimal_io_size here would start the
+# partition on a boundary the driver never would — defeating the goal of
+# benchmarking the driver's exact member layout.
 compute_align_bytes() {
     local phys="$1" opt="$2"
-    : "$phys"  # unused; documented in the gate
-    local floor=$((1024 * 1024))
-    if (( opt > floor )); then
-        printf '%s\n' "$opt"
-    else
-        printf '%s\n' "$floor"
-    fi
+    : "$phys" "$opt"  # unused; CSI parity pins alignment to a fixed 1 MiB
+    printf '%s\n' "$((1024 * 1024))"
 }
 
 # parse_free_region_b: reads `parted -m unit B print free` on stdin,
@@ -99,6 +101,29 @@ scan_test_partitions() {
                 printf "%s %s %s %s\n", $2, $1, $3, $4
             }
         '
+}
+
+# wait_partition_node DEV LABEL -> echo the /dev node whose PARTLABEL matches
+# LABEL, polling up to ~10s; non-zero on timeout. partprobe + `udevadm settle`
+# can return before udev has populated the partition's PARTLABEL: the kernel
+# emits the partition add-uevents slightly after partprobe returns, so a settle
+# fired immediately drains an empty queue and exits before the events arrive,
+# leaving a single post-settle lsblk read racy. Poll the way the CSI driver
+# does (goparted ensurePartitionVisible) rather than trusting one read.
+wait_partition_node() {
+    local dev="$1" label="$2" i=0 node
+    while (( i < 100 )); do
+        node="$(lsblk -ln -o NAME,PARTLABEL "$dev" 2>/dev/null \
+            | awk -v lbl="$label" '$2==lbl {print "/dev/"$1; exit}')"
+        if [[ -n "$node" && -b "$node" ]]; then
+            printf '%s\n' "$node"
+            return 0
+        fi
+        sleep 0.1
+        udevadm settle >/dev/null 2>&1 || true
+        (( i++ ))
+    done
+    return 1
 }
 
 # remove_mode DEV BASE YES -> validate, list, refuse-if-busy, delete.
@@ -199,7 +224,7 @@ main() {
             --remove)  REMOVE=1 ;;
             -y|--yes)  YES=1 ;;
             -h|--help)
-                sed -n '2,39p' "$0" | sed 's/^# \?//'
+                sed -n '2,42p' "$0" | sed 's/^# \?//'
                 exit 0
                 ;;
             -*) die "unknown flag: $arg" ;;
@@ -213,7 +238,7 @@ main() {
     [[ $EUID -eq 0 ]] || die "must run as root (try: sudo $0 $*)"
 
     # ---- tool check ----
-    for t in lsblk blockdev parted partprobe udevadm awk; do
+    for t in lsblk blockdev parted partprobe udevadm awk shred; do
         command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
     done
 
@@ -367,9 +392,7 @@ EOF
     # 512 B sectors regardless of LBA size.
     declare -a PART_DEVS
     for (( i = 1; i <= COUNT; i++ )); do
-        pdev="$(lsblk -ln -o NAME,PARTLABEL "$DEV" \
-            | awk -v lbl="${LABELS[i]}" '$2==lbl {print "/dev/"$1; exit}')"
-        [[ -b "$pdev" ]] \
+        pdev="$(wait_partition_node "$DEV" "${LABELS[i]}")" \
             || die "post-create: could not locate /dev node for ${LABELS[i]}"
         start_sectors="$(cat "/sys/class/block/$(basename "$pdev")/start" 2>/dev/null)"
         start_bytes=$(( start_sectors * 512 ))
@@ -377,6 +400,44 @@ EOF
             die "post-create: $pdev start offset $start_bytes B is NOT a multiple of ${ALIGN_B} B (alignment broken)"
         fi
         PART_DEVS[i]="$pdev"
+    done
+
+    # ---- match the CSI driver's member identity + zeroing ----
+    # The driver creates each member with GPT type Linux RAID (goparted
+    # gpt.LinuxRAID) and zero-fills the body (shred -z) before building the
+    # array with --assume-clean, so its mirrors start byte-identical. parted's
+    # `ext4` fs-type above left a generic Linux-data type and an un-zeroed
+    # body; reproduce both so the array benchmarked here matches production.
+    #
+    # Data-safety gate: a partition block device always exposes
+    # /sys/.../partition (its number); a whole-disk node never does. Resolving
+    # the partition number through that file is what keeps the type-flip and the
+    # destructive shred below off a whole-disk node, regardless of transport or
+    # LBA size.
+    declare -a PART_NUMS
+    for (( i = 1; i <= COUNT; i++ )); do
+        pbase="$(basename "${PART_DEVS[i]}")"
+        [[ -f "/sys/class/block/$pbase/partition" ]] \
+            || die "refusing to modify non-partition node: ${PART_DEVS[i]}"
+        PART_NUMS[i]="$(cat "/sys/class/block/$pbase/partition")"
+    done
+
+    # GPT type -> Linux RAID. parted's `raid` flag sets the type GUID to
+    # A19D880F-… (the driver's gpt.LinuxRAID). Re-read the table once after.
+    for (( i = 1; i <= COUNT; i++ )); do
+        parted -s "$DEV" set "${PART_NUMS[i]}" raid on
+    done
+    partprobe "$DEV"
+    udevadm settle
+
+    # Zero each member body, exactly as the driver does, so a later
+    # --assume-clean array starts from identical mirrors. Operates only on the
+    # partition nodes gated above — never $DEV.
+    for (( i = 1; i <= COUNT; i++ )); do
+        pdev="${PART_DEVS[i]}"
+        [[ -b "$pdev" ]] || die "post-create: $pdev vanished before zeroing"
+        log "zeroing $pdev (shred -z) to match driver --assume-clean"
+        shred -f -n 1 -z "$pdev"
     done
 
     echo
