@@ -4,14 +4,14 @@ TEST_PROGS := \
 	latency-balance-raid10.sh \
 	latency-balance-stress.sh
 
-TEST_FILES := latency-balance-lib.sh
+TEST_FILES := lib.sh
 
-# Prefer the upstream kselftest harness when ../lib.mk is vendored in this
+# Prefer the upstream kselftest harness when ../../lib.mk is vendored in this
 # tree.  It is not present on the meshstor lineage, so fall back to a
 # self-contained runner; in practice these tests are run directly as
 # ./latency-balance-*.sh (exit 0=pass, 1=fail, 4=skip).
-ifneq ($(wildcard ../lib.mk),)
-include ../lib.mk
+ifneq ($(wildcard ../../lib.mk),)
+include ../../lib.mk
 else
 .PHONY: all clean run_tests
 all:

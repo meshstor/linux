@@ -9,8 +9,9 @@
 #
 # Two dm-delay legs in a near=2 layout: every sector has a copy on both
 # legs, so read_balance always chooses between the two, exactly like the
-# raid1 case but through the raid10 picker.  Targets /dev/mdN by default;
-# point at the ms stack via the env overrides in latency-balance-lib.sh.
+# raid1 case but through the raid10 picker.  Targets the meshstor-ms stack
+# (/dev/msN) by default under MD_SUBSYS=ms; set MD_SUBSYS=md for the
+# in-tree /dev/mdN driver -- see lib.sh.
 #
 # Phases mirror the raid1 test (1-6, 8); phase 7's raid1-specific
 # lowest-index tie-break is replaced by a trickle-liveness check that does
@@ -18,8 +19,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=latency-balance-lib.sh
-. "$HERE/latency-balance-lib.sh"
+# shellcheck source=lib.sh
+. "$HERE/lib.sh"
 
 SLOW=$LATBAL_SLOW_MS
 
