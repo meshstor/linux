@@ -18,7 +18,15 @@ TEST_PROGS := \
 	test_resize_race_concurrent_write.sh \
 	test_shrink_regrow_stale_state.sh \
 	test_torn_state_write_error_llbitmap.sh \
-	test_torn_state_write_error_md_bitmap.sh
+	test_torn_state_write_error_md_bitmap.sh \
+	test_assemble_kick_non_fresh.sh \
+	test_first_use_persists.sh \
+	test_lbs_stability.sh \
+	test_mode_a_chunksize_einval.sh \
+	test_mode_b_concurrent_io.sh \
+	test_mode_b_data_persists.sh \
+	test_mode_b_spare_recovers.sh \
+	test_stop_events_sync.sh
 
 TEST_FILES := lib.sh
 
