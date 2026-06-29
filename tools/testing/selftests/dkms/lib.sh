@@ -4,10 +4,10 @@
 #
 # These tests exercise the DKMS build tooling — the compat patches in
 # dkms/patches/, the feature-flag detection in dkms/Makefile.in, and the
-# bin/build-tarball assembly pipeline. Unlike the runtime md selftests under
-# tools/testing/selftests/md/llbitmap/, they need NO root, NO loaded module,
-# and NO special hardware: they operate purely on repo files plus fixture
-# kernel header trees.
+# bin/build-tarball assembly pipeline. Unlike the runtime md selftests
+# (which live in the composed meshstor-main tree, e.g. md/llbitmap/), they
+# need NO root, NO loaded module, and NO special hardware: they operate
+# purely on repo files plus fixture kernel header trees.
 #
 # Sourced by each test_*.sh in this directory; never run directly.
 
