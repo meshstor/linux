@@ -20,7 +20,8 @@
 # CONFIG_KASAN=y (and lockdep / PROVE_LOCKING); on a stock kernel it still
 # shakes the races but only oopses/WARNs are observable.
 #
-# Targets /dev/mdN by default; ms-stack overrides per latency-balance-lib.sh.
+# Targets the meshstor-ms stack (/dev/msN) by default under MD_SUBSYS=ms;
+# set MD_SUBSYS=md for the in-tree /dev/mdN driver -- see lib.sh.
 set -euo pipefail
 
 # Smaller legs than the functional tests: recovery after each re-add must
@@ -29,8 +30,8 @@ set -euo pipefail
 export LATBAL_LEG_MB
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=latency-balance-lib.sh
-. "$HERE/latency-balance-lib.sh"
+# shellcheck source=lib.sh
+. "$HERE/lib.sh"
 
 CHURN_ITERS="${LATBAL_CHURN_ITERS:-12}"
 TOGGLE_ITERS="${LATBAL_TOGGLE_ITERS:-50}"

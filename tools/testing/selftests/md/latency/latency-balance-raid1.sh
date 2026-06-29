@@ -4,10 +4,9 @@
 # Functional test for raid1 latency-aware (shortest-expected-delay) read
 # balancing.  RAID1 over two dm-delay legs on loop-backed tmpfs.
 #
-# Targets the in-tree md driver via /dev/mdN by default (skips unless the
-# running kernel was built from this tree); export MDADM / LATBAL_DEV_PREFIX
-# / LATBAL_SYSFS_SUBDIR / LATBAL_MDSTAT to point it at the ms stack instead
-# -- see latency-balance-lib.sh.
+# Targets the meshstor-ms stack (/dev/msN) by default under MD_SUBSYS=ms;
+# set MD_SUBSYS=md (and export MDADM / LATBAL_DEV_PREFIX / LATBAL_SYSFS_SUBDIR
+# / LATBAL_MDSTAT) to target the in-tree /dev/mdN driver instead -- see lib.sh.
 #
 # Phases:
 #  1. asymmetric legs (0ms vs 2ms): >=99% of reads on the fast leg
@@ -32,8 +31,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=latency-balance-lib.sh
-. "$HERE/latency-balance-lib.sh"
+# shellcheck source=lib.sh
+. "$HERE/lib.sh"
 
 SLOW=$LATBAL_SLOW_MS
 

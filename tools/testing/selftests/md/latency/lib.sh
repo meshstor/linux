@@ -10,14 +10,15 @@
 # when the skew is swapped, spreads under real queuing, and falls back
 # to the stock policy when the feature is off.
 #
-# By default the tests target the in-tree md driver via stock /dev/mdN
-# devices, which only carry the SED code on a kernel built from this
-# tree -- on any other kernel the feature-detect check skips them.
-# They can also target the out-of-tree meshstor-ms variant
-# (raid1_ms.ko / raid10_ms.ko under ms_mod.ko, major 252, /dev/msN) by
-# exporting, before running the test:
+# By default the tests target the meshstor-ms variant (MD_SUBSYS=ms) via
+# /dev/msN on a kernel with raid1_ms.ko / raid10_ms.ko loaded, which only
+# carry the SED code on a kernel built from this tree -- on any other kernel
+# the feature-detect check skips them.  Override with MD_SUBSYS=md to target
+# the in-tree md driver instead.  Individual knobs (MDADM, LATBAL_*) override
+# the per-subsystem defaults when set explicitly, e.g.:
 #
-#   MDADM=/home/mykola/bin/mdadm     # mdadm that understands --subsys=ms
+#   MD_SUBSYS=ms                     # meshstor-ms (default); or 'md' for in-tree
+#   MDADM=/home/mykola/mdadm/mdadm   # mdadm that understands --subsys=ms
 #   LATBAL_SUBSYS=ms                 # pass --subsys=ms to mdadm (default none)
 #   LATBAL_DEV_PREFIX=ms             # device basename prefix (default md)
 #   LATBAL_SYSFS_SUBDIR=ms           # /sys/block/<dev>/<subdir> (default md)
@@ -29,14 +30,37 @@
 
 set -u
 
-MDADM="${MDADM:-mdadm}"
-# Optional mdadm subsystem selector for the meshstor-ms variant; empty
-# targets the in-tree md subsystem.  Set LATBAL_SUBSYS=ms (with a patched
-# mdadm) to drive /dev/msN.
-LATBAL_SUBSYS="${LATBAL_SUBSYS:-}"
-LATBAL_DEV_PREFIX="${LATBAL_DEV_PREFIX:-md}"
-LATBAL_SYSFS_SUBDIR="${LATBAL_SYSFS_SUBDIR:-md}"
-LATBAL_MDSTAT="${LATBAL_MDSTAT:-/proc/mdstat}"
+# MD_SUBSYS selects the subsystem and derives the device/sysfs/stat knobs
+# AND the default mdadm, matching the raid10/ and takeover/ suites so a
+# single MD_SUBSYS=ms drives the whole composed md selftest tree (and so a
+# standalone `MD_SUBSYS=ms bash latency-balance-raid1.sh` "just works" like
+# its siblings, not just under the orchestrator). Each LATBAL_* and MDADM
+# still overrides when set explicitly.
+#   ms (default) -> meshstor-ms (raid1_ms/raid10_ms under ms_mod.ko, major
+#                   252, /dev/msN, /sys/block/msN/ms, /proc/msstat, patched
+#                   mdadm with --subsys=ms).
+#   md           -> in-tree md driver (stock /dev/mdN, /proc/mdstat, system mdadm).
+MD_SUBSYS="${MD_SUBSYS:-ms}"
+case "$MD_SUBSYS" in
+ms)
+	MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
+	LATBAL_SUBSYS="${LATBAL_SUBSYS:-ms}"
+	LATBAL_DEV_PREFIX="${LATBAL_DEV_PREFIX:-ms}"
+	LATBAL_SYSFS_SUBDIR="${LATBAL_SYSFS_SUBDIR:-ms}"
+	LATBAL_MDSTAT="${LATBAL_MDSTAT:-/proc/msstat}"
+	;;
+md)
+	MDADM="${MDADM:-mdadm}"
+	LATBAL_SUBSYS="${LATBAL_SUBSYS:-}"
+	LATBAL_DEV_PREFIX="${LATBAL_DEV_PREFIX:-md}"
+	LATBAL_SYSFS_SUBDIR="${LATBAL_SYSFS_SUBDIR:-md}"
+	LATBAL_MDSTAT="${LATBAL_MDSTAT:-/proc/mdstat}"
+	;;
+*)
+	echo "FAIL: unknown MD_SUBSYS=$MD_SUBSYS (want 'ms' or 'md')" >&2
+	exit 1
+	;;
+esac
 LATBAL_IMG_DIR="${LATBAL_IMG_DIR:-/dev/shm}"
 # Per-leg base image size.  The array data area is a touch smaller.
 LATBAL_LEG_MB="${LATBAL_LEG_MB:-256}"
