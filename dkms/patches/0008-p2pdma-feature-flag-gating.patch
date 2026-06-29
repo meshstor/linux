@@ -19,7 +19,7 @@ index d1c7fc08..050221d3 100644
  static inline bool md_bio_is_p2pdma(struct bio *bio)
  {
 +#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
- 	return bio_has_data(bio) && bio->bi_vcnt &&
+ 	return bio_has_data(bio) && bio->bi_io_vec &&
  	       is_pci_p2pdma_page(bio->bi_io_vec->bv_page);
 +#else
 +	return false;
