@@ -337,19 +337,18 @@ if [[ -z "$NO_TEST" ]]; then
         mapfile -t md_tests < <(find "$md_dir" -type f -name '*.sh' ! -name 'lib.sh' | sort)
         mpass=0 mfail=0 mskip=0 mfailed=()
         # Force the ms subsystem across the WHOLE suite so every test exercises
-        # the reconstructed modules. Critical: the raid10/ suite defaults to the
-        # in-tree md/raid10 driver (RAID10_DEV_PREFIX=md, system mdadm). Left at
-        # that default, raid10/test_recovery_freeze_deadlock.sh reproduces the
-        # genuine upstream forced-raise vs freeze_array() deadlock and wedges
-        # IN-TREE kthreads (D state, only a reboot clears them) — instead of
-        # validating raid10_ms (which carries the per-bucket-arrays fix).
-        # MD_SUBSYS=ms covers the top-level/llbitmap suites. The raid10/ suite
-        # uses its OWN knobs and needs ALL THREE: RAID10_DEV_PREFIX=ms (device
-        # /dev/msN), RAID10_SYSFS_SUBDIR=ms (/sys/block/msN/ms/...), and
-        # RAID10_MDSTAT=/proc/msstat. Setting only DEV_PREFIX makes the array on
-        # raid10_ms but then polls /sys/block/msN/md/... (nonexistent) and
-        # reports spurious "sync_action never went idle" failures. All want the
-        # /dev/msN-aware (patched) mdadm.
+        # the reconstructed modules. Every suite keys off MD_SUBSYS (default ms):
+        # takeover/, raid10/, and latency/ derive their device prefix (/dev/msN),
+        # sysfs subdir (/sys/block/msN/ms/), and stat path (/proc/msstat) from
+        # it; llbitmap/ is hard-wired to ms and only needs the patched mdadm.
+        # The RAID10_* exports below are explicit overrides retained for clarity
+        # but are redundant with MD_SUBSYS=ms. All suites need the /dev/msN-aware
+        # (patched) mdadm.
+        # WARNING: if you explicitly set MD_SUBSYS=md, the single test
+        # raid10/test_recovery_freeze_deadlock.sh reproduces the genuine upstream
+        # forced-raise vs freeze_array() deadlock and wedges IN-TREE kthreads
+        # (D state, only a reboot clears them) — that test is purpose-built to
+        # hit that race; the default MD_SUBSYS=ms is safe.
         if [[ -z "${MDADM:-}" ]]; then
             if   [[ -x "$REPO_ROOT/build/msadm" ]]; then MDADM="$REPO_ROOT/build/msadm"
             elif [[ -x "$HOME/mdadm/mdadm"       ]]; then MDADM="$HOME/mdadm/mdadm"

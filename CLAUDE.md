@@ -269,14 +269,15 @@ KERNEL_TREE=build/linux-meshstor-rebuilt bash tools/testing/selftests/dkms/run_a
   tree's line numbers shift with the feature set/order).
 - `selftests/md/` runtime tests require **root**, the loaded `ms_*` modules, and
   the patched mdadm (`/dev/msN`, dynamic major ~252). Source `lib.sh`; never run
-  a `test_*.sh` bare. They **default to native md** — override to the ms
-  subsystem or they exercise the *in-tree* driver: `MD_SUBSYS=ms` for the
-  top-level/llbitmap suites, and the `raid10/` suite *additionally* needs
-  `RAID10_DEV_PREFIX=ms RAID10_SYSFS_SUBDIR=ms RAID10_MDSTAT=/proc/msstat`. Left
-  at the `md` default, `raid10/test_recovery_freeze_deadlock.sh` reproduces the
-  genuine upstream raise_barrier/freeze_array deadlock and wedges **in-tree**
-  kthreads (D state, reboot to clear). `bin/rebuild-meshstor-main` exports this
-  whole env for the suite automatically.
+  a `test_*.sh` bare. The runtime suites key off a single `MD_SUBSYS` knob that
+  **defaults to `ms`**; set `MD_SUBSYS=md` to exercise the in-tree driver.
+  `llbitmap/` is hard-wired to ms and only needs the patched `MDADM`.
+  `bin/rebuild-meshstor-main` exports `MD_SUBSYS=ms` for the whole suite
+  automatically. WARNING: if you explicitly set `MD_SUBSYS=md`,
+  `raid10/test_recovery_freeze_deadlock.sh` reproduces the genuine upstream
+  raise_barrier/freeze_array deadlock and wedges **in-tree** kthreads (D state,
+  reboot to clear) — that test is purpose-built to hit that race; the default
+  `MD_SUBSYS=ms` is safe.
 
 ## Verification before merging a rebase or compat change
 
