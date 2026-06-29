@@ -89,6 +89,31 @@ assert_file_matches "$OUT/ms.h" 'static inline bool ms_bio_is_p2pdma' \
 	"md_bio_is_p2pdma must survive the rename into ms.h as ms_bio_is_p2pdma"
 assert_file_matches "$OUT/ms.c" 'if \(!ms_bio_is_p2pdma\(bio\)\)' \
 	"md_submit_bio must guard the REQ_NOMERGE clear on ms_bio_is_p2pdma"
+# F1: the helper must guard on bi_io_vec, never bi_vcnt (the dead-detector form).
+assert_file_matches "$OUT/ms.h" 'bio_has_data\(bio\) && bio->bi_io_vec' \
+	"ms_bio_is_p2pdma must guard on bi_io_vec (F1 fix)"
+assert_file_not_matches "$OUT/ms.h" 'bio->bi_vcnt' \
+	"ms_bio_is_p2pdma must NOT reference bi_vcnt (dead split-detector regression)"
+# F1: in raid1_write_request, the ms_bio_is_p2pdma read must precede ms_account_bio
+# (the bit is read before the bio is re-cloned). SCOPED to the function body --
+# a whole-file check is fooled by the ms_account_bio in raid1_read_request.
+awk '/^static bool raid1_write_request\(/{f=1}
+     f && /ms_bio_is_p2pdma/{p=NR}
+     f && /ms_account_bio/{a=NR}
+     f && /^}/{exit}
+     END{exit !(p && a && p < a)}' "$OUT/raid1_ms.c" \
+	|| dkms_fail "raid1_write_request: ms_bio_is_p2pdma must precede ms_account_bio"
+# F2: the add-path re-gate helper exists (renamed mddev->mssev) and is called at
+# the install sites in both personalities; the clear uses &= ~ (not |=), so the
+# existing count==1 |= guard is unaffected.
+assert_file_matches "$OUT/raid1-10_ms.c" 'raid1_p2pdma_clear_on_add\(struct mssev' \
+	"F2 helper must survive the rename in raid1-10_ms.c"
+assert_file_matches "$OUT/raid1_ms.c" 'raid1_p2pdma_clear_on_add\(mssev' \
+	"F2 helper must be called from raid1_add_disk"
+assert_file_matches "$OUT/raid10_ms.c" 'raid1_p2pdma_clear_on_add\(mssev' \
+	"F2 helper must be called from raid10_add_disk"
+assert_file_matches "$OUT/raid1-10_ms.c" 'features &= ~BLK_FEAT_PCI_P2PDMA' \
+	"F2 must CLEAR (&= ~), not set, BLK_FEAT_PCI_P2PDMA"
 # --- raid1: exactly ONE gated advertise, no bare/adjacent line ----------
 adv_count=$(grep -c 'lim\.features |= BLK_FEAT_PCI_P2PDMA' "$OUT/raid1_ms.c" || true)
 [ "$adv_count" = "1" ] || dkms_fail "raid1_ms.c must have exactly one BLK_FEAT_PCI_P2PDMA advertise (found $adv_count)"
