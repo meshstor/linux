@@ -25,7 +25,7 @@ md_mdadm --create --run --metadata=1.2 --level=1 --raid-devices=2 \
 md_wait_sync "$MD_TEST_MD_DEV"
 
 # Lay down a deterministic pattern (urandom seeded by /dev/urandom).
-dd if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=16 oflag=direct \
+"$DD" if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=16 oflag=direct \
 	>/dev/null 2>&1 || md_fail "initial dd failed"
 sync
 
@@ -40,8 +40,8 @@ do1="$(md_sysfs_read "$sysfs/dev-$loop1_name/offset")"
 
 # Capture per-leg checksum of the first 8 MiB of data, computed at
 # the raw block layer (bypass the array entirely).
-leg0_before="$(dd if="$loop0" bs=512 skip="$do0" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
-leg1_before="$(dd if="$loop1" bs=512 skip="$do1" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
+leg0_before="$("$DD" if="$loop0" bs=512 skip="$do0" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
+leg1_before="$("$DD" if="$loop1" bs=512 skip="$do1" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
 
 # Sanity: raid1 mirrors -> both legs are identical pre-takeover.
 [ "$leg0_before" = "$leg1_before" ] \
@@ -67,8 +67,8 @@ do1_after="$(md_sysfs_read "$sysfs/dev-$loop1_name/offset")"
 [ "$do1" = "$do1_after" ] \
 	|| md_fail "data_offset on leg1 moved across takeover: $do1 -> $do1_after"
 
-leg0_after="$(dd if="$loop0" bs=512 skip="$do0_after" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
-leg1_after="$(dd if="$loop1" bs=512 skip="$do1_after" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
+leg0_after="$("$DD" if="$loop0" bs=512 skip="$do0_after" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
+leg1_after="$("$DD" if="$loop1" bs=512 skip="$do1_after" count=16384 2>/dev/null | md5sum | awk '{print $1}')"
 
 [ "$leg0_before" = "$leg0_after" ] \
 	|| md_fail "leg0 data changed across takeover: $leg0_before -> $leg0_after"

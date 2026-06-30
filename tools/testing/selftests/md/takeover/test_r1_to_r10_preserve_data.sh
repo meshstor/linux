@@ -18,7 +18,7 @@ md_wait_sync "$MD_TEST_MD_DEV"
 sysfs="$(md_sysfs_path "$MD_TEST_MD_DEV")"
 
 # Write 32 MiB of urandom, record md5.
-dd if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=32 oflag=direct \
+"$DD" if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=32 oflag=direct \
 	>/dev/null 2>&1 || md_fail "initial dd failed"
 sync
 before="$(md5sum < "$MD_TEST_MD_DEV" | awk '{print $1}')"

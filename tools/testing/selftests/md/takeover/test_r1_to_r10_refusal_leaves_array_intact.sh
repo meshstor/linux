@@ -48,7 +48,7 @@ after_raid_disks="$(md_sysfs_read "$sysfs/raid_disks")"
 
 # The array must still be writable after the refusal so the admin
 # can fix the precondition and retry.
-dd if=/dev/zero of="$MD_TEST_MD_DEV" bs=1M count=1 oflag=direct \
+"$DD" if=/dev/zero of="$MD_TEST_MD_DEV" bs=1M count=1 oflag=direct \
 	>/dev/null 2>&1 || md_fail "array no longer accepts writes after refused takeover"
 
 md_pass "refused takeover left array geometry and IO path intact"

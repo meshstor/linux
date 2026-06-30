@@ -37,10 +37,10 @@ got_kb="$(md_sysfs_read "$sysfs/component_size")"
 	|| md_fail "component_size did not stick (want $misaligned_kb, got $got_kb)"
 
 # Data written before the attempt must be untouched after the refusal.
-dd if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=8 oflag=direct \
+"$DD" if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=8 oflag=direct \
 	>/dev/null 2>&1 || md_fail "initial dd failed"
 sync
-md5_before="$(dd if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
+md5_before="$("$DD" if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
 	2>/dev/null | md5sum | awk '{print $1}')"
 
 md_clear_dmesg
@@ -55,7 +55,7 @@ fi
 level="$(md_sysfs_read "$sysfs/level")"
 [ "$level" = "raid1" ] || md_fail "level changed after refusal: $level"
 
-md5_after="$(dd if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
+md5_after="$("$DD" if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
 	2>/dev/null | md5sum | awk '{print $1}')"
 [ "$md5_after" = "$md5_before" ] \
 	|| md_fail "data changed across refused takeover: $md5_before -> $md5_after"

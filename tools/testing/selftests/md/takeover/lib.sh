@@ -39,6 +39,26 @@ esac
 # Path to the in-tree-patched mdadm binary. Override via MDADM=...
 MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
 
+# Resolve a dd that handles non-page-aligned O_DIRECT buffers.  The Rust
+# "uutils" coreutils rewrite ships as the default /usr/bin/dd on some recent
+# distros (e.g. Ubuntu's 7.x kernels); its direct-I/O path issues misaligned
+# buffers and fails with EINVAL on any sub-page transfer (the bs=4096 probe
+# I/O below, etc.), which silently breaks our direct-I/O assertions.  Prefer
+# GNU dd: on normal distros the system dd already is GNU and is picked first;
+# only on a uutils host do we fall through to gnudd.  Use "$DD", not dd.
+_md_resolve_dd() {
+	local cand
+	for cand in "${DD:-}" gnudd dd; do
+		[ -n "$cand" ] || continue
+		command -v "$cand" >/dev/null 2>&1 || continue
+		"$cand" --version 2>/dev/null | grep -qi 'uutils' && continue
+		echo "$cand"; return 0
+	done
+	echo dd
+}
+: "${DD:=$(_md_resolve_dd)}"
+export DD
+
 # md_mdadm ARGS... -> mdadm with the right subsys baked in.
 md_mdadm() {
 	"$MDADM" --subsys="$MD_SUBSYS" "$@"

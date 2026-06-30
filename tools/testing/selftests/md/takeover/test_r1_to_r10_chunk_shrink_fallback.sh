@@ -34,10 +34,10 @@ odd_kb=$(( (natural_kb / 512 - 1) * 512 + page_kb ))
 echo "$odd_kb" > "$sysfs/component_size" \
 	|| md_fail "could not shrink component_size to ${odd_kb}K"
 
-dd if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=8 oflag=direct \
+"$DD" if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=8 oflag=direct \
 	>/dev/null 2>&1 || md_fail "initial dd failed"
 sync
-md5_before="$(dd if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
+md5_before="$("$DD" if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
 	2>/dev/null | md5sum | awk '{print $1}')"
 size_before="$(md_sysfs_read "/sys/block/$md_name/size")"
 
@@ -56,7 +56,7 @@ size_after="$(md_sysfs_read "/sys/block/$md_name/size")"
 [ "$size_after" = "$size_before" ] \
 	|| md_fail "array size changed: $size_before -> $size_after sectors"
 
-md5_after="$(dd if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
+md5_after="$("$DD" if="$MD_TEST_MD_DEV" bs=1M count=8 iflag=direct \
 	2>/dev/null | md5sum | awk '{print $1}')"
 [ "$md5_after" = "$md5_before" ] \
 	|| md_fail "data changed across takeover: $md5_before -> $md5_after"
