@@ -335,12 +335,15 @@ if [[ -z "$NO_TEST" ]]; then
     # 4b. md runtime selftests from the reconstructed worktree (the union of all
     #     cherry-picked features). Each test_*.sh sources its sibling lib.sh and
     #     self-skips (exit 4) without root / modules / patched mdadm.
+    #     lib.sh is a helper (never run standalone); evidence_*.sh are RCA data
+    #     probes, not pass/fail tests (they assert nothing and would bank a
+    #     meaningless verdict) — exclude both from the run.
     md_dir="$WORKTREE/tools/testing/selftests/md"
     if [[ -d "$md_dir" ]]; then
         [[ "$(id -u)" -ne 0 && ${#SUDO[@]} -eq 0 ]] \
             && warn "not root and no sudo — md runtime tests will SKIP"
         log "running md runtime selftests from $md_dir"
-        mapfile -t md_tests < <(find "$md_dir" -type f -name '*.sh' ! -name 'lib.sh' | sort)
+        mapfile -t md_tests < <(find "$md_dir" -type f -name '*.sh' ! -name 'lib.sh' ! -name 'evidence_*' | sort)
         mpass=0 mfail=0 mskip=0 mfailed=()
         # Force the ms subsystem across the WHOLE suite so every test exercises
         # the reconstructed modules. Every suite keys off MD_SUBSYS (default ms):
