@@ -215,7 +215,13 @@ git worktree prune
 mkdir -p "$(dirname "$WORKTREE")"
 
 log "creating worktree $WORKTREE on $TARGET_BRANCH @ $BASE_REF"
-git worktree add -B "$TARGET_BRANCH" "$WORKTREE" "$BASE_REF" >/dev/null
+# --no-track is critical: creating $TARGET_BRANCH *from* origin/master would
+# otherwise (default branch.autoSetupMerge) set its upstream to refs/heads/master.
+# Combined with a user's push.default=upstream, a bare `git push --force` from
+# this worktree would then push the reconstruction straight to origin master,
+# clobbering verbatim-upstream master. With no upstream, a bare push fails safely;
+# publish only via the explicit refspec printed below.
+git worktree add -B "$TARGET_BRANCH" --no-track "$WORKTREE" "$BASE_REF" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Stage 1d: cherry-pick each branch's commits onto the worktree
