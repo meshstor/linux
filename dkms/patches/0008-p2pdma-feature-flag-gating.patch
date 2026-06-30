@@ -1,12 +1,15 @@
 P2PDMA feature-flag gating -- compile the P2P advertise out on pre-6.11 kernels.
 
 The P2P feature lives in drivers/md (feature branch p2pdma-fixes): the member-AND
-advertise, the raid1_can_advertise_p2pdma() helper, and md_bio_is_p2pdma(). On
-kernels without BLK_FEAT_PCI_P2PDMA (pre-6.11, e.g. RHEL9/5.14, which also lack the
-FOLL_PCI_P2PDMA O_DIRECT path) the whole feature must compile out. Gate every site
-on HAVE_BLK_FEAT_PCI_P2PDMA (dkms/Makefile.in feature_flags probe): the helper and
+advertise, the raid1_can_advertise_p2pdma() helper, md_bio_is_p2pdma(), and the
+add-path re-gate helper raid1_p2pdma_clear_on_add(). On kernels without
+BLK_FEAT_PCI_P2PDMA (pre-6.11, e.g. RHEL9/5.14, which also lack the FOLL_PCI_P2PDMA
+O_DIRECT path) the whole feature must compile out. Gate every site on
+HAVE_BLK_FEAT_PCI_P2PDMA (dkms/Makefile.in feature_flags probe): the helpers and
 both advertise sites #ifdef out entirely; md_bio_is_p2pdma() folds to a constant
 false so its callers (REQ_NOMERGE preserve, write-behind skip) still build.
+raid1_p2pdma_clear_on_add() folds to an empty inline stub so the four call sites
+become no-ops with no per-call gating.
 
 Source-level, not a header shim: it adds preprocessor structure to drivers/md.
 
@@ -39,11 +42,14 @@ index fa907a12..d938d532 100644
  /*
   * Advertise PCI P2PDMA only when every non-faulty member can do it.
   * BLK_FEAT_PCI_P2PDMA is excluded from BLK_FEAT_INHERIT_MASK, so md sets it
-@@ -325,3 +326,4 @@ static bool raid1_can_advertise_p2pdma(struct mddev *mddev)
- 	}
- 	return any;
+@@ -353,3 +354,7 @@ static void raid1_p2pdma_clear_on_add(struct mddev *mddev, struct md_rdev *rdev)
+ 	lim.features &= ~BLK_FEAT_PCI_P2PDMA;
+ 	queue_limits_commit_update(mddev->gendisk->queue, &lim);
  }
-+#endif /* HAVE_BLK_FEAT_PCI_P2PDMA */
++#else
++static inline void raid1_p2pdma_clear_on_add(struct mddev *mddev,
++					     struct md_rdev *rdev) { }
++#endif
 diff --git a/raid1.c b/raid1.c
 index dab72170..1ce30346 100644
 --- a/raid1.c
