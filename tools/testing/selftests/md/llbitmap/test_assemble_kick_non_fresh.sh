@@ -48,7 +48,7 @@ echo "INFO: ms_dev=$MS_DEV LA=$LA LB=$LB"
 	--level=1 --metadata=1.2 --raid-devices=2 --homehost=any \
 	--bitmap=internal "$LA" "$LB" --run --force >/dev/null 2>&1
 
-dd if=/dev/urandom of="$MS_DEV" bs=1M count=1 oflag=direct >/dev/null 2>&1
+"$DD" if=/dev/urandom of="$MS_DEV" bs=1M count=1 oflag=direct >/dev/null 2>&1
 "$MDADM" --wait "$MS_DEV" || true
 "$MDADM" --stop "$MS_DEV" >/dev/null 2>&1
 
@@ -63,7 +63,7 @@ fi
 # least two events ahead of LB.
 for i in 1 2; do
 	"$MDADM" --assemble "$MS_DEV" "$LA" --run --force >/dev/null 2>&1
-	dd if=/dev/urandom of="$MS_DEV" bs=1M count=1 oflag=direct >/dev/null 2>&1
+	"$DD" if=/dev/urandom of="$MS_DEV" bs=1M count=1 oflag=direct >/dev/null 2>&1
 	"$MDADM" --wait "$MS_DEV" || true
 	"$MDADM" --stop "$MS_DEV" >/dev/null 2>&1
 done
@@ -116,7 +116,7 @@ LB2_BASE=$(basename "$LB2")
 "$MDADM" --create "$MS_DEV2" \
 	--level=1 --metadata=1.2 --raid-devices=2 --homehost=any \
 	--bitmap=internal "$LA2" "$LB2" --run --force >/dev/null 2>&1
-dd if=/dev/urandom of="$MS_DEV2" bs=1M count=1 oflag=direct >/dev/null 2>&1
+"$DD" if=/dev/urandom of="$MS_DEV2" bs=1M count=1 oflag=direct >/dev/null 2>&1
 "$MDADM" --wait "$MS_DEV2" || true
 "$MDADM" --stop "$MS_DEV2" >/dev/null 2>&1
 

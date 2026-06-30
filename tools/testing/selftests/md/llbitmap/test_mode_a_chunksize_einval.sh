@@ -55,14 +55,14 @@ sync
 # byte offset 96 (0x60) from the start of the MD super; it's a __le32
 # in sectors. So bitmap super lives at sb_start + bitmap_offset*512.
 SB_START=4096
-BITMAP_OFFSET_SECTORS=$(dd if="$LA" bs=1 skip=$((SB_START + 96)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+BITMAP_OFFSET_SECTORS=$("$DD" if="$LA" bs=1 skip=$((SB_START + 96)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 BITMAP_SUPER_BYTE=$(( SB_START + BITMAP_OFFSET_SECTORS * 512 ))
 echo "INFO: bitmap super at byte $BITMAP_SUPER_BYTE (sb_start=$SB_START, bitmap_offset=$BITMAP_OFFSET_SECTORS sectors)"
 
 # Sanity: read magic, version, chunksize from where we think the super is.
-MAGIC=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 0)) count=4 status=none | od -An -tx4 -N4 | tr -d ' ')
-VERSION=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 4)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
-ORIG_CHUNKSIZE=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+MAGIC=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 0)) count=4 status=none | od -An -tx4 -N4 | tr -d ' ')
+VERSION=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 4)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+ORIG_CHUNKSIZE=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 echo "INFO: bitmap super magic=0x$MAGIC version=$VERSION orig_chunksize=$ORIG_CHUNKSIZE"
 
 # BITMAP_MAGIC = 0x6d746962, BITMAP_MAJOR_LOCKLESS = 6.
@@ -80,17 +80,17 @@ fi
 #   131072 bytes reserved
 #   204800 > 131072 → must be rejected
 # This exercises the dimensional check at line 997.
-printf '\x01\x00\x00\x00' | dd of="$LA" bs=1 seek=$((BITMAP_SUPER_BYTE + 52)) count=4 conv=notrunc status=none
+printf '\x01\x00\x00\x00' | "$DD" of="$LA" bs=1 seek=$((BITMAP_SUPER_BYTE + 52)) count=4 conv=notrunc status=none
 
 # Also clear BITMAP_FIRST_USE in sb->state at offset 48: bit 3 = 0x08.
 # If FIRST_USE is set, llbitmap_init runs and our chunksize=1 would be
 # overwritten by the auto-chosen value before the validator sees it.
-ORIG_STATE=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 48)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+ORIG_STATE=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 48)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 NEW_STATE=$(( ORIG_STATE & ~8 ))
 # Write 4 little-endian bytes of NEW_STATE. Use python for unambiguous
 # binary encoding; the printf+sed+xargs chain mangled non-printable bytes.
 python3 -c "import sys; sys.stdout.buffer.write(($NEW_STATE).to_bytes(4, 'little'))" \
-	| dd of="$LA" bs=1 seek=$((BITMAP_SUPER_BYTE + 48)) count=4 conv=notrunc status=none
+	| "$DD" of="$LA" bs=1 seek=$((BITMAP_SUPER_BYTE + 48)) count=4 conv=notrunc status=none
 echo "INFO: cleared FIRST_USE in sb->state ($ORIG_STATE -> $NEW_STATE)"
 
 sync
@@ -100,7 +100,7 @@ blockdev --flushbufs "$LA" 2>/dev/null || true
 blockdev --flushbufs "$LB" 2>/dev/null || true
 
 # Verify the edit took effect on the underlying file.
-VERIFY_CHUNKSIZE=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+VERIFY_CHUNKSIZE=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 echo "INFO: post-edit chunksize on disk = $VERIFY_CHUNKSIZE"
 if [ "$VERIFY_CHUNKSIZE" != "1" ]; then
 	llbitmap_fail "edit did not persist: post-edit chunksize=$VERIFY_CHUNKSIZE, expected 1"
@@ -111,9 +111,9 @@ dmesg --clear >/dev/null 2>&1 || true
 
 echo "INFO: attempting assemble with chunksize=1 sectors (forced too-small)..."
 # Re-verify chunksize is still 1 immediately before mdadm reads it.
-RIGHT_BEFORE=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+RIGHT_BEFORE=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 echo "INFO: chunksize on disk RIGHT before assemble: $RIGHT_BEFORE"
-RIGHT_BEFORE_STATE=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 48)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+RIGHT_BEFORE_STATE=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 48)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 echo "INFO: state on disk RIGHT before assemble: $RIGHT_BEFORE_STATE"
 ASSEMBLE_OUTPUT=$("$MDADM" --assemble "$MS_DEV" "$LA" "$LB" --run 2>&1 || true)
 echo "INFO: mdadm output: $ASSEMBLE_OUTPUT"

@@ -110,7 +110,7 @@ echo "  chunks at create: $CH0"
 # what makes the post-regrow Unwritten count attributable solely to the grown
 # span: without it the discriminator could be masked by genuinely-unwritten
 # chunks below the shrink point.
-dd if=/dev/urandom of="$MS_DEV" bs=1M count=$C2_MB oflag=direct conv=fsync \
+"$DD" if=/dev/urandom of="$MS_DEV" bs=1M count=$C2_MB oflag=direct conv=fsync \
 	status=none || llbitmap_fail "initial full-array write failed"
 sync
 
