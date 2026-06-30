@@ -19,12 +19,24 @@
 #         pre-existing data verifies, no oops in dmesg.
 #   FAIL  oops/NULL-deref observed in dmesg (or, pre-fix, the host panics).
 #   SKIP  not llbitmap, or grow refused with -EINVAL (bitmap space too small
-#         for these sizes on this kernel — tune LOOP_*_MB / bitmap-chunk).
+#         for these sizes on this kernel — tune LOOP_*_MB / bitmap-chunk), or
+#         MD_SUBSYS=md (this reproducer would wedge the in-tree md driver).
 
 set -u
 
 DIR="$(dirname "$0")"
 . "$DIR/lib.sh"
+
+# Honor MD_SUBSYS so this reproducer participates in the md/ms suite switch
+# instead of silently always driving ms.  The pre-fix bug (llbitmap_resize()
+# not growing pctl[]/nr_pages) is an upstream llbitmap defect: on the in-tree md
+# driver it NULL-derefs / hangs the post-grow resync exactly as on an unfixed ms
+# build -- a genuine kernel wedge that needs a reboot.  The fix ships in ms_mod,
+# so refuse to run against in-tree md.  (The rest of the llbitmap suite is
+# ms-only; MD_SUBSYS defaults to ms here.)
+if [ "${MD_SUBSYS:-ms}" = md ]; then
+	llbitmap_skip "llbitmap grow-resize reproducer would wedge the in-tree md driver (upstream pctl/nr_pages grow bug); run only on ms (MD_SUBSYS=ms)"
+fi
 
 llbitmap_require_root
 llbitmap_require_modules
