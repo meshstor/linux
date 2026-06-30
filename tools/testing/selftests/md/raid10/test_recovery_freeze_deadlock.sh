@@ -65,6 +65,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "${HERE}/lib.sh"
 
+# This reproducer deliberately drives the array into the forced-raise_barrier()
+# vs freeze_array() deadlock.  On the in-tree md driver (MD_SUBSYS=md) that is a
+# genuine upstream wedge: ${MD}_resync parks in raise_barrier() and ${MD}_raid10
+# in freeze_array(), both in D state, and only a reboot clears them (the
+# per-bucket back-off fix lives in raid10_ms, not in stock md).  Refuse to run
+# against in-tree md so the suite can never brick that kernel.
+if [ "$MD_SUBSYS" = md ]; then
+	raid10_skip "forced-raise vs freeze_array deadlock genuinely wedges the in-tree md driver (D-state kthreads, reboot needed); run only on ms (MD_SUBSYS=ms)"
+fi
+
 WATCH_SECS="${RAID10_WEDGE_WATCH_SECS:-60}"
 STALL_SECS="${RAID10_WEDGE_STALL_SECS:-10}"
 SYNC_KBPS="${RAID10_SYNC_KBPS:-500}"
