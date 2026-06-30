@@ -21,7 +21,7 @@ md_wait_sync "$MD_TEST_MD_DEV"
 
 # Lay down a known pattern so we can verify byte-identity across
 # the stop/assemble cycle as well.
-dd if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=16 oflag=direct \
+"$DD" if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count=16 oflag=direct \
 	>/dev/null 2>&1 || md_fail "initial dd failed"
 sync
 

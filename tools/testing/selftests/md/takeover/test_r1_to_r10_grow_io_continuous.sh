@@ -101,11 +101,11 @@ sysfs="$(md_sysfs_path "$MD_TEST_MD_DEV")"
 # 4. 32 MiB of urandom in the protected region; snapshot md5.
 PROTECT_MB=32
 PROBE_BASE_MB=40   # workers operate at 40..43 MiB, well past PROTECT_MB.
-dd if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count="$PROTECT_MB" \
+"$DD" if=/dev/urandom of="$MD_TEST_MD_DEV" bs=1M count="$PROTECT_MB" \
 	oflag=direct >/dev/null 2>&1 || md_fail "initial dd failed"
 sync
 md5_protected() {
-	dd if="$MD_TEST_MD_DEV" bs=1M count="$PROTECT_MB" iflag=direct \
+	"$DD" if="$MD_TEST_MD_DEV" bs=1M count="$PROTECT_MB" iflag=direct \
 		2>/dev/null | md5sum | awk '{print $1}'
 }
 md5_raid1="$(md5_protected)"
@@ -123,14 +123,14 @@ spawn_worker() {
 	rb="$(mktemp "$scratch/md-probe-rb.$id.XXXXXX")"
 	(
 		while [ ! -e "$probe_stop" ]; do
-			dd if=/dev/urandom of="$nonce" bs=4096 count=1 \
+			"$DD" if=/dev/urandom of="$nonce" bs=4096 count=1 \
 				status=none 2>/dev/null
 			local t0 t1
 			t0="$(ts)"
-			if dd if="$nonce" of="$MD_TEST_MD_DEV" bs=4096 count=1 \
+			if "$DD" if="$nonce" of="$MD_TEST_MD_DEV" bs=4096 count=1 \
 				seek="$skip_4k" oflag=direct conv=notrunc \
 				status=none 2>/dev/null \
-			   && dd if="$MD_TEST_MD_DEV" of="$rb" bs=4096 count=1 \
+			   && "$DD" if="$MD_TEST_MD_DEV" of="$rb" bs=4096 count=1 \
 				skip="$skip_4k" iflag=direct \
 				status=none 2>/dev/null \
 			   && cmp -s "$nonce" "$rb"; then

@@ -36,7 +36,7 @@ mount "$MD_TEST_MD_DEV" "$mnt" || md_fail "mount failed"
 
 # Lay down a tree of files with checksummable content.
 for i in $(seq 1 32); do
-	dd if=/dev/urandom of="$mnt/file_$i" bs=64K count=1 \
+	"$DD" if=/dev/urandom of="$mnt/file_$i" bs=64K count=1 \
 		>/dev/null 2>&1 || md_fail "file write failed"
 done
 sync

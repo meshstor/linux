@@ -36,7 +36,7 @@ size_after="$(md_sysfs_read "/sys/block/$md_name/size")"
 
 # Final IO check: write at end-of-array minus 1 MiB.
 end_offset_kb=$(( (size_after / 2) - 1024 ))
-dd if=/dev/zero of="$MD_TEST_MD_DEV" bs=1K seek="$end_offset_kb" count=512 \
+"$DD" if=/dev/zero of="$MD_TEST_MD_DEV" bs=1K seek="$end_offset_kb" count=512 \
 	conv=notrunc oflag=direct >/dev/null 2>&1 \
 	|| md_fail "write at end-of-array failed"
 
