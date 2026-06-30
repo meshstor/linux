@@ -325,3 +325,31 @@ static bool raid1_can_advertise_p2pdma(struct mddev *mddev)
 	}
 	return any;
 }
+
+/*
+ * On hot-add the block layer re-stacks limits (mddev_stack_new_rdev), but only a
+ * >= 7.2 blk_stack_limits performs the PCI P2PDMA member-AND. On older kernels,
+ * adding a non-P2P member to a P2P-advertising array would leave P2P advertised
+ * and route P2P I/O to a member that cannot map it. Clear the advertisement here,
+ * before the new member becomes write-eligible. Call this immediately before each
+ * install site (success path only): a top-of-function clear would spuriously
+ * de-advertise on a rejected add (-EBUSY/-EINVAL/-EEXIST). Removal/faulty
+ * transitions never introduce a non-P2P member -- and run in atomic context -- so
+ * they are intentionally not handled (a missed P2P "upgrade" on the last non-P2P
+ * member's removal is accepted; it never advertises when it shouldn't).
+ */
+static void raid1_p2pdma_clear_on_add(struct mddev *mddev, struct md_rdev *rdev)
+{
+	struct queue_limits lim;
+
+	if (mddev_is_dm(mddev))
+		return;
+	if (!blk_queue_pci_p2pdma(mddev->gendisk->queue))
+		return;	/* array isn't advertising P2P; nothing to clear */
+	if (blk_queue_pci_p2pdma(bdev_get_queue(rdev->bdev)))
+		return;	/* new member supports P2P; advertisement stays valid */
+
+	lim = queue_limits_start_update(mddev->gendisk->queue);
+	lim.features &= ~BLK_FEAT_PCI_P2PDMA;
+	queue_limits_commit_update(mddev->gendisk->queue, &lim);
+}
