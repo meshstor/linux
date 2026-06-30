@@ -95,8 +95,8 @@ CS_FILE="/sys/block/$MS_NAME/ms/component_size"
 
 # Marker in the ORIGINAL region for an integrity check; the writers below never
 # touch the first MARKER_MB MiB.
-dd if=/dev/urandom of=/tmp/llrace.marker bs=1M count=$MARKER_MB status=none
-dd if=/tmp/llrace.marker of="$MS_DEV" bs=1M count=$MARKER_MB oflag=direct \
+"$DD" if=/dev/urandom of=/tmp/llrace.marker bs=1M count=$MARKER_MB status=none
+"$DD" if=/tmp/llrace.marker of="$MS_DEV" bs=1M count=$MARKER_MB oflag=direct \
 	conv=fsync status=none
 EXPECTED_MD5=$(md5sum /tmp/llrace.marker | awk '{print $1}')
 
@@ -120,7 +120,7 @@ for w in $(seq 1 $WRITERS); do
 			max_mb=$(( sz / 2048 ))			# 512B sectors -> MiB
 			[ "$max_mb" -gt $((MARKER_MB + 8)) ] || { sleep 0.05; continue; }
 			off=$(( (RANDOM % (max_mb - MARKER_MB - 4)) + MARKER_MB ))
-			dd if=/dev/zero of="$MS_DEV" bs=64K seek=$((off * 16)) \
+			"$DD" if=/dev/zero of="$MS_DEV" bs=64K seek=$((off * 16)) \
 				count=4 oflag=direct conv=fsync status=none \
 				2>/dev/null && echo >> "$writer_progress" || true
 		done
@@ -181,7 +181,7 @@ if kasan_oops; then
 	llbitmap_fail "KASAN/oops observed in dmesg after grow-under-write"
 fi
 
-ACTUAL_MD5=$(dd if="$MS_DEV" bs=1M count=$MARKER_MB iflag=direct status=none \
+ACTUAL_MD5=$("$DD" if="$MS_DEV" bs=1M count=$MARKER_MB iflag=direct status=none \
 	| md5sum | awk '{print $1}')
 [ "$ACTUAL_MD5" = "$EXPECTED_MD5" ] \
 	|| llbitmap_fail "original-region data mismatch: $ACTUAL_MD5 != $EXPECTED_MD5"

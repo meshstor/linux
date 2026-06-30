@@ -54,7 +54,7 @@ LLBITMAP_TEST_MOUNT=$(mktemp -d /tmp/llbitmap-mnt.XXXXXX)
 mount "$MS_DEV" "$LLBITMAP_TEST_MOUNT"
 
 # Write 32 MiB of content with a checksum-friendly pattern.
-dd if=/dev/urandom of="$LLBITMAP_TEST_MOUNT/marker" bs=1M count=32 conv=fsync status=none
+"$DD" if=/dev/urandom of="$LLBITMAP_TEST_MOUNT/marker" bs=1M count=32 conv=fsync status=none
 sync
 EXPECTED_MD5=$(md5sum "$LLBITMAP_TEST_MOUNT/marker" | awk '{print $1}')
 echo "INFO: marker md5=$EXPECTED_MD5"

@@ -76,7 +76,7 @@ bitmap_super_offset() {
 	local dev="$1"
 	local sb_start=4096
 	local off
-	off=$(dd if="$dev" bs=1 skip=$((sb_start + 96)) count=4 status=none |
+	off=$("$DD" if="$dev" bs=1 skip=$((sb_start + 96)) count=4 status=none |
 	      od -An -tu4 -N4 | tr -d ' ')
 	echo $(( sb_start + off * 512 ))
 }
@@ -85,7 +85,7 @@ read_state_byte0() {
 	local dev="$1"
 	local sb_off
 	sb_off=$(bitmap_super_offset "$dev")
-	dd if="$dev" bs=1 skip=$((sb_off + 48)) count=1 status=none | od -An -tu1 -N1 | tr -d ' '
+	"$DD" if="$dev" bs=1 skip=$((sb_off + 48)) count=1 status=none | od -An -tu1 -N1 | tr -d ' '
 }
 
 # Clear FIRST_USE (bit 3) so read_sb proceeds to the chunksize check
@@ -96,7 +96,7 @@ clear_first_use() {
 	sb_off=$(bitmap_super_offset "$dev")
 	cur=$(read_state_byte0 "$dev")
 	printf "\\x$(printf '%02x' $((cur & ~8)))" |
-		dd of="$dev" bs=1 seek=$((sb_off + 48)) count=1 conv=notrunc status=none
+		"$DD" of="$dev" bs=1 seek=$((sb_off + 48)) count=1 conv=notrunc status=none
 }
 
 # Forge a non-power-of-2 chunksize (=3) into the __le32 at sb+52.
@@ -105,7 +105,7 @@ forge_bad_chunksize() {
 	local sb_off
 	sb_off=$(bitmap_super_offset "$dev")
 	printf '\x03\x00\x00\x00' |
-		dd of="$dev" bs=1 seek=$((sb_off + 52)) count=4 conv=notrunc status=none
+		"$DD" of="$dev" bs=1 seek=$((sb_off + 52)) count=4 conv=notrunc status=none
 }
 
 LA=$(llbitmap_make_loop $LOOP_SIZE_MB)

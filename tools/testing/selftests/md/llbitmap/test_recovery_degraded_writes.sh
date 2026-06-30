@@ -148,12 +148,12 @@ run_case() {
 	wait_idle_optimal || llbitmap_fail "$layout/$heal: initial sync never finished"
 
 	# healthy-era pattern P1, then degrade, then degraded-era pattern P2
-	dd if=/dev/urandom of="$MS_DEV" bs=1M count="$REGION_MB" \
+	"$DD" if=/dev/urandom of="$MS_DEV" bs=1M count="$REGION_MB" \
 		seek="$SEEK_MB" oflag=direct status=none
 	"$MDADM" "$MS_DEV" --fail "${MEMBERS[$FAIL_IDX]}" >/dev/null 2>&1
 	"$MDADM" "$MS_DEV" --remove "${MEMBERS[$FAIL_IDX]}" >/dev/null 2>&1
-	dd if=/dev/urandom of="$P2" bs=1M count="$REGION_MB" status=none
-	dd if="$P2" of="$MS_DEV" bs=1M seek="$SEEK_MB" oflag=direct status=none
+	"$DD" if=/dev/urandom of="$P2" bs=1M count="$REGION_MB" status=none
+	"$DD" if="$P2" of="$MS_DEV" bs=1M seek="$SEEK_MB" oflag=direct status=none
 
 	case "$heal" in
 	add)
@@ -170,7 +170,7 @@ run_case() {
 	"$MDADM" "$MS_DEV" --fail "${MEMBERS[$PARTNER_IDX]}" >/dev/null 2>&1
 	sleep 1
 
-	if ! cmp -s <(dd if="$MS_DEV" bs=1M skip="$SEEK_MB" count="$REGION_MB" \
+	if ! cmp -s <("$DD" if="$MS_DEV" bs=1M skip="$SEEK_MB" count="$REGION_MB" \
 			iflag=direct status=none) "$P2"; then
 		llbitmap_fail "$layout/$heal: rebuilt member serves stale data"
 	fi

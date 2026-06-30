@@ -67,14 +67,14 @@ echo "INFO: in-memory llbitmap->chunksize = $LLBITMAP_CHUNKSIZE sectors"
 # Bitmap super at sb_start (4096) + bitmap_offset (sectors, at MD super
 # byte 96) * 512.
 SB_START=4096
-BITMAP_OFFSET_SECTORS=$(dd if="$LA" bs=1 skip=$((SB_START + 96)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+BITMAP_OFFSET_SECTORS=$("$DD" if="$LA" bs=1 skip=$((SB_START + 96)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 BITMAP_SUPER_BYTE=$(( SB_START + BITMAP_OFFSET_SECTORS * 512 ))
 
 # bitmap_super_t layout (md-bitmap.h:36-52):
 #   offset 48: __le32 state
 #   offset 52: __le32 chunksize
-SB_STATE=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 48)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
-SB_CHUNKSIZE=$(dd if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+SB_STATE=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 48)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
+SB_CHUNKSIZE=$("$DD" if="$LA" bs=1 skip=$((BITMAP_SUPER_BYTE + 52)) count=4 status=none | od -An -tu4 -N4 | tr -d ' ')
 
 echo "INFO: on-disk sb->state    = $SB_STATE (bit 3 = BITMAP_FIRST_USE = 8)"
 echo "INFO: on-disk sb->chunksize = $SB_CHUNKSIZE"

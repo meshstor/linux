@@ -58,7 +58,7 @@ mount "$MS_DEV" "$LLBITMAP_TEST_MOUNT"
 
 # Initial data: 256 MiB of pseudorandom content. Captured md5 will be
 # our reference for what the spare must hold post-recovery.
-dd if=/dev/urandom of="$LLBITMAP_TEST_MOUNT/initial" bs=1M count=256 conv=fsync status=none
+"$DD" if=/dev/urandom of="$LLBITMAP_TEST_MOUNT/initial" bs=1M count=256 conv=fsync status=none
 sync
 INITIAL_MD5=$(md5sum "$LLBITMAP_TEST_MOUNT/initial" | awk '{print $1}')
 echo "INFO: initial 256 MiB md5=$INITIAL_MD5"
@@ -73,7 +73,7 @@ WRITER_PID_FILE=$(mktemp)
 (
 	# shellcheck disable=SC2034
 	for round in $(seq 1 200); do
-		dd if=/dev/urandom of="$LLBITMAP_TEST_MOUNT/rolling" bs=1M count=64 conv=fsync status=none 2>/dev/null || break
+		"$DD" if=/dev/urandom of="$LLBITMAP_TEST_MOUNT/rolling" bs=1M count=64 conv=fsync status=none 2>/dev/null || break
 		sync 2>/dev/null || break
 		sleep 0.1
 	done

@@ -50,7 +50,7 @@ bitmap_super_offset() {
 	local dev="$1"
 	local sb_start=4096
 	local off
-	off=$(dd if="$dev" bs=1 skip=$((sb_start + 96)) count=4 status=none |
+	off=$("$DD" if="$dev" bs=1 skip=$((sb_start + 96)) count=4 status=none |
 	      od -An -tu4 -N4 | tr -d ' ')
 	echo $(( sb_start + off * 512 ))
 }
@@ -59,7 +59,7 @@ read_state_byte0() {
 	local dev="$1"
 	local sb_off
 	sb_off=$(bitmap_super_offset "$dev")
-	dd if="$dev" bs=1 skip=$((sb_off + 48)) count=1 status=none | od -An -tu1 -N1 | tr -d ' '
+	"$DD" if="$dev" bs=1 skip=$((sb_off + 48)) count=1 status=none | od -An -tu1 -N1 | tr -d ' '
 }
 
 write_state_byte0() {
@@ -67,14 +67,14 @@ write_state_byte0() {
 	local val="$2"
 	local sb_off
 	sb_off=$(bitmap_super_offset "$dev")
-	printf "\\x$(printf '%02x' "$val")" | dd of="$dev" bs=1 seek=$((sb_off + 48)) count=1 conv=notrunc status=none
+	printf "\\x$(printf '%02x' "$val")" | "$DD" of="$dev" bs=1 seek=$((sb_off + 48)) count=1 conv=notrunc status=none
 }
 
 read_events() {
 	local dev="$1"
 	local sb_off
 	sb_off=$(bitmap_super_offset "$dev")
-	dd if="$dev" bs=1 skip=$((sb_off + 24)) count=8 status=none |
+	"$DD" if="$dev" bs=1 skip=$((sb_off + 24)) count=8 status=none |
 		python3 -c 'import sys; print(int.from_bytes(sys.stdin.buffer.read(8), "little"))'
 }
 
@@ -137,7 +137,7 @@ echo "$BITS_RAW" | head -8
 
 # Drive several md_update_sb cycles so a live bitmap advances sb->events.
 for i in $(seq 1 4); do
-	dd if=/dev/urandom of="$MS_DEV" bs=1M count=1 seek=$((i*5)) \
+	"$DD" if=/dev/urandom of="$MS_DEV" bs=1M count=1 seek=$((i*5)) \
 		oflag=direct status=none 2>/dev/null || true
 	sync
 	echo idle | sudo tee "/sys/block/$MS_NAME/ms/sync_action" >/dev/null 2>&1 || true

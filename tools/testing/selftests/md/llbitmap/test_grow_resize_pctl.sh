@@ -60,8 +60,8 @@ case "$bt" in
 esac
 
 # Write a marker into the ORIGINAL region (first 8 MiB) for integrity check.
-dd if=/dev/urandom of=/tmp/llgrow.marker bs=1M count=8 status=none
-dd if=/tmp/llgrow.marker of="$MS_DEV" bs=1M count=8 oflag=direct conv=fsync status=none
+"$DD" if=/dev/urandom of=/tmp/llgrow.marker bs=1M count=8 status=none
+"$DD" if=/tmp/llgrow.marker of="$MS_DEV" bs=1M count=8 oflag=direct conv=fsync status=none
 EXPECTED_MD5=$(md5sum /tmp/llgrow.marker | awk '{print $1}')
 
 SIZE_BEFORE=$(blockdev --getsize64 "$MS_DEV")
@@ -102,7 +102,7 @@ echo "  array size after grow:  $SIZE_AFTER bytes"
 
 # Exercise the NEW region: write into the grown tail (8 MiB past the old end).
 NEW_SEEK_MB=$(( SIZE_BEFORE / 1048576 + 8 ))
-dd if=/dev/urandom of="$MS_DEV" bs=1M seek=$NEW_SEEK_MB count=16 oflag=direct conv=fsync status=none \
+"$DD" if=/dev/urandom of="$MS_DEV" bs=1M seek=$NEW_SEEK_MB count=16 oflag=direct conv=fsync status=none \
 	|| llbitmap_fail "write into grown region failed"
 sync
 
@@ -113,7 +113,7 @@ if llbitmap_dmesg_contains 'BUG: kernel NULL pointer' || \
 	llbitmap_fail "oops observed in dmesg after grow"
 fi
 
-ACTUAL_MD5=$(dd if="$MS_DEV" bs=1M count=8 iflag=direct status=none | md5sum | awk '{print $1}')
+ACTUAL_MD5=$("$DD" if="$MS_DEV" bs=1M count=8 iflag=direct status=none | md5sum | awk '{print $1}')
 [ "$ACTUAL_MD5" = "$EXPECTED_MD5" ] \
 	|| llbitmap_fail "original-region data mismatch: $ACTUAL_MD5 != $EXPECTED_MD5"
 

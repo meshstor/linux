@@ -120,12 +120,12 @@ echo 2000000 > "$SYS/sync_speed_max"
 wait_idle_degraded 0 || llbitmap_fail "initial sync never finished"
 
 # healthy-era pattern, then lose D, then degraded-era pattern P2
-dd if=/dev/urandom of="$MS_DEV" bs=1M count="$REGION_MB" \
+"$DD" if=/dev/urandom of="$MS_DEV" bs=1M count="$REGION_MB" \
 	seek="$SEEK_MB" oflag=direct status=none
 "$MDADM" "$MS_DEV" --fail "${MEMBERS[$D_IDX]}" >/dev/null 2>&1
 "$MDADM" "$MS_DEV" --remove "${MEMBERS[$D_IDX]}" >/dev/null 2>&1
-dd if=/dev/urandom of="$P2" bs=1M count="$REGION_MB" status=none
-dd if="$P2" of="$MS_DEV" bs=1M seek="$SEEK_MB" oflag=direct status=none
+"$DD" if=/dev/urandom of="$P2" bs=1M count="$REGION_MB" status=none
+"$DD" if="$P2" of="$MS_DEV" bs=1M seek="$SEEK_MB" oflag=direct status=none
 
 # lose B as well, rebuild a blank spare into its slot (slot 1 is the
 # first free slot, so the spare lands there, not in D's)
@@ -152,7 +152,7 @@ wait_idle_degraded 0 || llbitmap_fail "re-add catch-up never finished"
 "$MDADM" "$MS_DEV" --fail "${MEMBERS[$C_IDX]}" >/dev/null 2>&1
 sleep 1
 
-if ! cmp -s <(dd if="$MS_DEV" bs=1M skip="$SEEK_MB" count="$REGION_MB" \
+if ! cmp -s <("$DD" if="$MS_DEV" bs=1M skip="$SEEK_MB" count="$REGION_MB" \
 		iflag=direct status=none) "$P2"; then
 	llbitmap_fail "re-added member serves stale data"
 fi
