@@ -56,8 +56,29 @@ sudo dmsetup targets | grep -q '^flakey' || llbitmap_skip "dm-flakey target miss
 LOOP_SIZE_MB=100
 
 P12_FLAKEY_NAMES=()
+
+# Stop any IN-KERNEL md array that udev auto-assembled over our members.
+# meshstor superblocks are bit-for-bit identical to kernel md, so the in-tree
+# md_mod grabs the flakey/loop members the moment they reappear (after --stop
+# and after every dmsetup resume), holding them busy and shadowing direct reads
+# of the underlying loops.  Stop only the md arrays that hold OUR members.
+p12_stop_inkernel_md() {
+	local memb base h hname
+	for memb in "${FA:-}" "${FB:-}" "${LA:-}" "${LB:-}"; do
+		[ -n "$memb" ] && [ -e "$memb" ] || continue
+		base=$(basename "$(readlink -f "$memb")")
+		for h in /sys/block/"$base"/holders/md*; do
+			[ -e "$h" ] || continue
+			hname=$(basename "$h")
+			sudo mdadm --stop "/dev/$hname" >/dev/null 2>&1 || true
+		done
+	done
+	udevadm settle 2>/dev/null || true
+}
+
 p12_cleanup() {
 	set +e
+	p12_stop_inkernel_md
 	for n in "${P12_FLAKEY_NAMES[@]:-}"; do
 		sudo dmsetup remove "$n" 2>/dev/null
 	done
@@ -131,6 +152,20 @@ sync
 sudo "$MDADM" --stop "$MS_DEV" >/dev/null 2>&1
 udevadm settle 2>/dev/null
 
+# The array wrote its superblock THROUGH the dm-flakey stacked on $LA/$LB.
+# Two things now corrupt a naive on-disk read of the underlying loops:
+#   1. each loop block device keeps its OWN page cache, still holding the
+#      pre-create (zero) pages, so a buffered read returns stale data --
+#      bitmap_super_offset() would read bitmap_offset as 0 and the FIRST_USE
+#      plant would land inside the md superblock, destroying it;
+#   2. udev auto-assembles the bit-identical superblock into an in-kernel md
+#      array that holds the members and re-populates that stale cache.
+# Stop the in-kernel md, then invalidate the loop caches, so the plant targets
+# the real bitmap super and the later --assemble can open the members.
+p12_stop_inkernel_md
+blockdev --flushbufs "$LA" 2>/dev/null || true
+blockdev --flushbufs "$LB" 2>/dev/null || true
+
 # Read state from both underlying loops (NOT via dm-flakey, so we read
 # what's actually on disk regardless of flakey state)
 STATE_A_BEFORE=$(read_state_byte0 "$LA")
@@ -161,6 +196,10 @@ sudo dmsetup load p12-flakeyB --table "0 $SIZE_B flakey $LB 0 0 999 1 error_writ
 sudo dmsetup resume p12-flakeyA
 sudo dmsetup resume p12-flakeyB
 echo "  flakey: all writes will return EIO"
+
+# The dmsetup resume re-triggered udev auto-assembly; clear it so our explicit
+# --assemble reaches RUN_ARRAY instead of failing with "is busy - skipping".
+p12_stop_inkernel_md
 
 # Attempt assemble. llbitmap_init must run because FIRST_USE is on disk.
 # Inside llbitmap_init it calls llbitmap_refresh_sb then
