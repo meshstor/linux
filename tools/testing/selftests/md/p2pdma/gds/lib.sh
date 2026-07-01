@@ -95,3 +95,134 @@ gds_cmp_legs() {
 			|| { echo "leg $m diverges from pattern" >&2; return 1; }
 	done
 }
+
+# ---------------------------------------------------------------------------
+# Loopback NVMe-oF: the single-node stand-in for the CSI's remote leg.
+# Target = nvmet configfs on this node; initiator = nvme connect to self with
+# the CSI's exact flags (meshstor-csi internal/nvmeof/host.go).
+GDS_NVMET_NQN=""
+GDS_NVMET_PORT_ID=7431          # unlikely to collide with a real deployment
+GDS_REMOTE_DEVS=()
+GDS_MNT="${GDS_MNT:-/mnt/gds-test}"
+
+# first IPv4 on an RDMA-capable netdev (hw NIC or rxe); rc 1 if none
+gds_rdma_addr() {
+	local ibdev netdev addr
+	for ibdev in /sys/class/infiniband/*; do
+		[ -e "$ibdev" ] || continue
+		for netdev in "$ibdev"/device/net/*; do
+			[ -e "$netdev" ] || continue
+			addr=$(ip -4 -o addr show dev "$(basename "$netdev")" \
+				| awk '{print $4}' | cut -d/ -f1 | head -1)
+			[ -n "$addr" ] && { echo "$addr"; return 0; }
+		done
+	done
+	return 1
+}
+
+# gds_nvmet_export TRANSPORT DEV...  (TRANSPORT: tcp|rdma)
+gds_nvmet_export() {
+	local tr=$1; shift
+	local addr port i=1 dev
+	modprobe nvmet "nvmet-$tr" nvme-fabrics "nvme-$tr" 2>/dev/null || true
+	[ -d /sys/kernel/config/nvmet ] || { echo "SKIP: nvmet configfs unavailable" >&2; exit 4; }
+	case "$tr" in
+		tcp)  addr=127.0.0.1; port=4420;;
+		rdma) addr=$(gds_rdma_addr) || { echo "SKIP: no RDMA-capable address" >&2; exit 4; }
+		      port=4421;;
+		*) echo "gds_nvmet_export: bad transport '$tr'" >&2; return 1;;
+	esac
+	GDS_NVMET_NQN="nqn.2025-12.io.meshstor:$tr:gdstest:$(hostname -s)"
+	local ss=/sys/kernel/config/nvmet/subsystems/$GDS_NVMET_NQN
+	mkdir -p "$ss" && echo 1 > "$ss/attr_allow_any_host"
+	for dev in "$@"; do
+		mkdir -p "$ss/namespaces/$i"
+		echo -n "$dev" > "$ss/namespaces/$i/device_path"
+		echo 1 > "$ss/namespaces/$i/enable"
+		i=$((i + 1))
+	done
+	local p=/sys/kernel/config/nvmet/ports/$GDS_NVMET_PORT_ID
+	mkdir -p "$p"
+	echo "$tr"   > "$p/addr_trtype"
+	echo ipv4    > "$p/addr_adrfam"
+	echo "$addr" > "$p/addr_traddr"
+	echo "$port" > "$p/addr_trsvcid"
+	ln -s "$ss" "$p/subsystems/$GDS_NVMET_NQN"
+	# CSI connect flags (nr-io-queues, aggressive timeouts). NOTE: the CSI Go
+	# code (meshstor-csi internal/nvmeof/host.go) also passes
+	# --fast_io_fail_tmo=1, but this nvme-cli (2.8, libnvme 1.8) has no such
+	# option under any spelling (confirmed via `nvme connect --help` and
+	# `strings` on the binary -- only --ctrl-loss-tmo is compiled in), so it
+	# is omitted here; --ctrl-loss-tmo alone governs path-failure teardown.
+	if ! nvme connect --transport "$tr" --traddr "$addr" --trsvcid "$port" \
+		--nqn "$GDS_NVMET_NQN" \
+		--hostnqn "nqn.2025-12.io.meshstor:$(hostname -s)" \
+		--nr-io-queues=16 --keep-alive-tmo=1 \
+		--ctrl-loss-tmo=3 --reconnect-delay=1 >/dev/null 2>&1; then
+		gds_nvmet_teardown
+		echo "SKIP: nvme connect ($tr) failed" >&2; exit 4
+	fi
+	# resolve initiator-side namespaces (NSID order == DEV order). NOTE: with
+	# native NVMe multipathing on (nvme_core.multipath=Y, common default),
+	# a fabrics namespace is split into a *hidden* per-controller-path device
+	# (nvme<ctrl>c<ctrl>n<nsid>, no /dev node -- "hidden" sysfs attr = 1) and
+	# a separate "head" device the kernel actually creates /dev/nvme<X>n<Y>
+	# for, filed under /sys/class/nvme-subsystem/nvme-subsysN/ instead of
+	# under the controller. Private (non-fabric, single-path) namespaces,
+	# e.g. local PCIe test partitions, skip that split and stay directly
+	# under the controller. So probe both locations and skip hidden ones.
+	local want=$(( i - 1 )) tries c ctrl="" sd ns cand cands
+	for tries in $(seq 100); do
+		for c in /sys/class/nvme/nvme*; do
+			[ -e "$c/subsysnqn" ] || continue
+			[ "$(cat "$c/subsysnqn" 2>/dev/null)" = "$GDS_NVMET_NQN" ] && { ctrl=$c; break; }
+		done
+		if [ -n "$ctrl" ]; then
+			sd=""
+			for c in /sys/class/nvme-subsystem/*; do
+				[ -e "$c/subsysnqn" ] || continue
+				[ "$(cat "$c/subsysnqn" 2>/dev/null)" = "$GDS_NVMET_NQN" ] && { sd=$c; break; }
+			done
+			cands=("$ctrl"/nvme*n*)
+			[ -n "$sd" ] && cands+=("$sd"/nvme*n*)
+			GDS_REMOTE_DEVS=()
+			for i in $(seq "$want"); do
+				ns=""
+				for cand in "${cands[@]}"; do
+					[ -f "$cand/nsid" ] || continue
+					[ "$(cat "$cand/nsid" 2>/dev/null)" = "$i" ] || continue
+					[ "$(cat "$cand/hidden" 2>/dev/null || echo 0)" = 1 ] && continue
+					ns=$cand; break
+				done
+				[ -n "$ns" ] && GDS_REMOTE_DEVS+=("/dev/$(basename "$ns")")
+			done
+			[ "${#GDS_REMOTE_DEVS[@]}" -eq "$want" ] && return 0
+		fi
+		sleep 0.2
+	done
+	gds_nvmet_teardown
+	echo "SKIP: loopback namespaces never appeared" >&2; exit 4
+}
+
+gds_nvmet_teardown() {
+	[ -n "$GDS_NVMET_NQN" ] || return 0
+	nvme disconnect -n "$GDS_NVMET_NQN" >/dev/null 2>&1 || true
+	local p=/sys/kernel/config/nvmet/ports/$GDS_NVMET_PORT_ID
+	local ss=/sys/kernel/config/nvmet/subsystems/$GDS_NVMET_NQN
+	rm -f "$p/subsystems/$GDS_NVMET_NQN" 2>/dev/null || true
+	rmdir "$p" 2>/dev/null || true
+	if [ -d "$ss" ]; then
+		local n
+		for n in "$ss"/namespaces/*; do
+			[ -d "$n" ] && { echo 0 > "$n/enable" 2>/dev/null; rmdir "$n" 2>/dev/null; }
+		done
+		rmdir "$ss" 2>/dev/null || true
+	fi
+	GDS_NVMET_NQN=""; GDS_REMOTE_DEVS=()
+}
+
+gds_teardown() {
+	mountpoint -q "$GDS_MNT" 2>/dev/null && umount "$GDS_MNT" 2>/dev/null
+	p2pdma_teardown
+	gds_nvmet_teardown
+}
