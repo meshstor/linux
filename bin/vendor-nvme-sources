@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# vendor-nvme-sources — populate/refresh dkms-nvme/vendor/ with each target
+# kernel's private nvme host sources {rdma.c, nvme.h, fabrics.h}.
+#
+# Variants and default sources ("latest" = newest release tag / SRPM):
+#   u2404-hwe  Ubuntu 24.04 HWE 6.17   Launchpad noble linux git, Ubuntu-hwe-6.17-* tag
+#   u2604      Ubuntu 26.04 (7.0)      Launchpad resolute linux git, Ubuntu-7.0.0-* tag
+#   rhel10     Rocky/RHEL 10 (6.12)    latest Rocky 10 BaseOS kernel SRPM
+#
+# Files are vendored BYTE-IDENTICAL to the distro source. The p2pdma
+# backport lives in dkms-nvme/patches/<variant>/ and is applied at
+# tarball-assembly time (bin/build-nvme-tarball), never here.
+#
+# Exit: 0 = vendor tree unchanged, 3 = files were (re)written — re-verify
+# that dkms-nvme/patches/ still applies at --fuzz=0 before committing.
+# Network-using by design; run manually when a target moves, never from
+# the build pipeline.
+#
+# Usage: bin/vendor-nvme-sources [--u2404 TAG] [--u2604 TAG] [--rhel10 NVR]
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+VENDOR="$REPO_ROOT/dkms-nvme/vendor"
+FILES=(rdma.c nvme.h fabrics.h)
+
+NOBLE_GIT="https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/noble"
+RESOLUTE_GIT="https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute"
+ROCKY_SRC="https://dl.rockylinux.org/pub/rocky/10/BaseOS/source/tree/Packages/k"
+
+U2404_TAG= U2604_TAG= RHEL10_NVR=
+while (($#)); do
+    case "$1" in
+        --u2404)  U2404_TAG="${2:?}";  shift 2 ;;
+        --u2604)  U2604_TAG="${2:?}";  shift 2 ;;
+        --rhel10) RHEL10_NVR="${2:?}"; shift 2 ;;
+        *) echo "usage: $0 [--u2404 TAG] [--u2604 TAG] [--rhel10 NVR]" >&2; exit 2 ;;
+    esac
+done
+
+for t in curl git rpm2cpio cpio xz tar; do
+    command -v "$t" >/dev/null \
+        || { echo "error: required tool '$t' not installed" >&2; exit 1; }
+done
+
+TMP="$(mktemp -d "$REPO_ROOT/build/vendor-nvme.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+latest_tag() { # $1=repo url  $2=tag glob -> newest matching tag name
+    git ls-remote --tags "$1" "$2" \
+        | awk -F/ '{print $NF}' | grep -v '\^{}$' | sort -V | tail -1
+}
+
+write_provenance() { # $1=variant  $2=source line  $3=ref line  $4=reverify line
+    local dir="$VENDOR/$1"
+    {
+        echo "# Provenance of dkms-nvme/vendor/$1 — written by bin/vendor-nvme-sources"
+        echo "# Vendored: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "source: $2"
+        echo "ref: $3"
+        echo "re-verify: $4"
+        echo "# sha256 of vendored files:"
+        (cd "$dir" && sha256sum "${FILES[@]}")
+    } > "$dir/PROVENANCE"
+}
+
+fetch_launchpad() { # $1=variant  $2=repo url  $3=tag  $4=pin flag name
+    local variant="$1" repo="$2" tag="$3" flag="$4" f
+    mkdir -p "$VENDOR/$variant"
+    for f in "${FILES[@]}"; do
+        curl -fsS "$repo/plain/drivers/nvme/host/$f?h=$tag" \
+            -o "$VENDOR/$variant/$f"
+    done
+    write_provenance "$variant" "$repo" "$tag" \
+        "bin/vendor-nvme-sources $flag $tag && git diff --exit-code dkms-nvme/vendor/$variant"
+    echo "vendored $variant  <-  $tag"
+}
+
+fetch_rocky() { # $1=NVR like 6.12.0-211.26.1.el10_2, or empty = latest
+    local nvr="$1" srpm f
+    if [[ -z "$nvr" ]]; then
+        srpm="$(curl -fsS "$ROCKY_SRC/" \
+            | grep -oE 'kernel-6\.12\.0-[0-9.]+\.el10[_0-9]*\.src\.rpm' \
+            | sort -uV | tail -1)"
+        [[ -n "$srpm" ]] || { echo "error: no kernel SRPM index at $ROCKY_SRC" >&2; exit 1; }
+    else
+        srpm="kernel-$nvr.src.rpm"
+    fi
+    mkdir -p "$VENDOR/rhel10"
+    echo "downloading $srpm (large; a few hundred MB)"
+    curl -fS -o "$TMP/$srpm" "$ROCKY_SRC/$srpm"
+    (cd "$TMP" && rpm2cpio "$srpm" | cpio -id --quiet 'linux-*.tar.xz')
+    tar -xJf "$TMP"/linux-*.tar.xz -C "$TMP" --wildcards \
+        'linux-*/drivers/nvme/host/rdma.c' \
+        'linux-*/drivers/nvme/host/nvme.h' \
+        'linux-*/drivers/nvme/host/fabrics.h'
+    for f in "${FILES[@]}"; do
+        cp "$TMP"/linux-*/drivers/nvme/host/"$f" "$VENDOR/rhel10/$f"
+    done
+    write_provenance rhel10 "$ROCKY_SRC/$srpm" "${srpm%.src.rpm}" \
+        "bin/vendor-nvme-sources --rhel10 ${srpm#kernel-} && git diff --exit-code dkms-nvme/vendor/rhel10"
+}
+
+[[ -n "$U2404_TAG" ]] || U2404_TAG="$(latest_tag "$NOBLE_GIT" 'Ubuntu-hwe-6.17-*')"
+[[ -n "$U2604_TAG" ]] || U2604_TAG="$(latest_tag "$RESOLUTE_GIT" 'Ubuntu-7.0.0-*')"
+[[ -n "$U2404_TAG" && -n "$U2604_TAG" ]] \
+    || { echo "error: could not resolve a Launchpad tag" >&2; exit 1; }
+
+fetch_launchpad u2404-hwe "$NOBLE_GIT" "$U2404_TAG" --u2404
+fetch_launchpad u2604 "$RESOLUTE_GIT" "$U2604_TAG" --u2604
+fetch_rocky "$RHEL10_NVR"
+
+if git -C "$REPO_ROOT" status --porcelain -- dkms-nvme/vendor | grep -q .; then
+    echo
+    echo "vendor tree CHANGED — verify dkms-nvme/patches/ still applies at"
+    echo "--fuzz=0 (bin/build-nvme-tarball fails loudly if not), then commit."
+    exit 3
+fi
+echo "vendor tree unchanged."

@@ -1,0 +1,9 @@
+# Provenance of dkms-nvme/vendor/u2604 — written by bin/vendor-nvme-sources
+# Vendored: 2026-07-02T16:57:16Z
+source: https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute
+ref: Ubuntu-7.0.0-28.28
+re-verify: bin/vendor-nvme-sources --u2604 Ubuntu-7.0.0-28.28 && git diff --exit-code dkms-nvme/vendor/u2604
+# sha256 of vendored files:
+143db83720d9a89c77e532d3ce1aa22c762b1cce9e9b6db91268717f44acbfc0  rdma.c
+1f93353de98a4ce50363bd628c696f741bb01d6cc67f72498b12d06287cd3569  nvme.h
+6e449f8bc602b385a9c5f714c6e02334a63d068d0fff703282e627b13e44893a  fabrics.h
