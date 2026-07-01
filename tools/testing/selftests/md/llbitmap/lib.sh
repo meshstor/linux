@@ -224,6 +224,29 @@ llbitmap_dmesg_clear() {
 	dmesg --clear >/dev/null 2>&1 || true
 }
 
+# llbitmap_stop_inkernel_md MEMBER... -> stop any IN-TREE md array that udev
+# auto-assembled over our loop/dm members.  meshstor superblocks are bit-for-bit
+# identical to kernel md, so under MD_SUBSYS=ms the in-tree md_mod grabs the
+# members the moment they reappear (after a --stop or a dmsetup create/resume),
+# holding them busy and shadowing a direct read of the underlying loops.  The
+# 'md*' holder glob matches only in-tree md arrays (our personality is msNNN),
+# so this never stops OUR array.  A no-op under MD_SUBSYS=md (our array *is* the
+# md* holder -- but there the bit-identical-superblock theft cannot occur).
+llbitmap_stop_inkernel_md() {
+	[ "$MD_SUBSYS" = ms ] || return 0
+	local memb base h hname
+	for memb in "$@"; do
+		[ -n "$memb" ] && [ -e "$memb" ] || continue
+		base=$(basename "$(readlink -f "$memb")")
+		for h in /sys/block/"$base"/holders/md*; do
+			[ -e "$h" ] || continue
+			hname=$(basename "$h")
+			"$MDADM" --stop "/dev/$hname" >/dev/null 2>&1 || true
+		done
+	done
+	udevadm settle 2>/dev/null || true
+}
+
 # llbitmap_state_count MS_NAME STATE -> integer chunk count in given state
 # Reads from /sys/block/<ms>/ms/llbitmap/bits which prints lines like:
 #   unwritten N

@@ -1,14 +1,26 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Mode B reproducer: fresh-spare recovery on a degraded RAID1 with
-# --bitmap=auto must reach in_sync within a bounded time.
+# Mode B recovery LIVENESS smoke test: fresh-spare recovery on a degraded
+# RAID1 with --bitmap=auto must reach in_sync within a bounded time and not
+# get stuck in "spare".
 #
-# Pre-fix expectation: TIMEOUT (spare stuck in "spare" state because
-# llbitmap state machine refuses to transition BitClean -> BitSyncing
-# during degraded recovery).
+# IMPORTANT -- this does NOT discriminate the BitClean->BitSyncing fix, and it
+# is NOT a regression guard for it.  Empirically the spare reaches in_sync on
+# BOTH the fixed and the unfixed kernel: conf->fullsync in raid1_sync_request
+# forces a full sync of the fresh spare regardless of what the llbitmap state
+# machine decides, so pre-degrade (clean) data is copied and in_sync is reached
+# either way.  The old "pre-fix => TIMEOUT" claim was wrong; fullsync always
+# rescues fresh-spare recovery.
 #
-# Post-fix expectation: spare reaches "in_sync" within ~30 s.
+# The actual regression guards for the degraded-recovery bug are the tests that
+# write DURING the degraded window (which fullsync cannot mask) and check the
+# data with a real oracle -- they FAIL on the unfixed kernel and PASS on the
+# fixed one:
+#     test_recovery_degraded_writes.sh
+#     test_classic_bitmap_double_degraded_re_add.sh
+# This test remains as a cheap liveness check (recovery completes, spare not
+# wedged); a genuine bug that also wedged recovery would still trip its timeout.
 
 set -eu
 
@@ -37,10 +49,14 @@ echo "INFO: ms_dev=$MS_DEV members=$LA,$LB spare=$LC"
 # precondition that makes Mode B fire: BitClean[Startsync] = BitNone in
 # the state machine table, and the degraded fast path only special-cases
 # BitDirty.
+# Create with error handling: a bootstrap create failure is a setup
+# precondition (SKIP), not a silent set-e death with a bare rc=1 and no
+# diagnostic (which is indistinguishable from a real regression).
 "$MDADM" --create "$MS_DEV" \
 	--level=1 --metadata=1.2 --raid-devices=2 --homehost=any \
 	--bitmap=auto --bitmap-chunk=64M --consistency-policy=bitmap \
-	--assume-clean "$LA" "$LB" --run --force >/dev/null 2>&1
+	--assume-clean "$LA" "$LB" --run --force >/dev/null 2>&1 \
+	|| llbitmap_skip "mdadm create failed"
 
 # Sanity: confirm llbitmap is the active bitmap implementation.
 bitmap_type=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")

@@ -19,6 +19,14 @@
 #
 # Pre-fix expectation per investigation: spare stuck at "spare", or
 # spare reaches in_sync but md5 mismatches under concurrent load.
+#
+# CAVEAT -- empirically this passes on BOTH the fixed and unfixed kernel, so it
+# is a smoke/liveness check, NOT a regression guard: conf->fullsync rescues the
+# fresh-spare sync and the verified data is the initial (pre-degrade) content
+# served largely from cache, so no mismatch appears on either kernel.  The
+# discriminating guards (write-while-degraded + data oracle, FAIL on the
+# unfixed kernel) are test_recovery_degraded_writes.sh and
+# test_classic_bitmap_double_degraded_re_add.sh.
 
 set -eu
 

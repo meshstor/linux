@@ -172,8 +172,14 @@ sync
 [ "$grew" -gt 0 ] || llbitmap_skip "no grow step applied (sizes too small / refused)"
 
 writes_done=$(wc -l < "$writer_progress" 2>/dev/null || echo 0)
+# Grows already succeeded (grew>0), so the array is functional; zero writes
+# landing means the concurrent-writer stressor never engaged and the
+# write-vs-resize race was never exercised.  That is the harness failing to
+# drive its own target -- FAIL, not a green-tolerated SKIP (which would silently
+# drop the entire UAF coverage).  (L172's first-grow-refused stays a genuine
+# geometry/resource SKIP.)
 [ "$writes_done" -gt 0 ] || \
-	llbitmap_skip "no concurrent write completed -- race never exercised"
+	llbitmap_fail "no concurrent write completed after $grew grows -- write-vs-resize race never exercised (writers never landed a write)"
 
 echo "  applied $grew grow steps under $WRITERS concurrent writers ($writes_done writes landed)"
 

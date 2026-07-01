@@ -53,14 +53,17 @@
 #   FAIL  a double-free / invalid-free / KASAN / slab-corruption splat appeared
 #         (the bug is present).
 #   SKIP  fault injection or a memory debugger is unavailable, an injector
-#         knob did not take, no create attempt could be issued, or the
-#         injector never fired (a clean run without injections proves
-#         nothing and must not be reported as PASS).
+#         knob could not be configured, or no create attempt could be issued
+#         -- a genuinely absent/unfit environment (checked before the run).
+#   FAIL  the injector is present and every knob read back OK, yet it never
+#         fired across all creates -- present-but-not-engaged is a broken
+#         harness, not an absent environment, and must be loud (a clean run
+#         without injections proves nothing and must never read as PASS).
 #
 # NOTE: this is a probabilistic reproducer (standard for slab fault injection).
 #   Injector engagement is enforced, not assumed: every knob write is read
 #   back, and the run must log at least one "FAULT_INJECTION: forcing a
-#   failure." line (verbose=1) or the verdict is SKIP.  The iteration count
+#   failure." line (verbose=1) or the verdict is FAIL.  The iteration count
 #   and probability are tunables (LLBITMAP_FI_ITERS, LLBITMAP_FI_PROB).
 #   A FAIL is always conclusive: the bug is present.
 
@@ -233,10 +236,15 @@ restore_fi
 
 # Prove the injector actually engaged: count the (rate-limited)
 # "FAULT_INJECTION: forcing a failure." lines logged since our dmesg clear.
-# Zero injections means zero coverage -- SKIP, never PASS.
+# The injector is present and every knob was read back OK (fi_set), so zero
+# injections after N creates is a broken harness (mis-scoped cache filter,
+# task-filter not applied, too few iters) -- NOT an absent environment.  That is
+# FAIL, never SKIP: a green-tolerated skip here is exactly how coverage silently
+# evaporates.  (Injector *absent* stays a SKIP, at the failslab-unavailable gate
+# above.)
 injected=$(sudo dmesg 2>/dev/null | grep -c 'FAULT_INJECTION: forcing a failure')
-[ "$injected" -gt 0 ] || llbitmap_skip \
-	"fault injector never fired across $attempts creates (0 FAULT_INJECTION log lines) -- nothing tested"
+[ "$injected" -gt 0 ] || llbitmap_fail \
+	"fault injector never fired across $attempts creates (0 FAULT_INJECTION log lines) -- injector present but did not engage; harness cannot exercise the double-free path"
 
 echo "  completed $attempts create attempts, $injected logged injections, no splat"
 llbitmap_pass "no double-free/corruption across $attempts creates with $injected fault injections"
