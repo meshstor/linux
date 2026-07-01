@@ -15,6 +15,13 @@ MD_TEST_LOOPS=()
 MD_TEST_FILES=()
 MD_TEST_MD_DEV=""
 
+# Side-file registry.  md_make_loop is called via command substitution
+# (loop0="$(md_make_loop 64)"), which runs it in a subshell, so the
+# MD_TEST_LOOPS/FILES appends below are LOST in the parent and md_cleanup would
+# detach/unlink nothing -- leaking a loop + backing file per call.  A file
+# append survives the subshell; record loop+image here and replay it in cleanup.
+MD_TEST_REGISTRY="$(mktemp "${MD_TMPDIR:-${TMPDIR:-/var/tmp}}/md-registry.XXXXXX" 2>/dev/null || echo /dev/null)"
+
 # Subsystem selector. "ms" -> _ms modules; "md" -> in-tree md.
 MD_SUBSYS="${MD_SUBSYS:-ms}"
 case "$MD_SUBSYS" in
@@ -117,6 +124,9 @@ md_make_loop() {
 	loop="$(losetup -f --show "$tmp")"
 	MD_TEST_LOOPS+=("$loop")
 	MD_TEST_FILES+=("$tmp")
+	# Survives command substitution (the array appends above do not); md_cleanup
+	# replays this to tear down loops/files created as loop0="$(md_make_loop)".
+	echo "$loop $tmp" >> "${MD_TEST_REGISTRY:-/dev/null}"
 	echo "$loop"
 }
 
@@ -133,8 +143,18 @@ md_cleanup() {
 		md_mdadm --stop "$MD_TEST_MD_DEV" >/dev/null 2>&1
 	fi
 	udevadm settle >/dev/null 2>&1
+	# Replay the side-file registry: recover loops/backing files created in
+	# command-substitution subshells (loop0="$(md_make_loop)"), where the
+	# in-function array appends were lost.  Without this they leak every run.
+	local _rl _rf
+	if [ -n "${MD_TEST_REGISTRY:-}" ] && [ -r "$MD_TEST_REGISTRY" ]; then
+		while read -r _rl _rf; do
+			[ -n "$_rl" ] && MD_TEST_LOOPS+=("$_rl")
+			[ -n "$_rf" ] && MD_TEST_FILES+=("$_rf")
+		done < "$MD_TEST_REGISTRY"
+	fi
 	local loop tries still
-	for loop in "${MD_TEST_LOOPS[@]}"; do
+	for loop in "${MD_TEST_LOOPS[@]:-}"; do
 		losetup -d "$loop" >/dev/null 2>&1
 	done
 	for tries in $(seq 1 50); do
@@ -149,9 +169,10 @@ md_cleanup() {
 		sleep 0.1
 	done
 	local f
-	for f in "${MD_TEST_FILES[@]}"; do
+	for f in "${MD_TEST_FILES[@]:-}"; do
 		rm -f "$f"
 	done
+	rm -f "${MD_TEST_REGISTRY:-}" 2>/dev/null
 	set -e
 }
 
