@@ -120,8 +120,7 @@ for _ in $(seq 50); do grep -q '\[U_\]\|\[_U\]' /proc/msstat && { ok=1; break; }
 
 # Leg contents: M1 (read RAW, bypassing flakey) must still hold A -- the
 # divergence-write data (PAT_C) never reached it although md reported success.
-OFF1=$(gds_data_offset_sectors "$M1")
-cmp -n $((8*1024*1024)) --ignore-initial=0:$((OFF1 * 512)) "$PAT_A" "$M1" \
+gds_cmp_legs "$PAT_A" $((8*1024*1024)) "$M1" \
 	|| { echo "FAIL: leg1 does not hold pattern A -- rig assumption broken" >&2; exit 1; }
 
 gds_verdict p6 divergence PASS "injected=$INJECTED rc=0 msstat=[UU] leg1=stale(A)"
