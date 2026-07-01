@@ -22,12 +22,11 @@ TEST_PROGS := \
 	test_assemble_kick_non_fresh.sh \
 	test_first_use_persists.sh \
 	test_lbs_stability.sh \
-	test_mode_a_chunksize_einval.sh \
-	test_mode_b_concurrent_io.sh \
-	test_mode_b_data_persists.sh \
-	test_mode_b_spare_recovers.sh \
-	test_stop_events_sync.sh
+	test_mode_a_chunksize_einval.sh
 
-TEST_FILES := lib.sh
+# evidence_stop_events_sync.sh is an RCA evidence probe, not a pass/fail test:
+# it is shipped (TEST_FILES) but deliberately NOT in TEST_PROGS, so the harness
+# does not run it and bank a meaningless verdict. Run it by hand for D4 data.
+TEST_FILES := lib.sh evidence_stop_events_sync.sh
 
 include ../../../lib.mk

@@ -9,10 +9,13 @@
 # then read the events counter on both members. Output is a JSON
 # summary suitable for piping to jq or inspecting by hand.
 #
-# This is an evidence probe, not a pass/fail regression test, so it exits SKIP
-# (4) -- it asserts no code-path correctness and must not bank an unconditional
-# PASS in the selftest harness. The caller decides whether the deltas support
-# shipping D4 (legacy_async_del_gendisk default flip) from the JSON summary.
+# This is an evidence probe, NOT a pass/fail regression test: it measures and
+# emits JSON, it asserts no code-path correctness. It is deliberately named
+# evidence_*.sh (not test_*.sh) and kept out of TEST_PROGS so the selftest
+# harness does not run it and bank a meaningless verdict; run it by hand when
+# gathering D4 evidence. Exit code is always 0 (a probe). The caller decides
+# whether the deltas support shipping D4 (legacy_async_del_gendisk default flip)
+# from the JSON summary.
 #
 # Decision rule (consumed by the cover letter for D4):
 #   D4 is justified iff max(delta_N) == 0 AND max(delta_Y) >= 2
@@ -136,12 +139,8 @@ printf '  "N": { "delta_max": %d, "delta_mean": "%.2f" }\n' \
 	"${MAX[N]}" "$(awk "BEGIN{print ${SUM[N]}/$TRIALS}")"
 printf '}\n'
 
-# This is an evidence probe, not a pass/fail regression test: it measures
-# events-counter divergence and emits the JSON above for the D4 decision. It
-# asserts no code-path correctness, so it must NOT bank an unconditional PASS
-# (exit 0) -- in a selftest harness exit 0 == PASS, which would stay green even
-# if every trial produced garbage (a false PASS). Report SKIP so the harness
-# records "informational, nothing asserted." The D4 decision rule
+# Always exit 0; this is a probe, and it is excluded from the pass/fail suite
+# by its evidence_*.sh name (see the header). The D4 decision rule
 # (max(delta_N)==0 AND max(delta_Y)>=2 over >=20 trials) is evaluated by the
-# consumer of the JSON, not here.
-llbitmap_skip "evidence probe only (no regression assertion); D4 decision rule is evaluated by the JSON consumer -- see summary above"
+# consumer of the JSON above, not here.
+exit 0
