@@ -18,6 +18,7 @@
 # which case the rejection comes from level_store() failing to resolve the
 # personality rather than from the takeover handler; either way the
 # observable invariant -- the array stays raid1 -- holds.
+
 . "$(dirname "$0")/lib.sh"
 md_require_root
 md_require_tools
@@ -34,6 +35,7 @@ md_wait_sync "$MD_TEST_MD_DEV"
 
 sysfs="$(md_sysfs_path "$MD_TEST_MD_DEV")"
 
+tested=0
 for target in raid0 raid6; do
 	if echo "$target" > "$sysfs/level" 2>/dev/null; then
 		md_fail "takeover unexpectedly accepted raid1 -> $target"
@@ -42,6 +44,9 @@ for target in raid0 raid6; do
 	level="$(md_sysfs_read "$sysfs/level")"
 	[ "$level" = "raid1" ] \
 		|| md_fail "level mutated after rejected -> $target attempt (got: $level)"
+	tested=$(( tested + 1 ))
 done
 
-md_pass "raid1 takeover to raid0/raid6 rejected; array stays raid1"
+[ "$tested" -gt 0 ] || md_skip "neither raid0 nor raid6 personality is registered -- the raid1->raidX takeover-refusal guard is not present in this build (expected under MD_SUBSYS=ms; run under MD_SUBSYS=md to exercise it)"
+
+md_pass "raid1 takeover to registered raid0/raid6 target(s) rejected by the takeover guard; array stays raid1 ($tested target(s) exercised)"
