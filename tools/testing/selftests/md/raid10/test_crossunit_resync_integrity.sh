@@ -68,6 +68,9 @@ SYSFS="$(_raid10_sysfs "$MD")"
 
 REPAIR_PID=""
 FIO_RC_FILE="$(mktemp /tmp/raid10-xu-fio.XXXXXX)"
+# Engagement ledger: repair_loop appends a line each time it observes the array
+# actually in a sync state, so the verdict can prove the race was exercised.
+REPAIR_ENGAGED="$(mktemp /tmp/raid10-xu-engaged.XXXXXX)"
 
 xu_cleanup() {
 	set +e
@@ -76,7 +79,7 @@ xu_cleanup() {
 	if [ -b "/dev/${MD}" ]; then
 		timeout 20 sh -c "echo idle > '$SYSFS/sync_action'" 2>/dev/null
 	fi
-	rm -f "$FIO_RC_FILE"
+	rm -f "$FIO_RC_FILE" "$REPAIR_ENGAGED"
 	# Safety net in case an older fio ignores --verify_state_save=0 and
 	# drops <host>-<job>-N-verify.state files in the cwd.
 	rm -f ./*-verify.state "$HERE"/*-verify.state 2>/dev/null
@@ -118,11 +121,14 @@ if [ "$ARRAY_MB" -lt 128 ]; then
 fi
 
 # Lay down a verifiable pattern across the whole device through md, so both
-# mirrors hold identical, crc-known data before the contended phase.
+# mirrors hold identical, crc-known data before the contended phase.  The size
+# was already validated (>=128 MB above), so a seed-write failure here is the
+# harness failing to establish its own baseline -- FAIL, not a green-tolerated
+# SKIP (which would drop the entire verify with no signal).
 fio --name=seed --filename="$DEV" --rw=write --bs=1M --direct=1 \
 	--size="${ARRAY_MB}M" --verify=crc32c --do_verify=0 \
 	--verify_state_save=0 --output=/dev/null >/dev/null 2>&1 \
-	|| raid10_skip "seed write failed (device too small or fio unhappy)"
+	|| raid10_fail "seed write failed -- cannot establish the crc-known baseline the verify depends on"
 
 # Re-trigger 'repair' continuously so a sync window is almost always active
 # while fio writes.  repair (not check) issues sync *writes*, the dangerous
@@ -130,6 +136,12 @@ fio --name=seed --filename="$DEV" --rw=write --bs=1M --direct=1 \
 repair_loop() {
 	while :; do
 		echo repair > "$SYSFS/sync_action" 2>/dev/null || true
+		# Record that repair actually entered a sync state, so the verdict can
+		# prove the cross-unit race was exercised (a repair that never runs
+		# makes the verify trivially clean).
+		case "$(cat "$SYSFS/sync_action" 2>/dev/null || echo idle)" in
+			check|repair|resync|recover) echo 1 >> "$REPAIR_ENGAGED" ;;
+		esac
 		# Let it run a bit; it returns to idle quickly on tmpfs.
 		sleep 2
 	done
@@ -137,6 +149,13 @@ repair_loop() {
 raid10_set_sync_speed "$MD" "$SYNC_KBPS"
 repair_loop &
 REPAIR_PID=$!
+
+# Prove the repair stressor engages before the verified-write window opens: a
+# run where repair never runs is an ordinary clean fio verify that PASSes
+# without ever exercising the cross-unit race.
+sleep 1
+raid10_assert_syncing "$MD" "at the start of the cross-unit repair window" \
+	|| raid10_fail "repair did not engage at window start -- cross-unit race not exercised"
 
 echo "array=$DEV ${ARRAY_MB}MB layout=$LAYOUT repair-loop pid=$REPAIR_PID window=${XU_SECS}s"
 
@@ -176,6 +195,12 @@ if [ "$rc" -ne 0 ]; then
 	# unrelated I/O errors; surface the distinction.
 	raid10_fail "fio exited $rc during repair -- verify mismatch (cross-unit corruption) or I/O error; rerun with --output to inspect"
 fi
+
+# The repair stressor must have been observed active during the window;
+# otherwise "no corruption" proves nothing -- the race requires a concurrent
+# repair to exist, so a clean verify with no repair is a no-op, not a PASS.
+engaged=$(wc -l < "$REPAIR_ENGAGED" 2>/dev/null || echo 0)
+[ "${engaged:-0}" -gt 0 ] || raid10_fail "repair never observed active during the ${XU_SECS}s window -- cross-unit race not exercised (a clean verify here is a no-op)"
 
 # Final consistency: stop repair, run one clean check, confirm no mismatch
 # count and no degradation.

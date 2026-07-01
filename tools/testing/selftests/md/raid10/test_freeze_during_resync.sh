@@ -114,8 +114,20 @@ DMESG_PRE=$(dmesg 2>/dev/null | wc -l || echo 0)
 
 start_check
 sleep 1
+# Prove a sync is actually in flight before we start freezing: freeze_array's
+# drain path (the target) is only exercised when there are in-flight sync
+# r10bios.  If the throttled check never engaged, freezing a quiescent array
+# drains trivially and "survived N toggles" would PASS without testing anything.
+raid10_assert_syncing "$MD" "before the first freeze toggle" \
+	|| raid10_fail "throttled check never engaged -- freeze_array vs active-sync not exercised"
 
+froze_with_sync=0
 for t in $(seq 1 "$TOGGLES"); do
+	# Count toggles where a sync was genuinely in flight at freeze time, so
+	# the verdict can prove freeze_array actually had sync r10bios to drain.
+	case "$(cat "$SYSFS/sync_action" 2>/dev/null || echo idle)" in
+		check|repair|resync|recover) froze_with_sync=$((froze_with_sync + 1)) ;;
+	esac
 	# Freeze: abort the sync and quiesce.  This is the call that must
 	# drain nr_sync_pending without hanging.
 	if ! timeout "$TOGGLE_TIMEOUT" "$MDADM" --readonly "$DEV" >/dev/null 2>&1; then
@@ -161,4 +173,8 @@ if [ "$DEGRADED" != "0" ]; then
 	raid10_fail "array degraded ($DEGRADED) after freeze/resync toggling"
 fi
 
-raid10_pass "survived $TOGGLES quiesce(freeze_array) vs active-sync toggles with no hang, splat, or degradation"
+# At least one freeze must have drained an in-flight sync; otherwise every
+# toggle froze a quiescent array and the target drain path was never exercised.
+[ "$froze_with_sync" -gt 0 ] || raid10_fail "no freeze toggle occurred while a sync was in flight -- freeze_array-vs-active-sync never exercised (a no-op run cannot PASS)"
+
+raid10_pass "survived $TOGGLES quiesce(freeze_array) vs active-sync toggles ($froze_with_sync with a sync in flight) with no hang, splat, or degradation"
