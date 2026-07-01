@@ -57,13 +57,17 @@
 # Verdict:
 #   PASS  the fixed kernel refused: "failed to RUN_ARRAY ...: I/O error" OR
 #         dmesg "failed to persist initial bitmap" OR (array did not start AND
-#         FIRST_USE still set on both members) -- with injection proven active.
+#         FIRST_USE still set on both members AND the assemble actually reached
+#         RUN_ARRAY -- i.e. was NOT merely "busy - skipping") -- with injection
+#         proven active.
 #   FAIL  the array started despite a failing data-page write (the swallowed-
-#         error bug), OR the harness could not exercise the fault after setup
-#         (the injection did not engage, or an injection-active run reached no
-#         clear verdict).  A regression guard that cannot run its target must be
-#         loud, not silently skipped -- a silent skip is how the original false
-#         PASS hid.
+#         error bug), OR the harness could not exercise the fault after setup:
+#         the injection did not engage; OR device theft won -- every assemble
+#         was "busy - skipping" so RUN_ARRAY never ran and FIRST_USE is
+#         "preserved" only because init never ran (that branch would false-PASS
+#         on a buggy kernel too, so it must FAIL); OR an injection-active run
+#         reached no clear verdict.  A regression guard that cannot run its
+#         target must be loud, not silently skipped or vacuously passed.
 #   SKIP  an environmental precondition is missing (not root, no dmsetup, no
 #         dm-flakey target, mdadm create failed, not an llbitmap array) -- the
 #         test could not even be set up.
@@ -336,8 +340,23 @@ fi
 if dmesg | tail -80 | grep -q 'failed to persist initial bitmap'; then
 	llbitmap_pass "fixed kernel logged 'failed to persist initial bitmap' and refused"
 fi
+
+# Device-theft guard, BEFORE the FIRST_USE-preserved pass.  The two PASSes above
+# already matched if the fault path actually ran (a real -EIO refusal / persist
+# log).  If we are still here with the final assemble reading "busy - skipping",
+# the in-tree md re-grabbed the bit-identical members before mdadm could open
+# them, RUN_ARRAY never ran, and the injected data-page fault was NEVER
+# exercised.  FIRST_USE is then "preserved" only because llbitmap_init never ran
+# -- indistinguishable from a real refusal, and it would go green on a BUGGY
+# kernel too (the swallowed-error bug never gets the chance to start the array).
+# That is the harness losing the device-theft race across all attempts, not a
+# pass: FAIL loudly rather than bank a meaningless green.
+if [ "$ARRAY_STARTED" -eq 0 ] && echo "$out" | grep -qi 'busy - skipping'; then
+	llbitmap_fail "device theft won: every assemble attempt was 'busy - skipping', the array never reached RUN_ARRAY and the data-page fault was never exercised -- FIRST_USE 'preserved' only because init never ran (this would false-PASS on a buggy kernel too)"
+fi
+
 if [ "$A_STILL" -ne 0 ] && [ "$B_STILL" -ne 0 ]; then
-	llbitmap_pass "array did not start and FIRST_USE preserved on both members"
+	llbitmap_pass "array did not start and FIRST_USE preserved on both members (assemble reached RUN_ARRAY; not a device-theft busy-skip)"
 fi
 
 llbitmap_fail "ambiguous outcome with injection active (started=$ARRAY_STARTED A_STILL=$A_STILL B_STILL=$B_STILL) -- neither a clean -EIO refusal nor a clean start; the test could not reach a verdict"
