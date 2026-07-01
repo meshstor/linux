@@ -220,6 +220,21 @@ fi
 
 inject_on
 
+# Prove the read-error injection actually engaged BEFORE the watch: on an
+# errored member, a direct read of a HEALTHY sector must succeed (rules out an
+# EBUSY/open failure masquerading as "active") while a read of the injected bad
+# segment must return EIO.  Without this a misconfigured dm-flakey (wrong
+# offset, table not resumed) would produce zero parking reads, the freeze side
+# would never be approached, and "survived the storm => PASS" would falsely
+# certify a run that exercised nothing.
+_probe="/dev/mapper/${DM_NAMES[0]}"
+dd if="$_probe" of=/dev/null bs=512 count=1 iflag=direct status=none 2>/dev/null \
+	|| raid10_fail "injection control probe cannot read $_probe (open/EBUSY) -- harness broken, cannot confirm injection"
+if dd if="$_probe" of=/dev/null bs=512 skip="$BAD_DEV_START_SECT" count=1 \
+	iflag=direct status=none 2>/dev/null; then
+	raid10_fail "read-error injection did not engage (direct read of the bad segment on $_probe succeeded) -- force-raise vs freeze storm not exercised"
+fi
+
 # Hammer the bad megabyte with mixed direct I/O.  Each failing read
 # parks in the forced raise's bucket and feeds raid10d a freeze_array()
 # call; md then records a badblock for the failed sectors, which would

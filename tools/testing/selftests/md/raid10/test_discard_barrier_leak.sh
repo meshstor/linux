@@ -139,7 +139,12 @@ for it in $(seq 1 "$ITERS"); do
 		len=$(( (ARRAY_BYTES - off) & ~((1 << 20) - 1) ))
 	fi
 	if ! blkdiscard --offset "$off" --length "$len" "$DEV" 2>/dev/null; then
-		raid10_skip "blkdiscard failed (offset=$off len=$len) -- discard unsupported on this stack"
+		# The array advertised discard (discard_max_bytes != 0, checked
+		# above), so a failing blkdiscard here is the advertised discard not
+		# working -- the harness cannot exercise the per-unit split path.
+		# FAIL, not a green-tolerated SKIP.  (The "advertises no discard"
+		# case is the legitimate SKIP, at the discard_max_bytes gate above.)
+		raid10_fail "blkdiscard failed (offset=$off len=$len) despite discard_max_bytes=$DMAX -- advertised discard did not work; cannot exercise the barrier-unit split"
 	fi
 	if ! wait_clean; then
 		state=$(cat "$SYSFS/array_state" 2>/dev/null || echo gone)
