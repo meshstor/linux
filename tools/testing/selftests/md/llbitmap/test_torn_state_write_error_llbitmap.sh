@@ -103,6 +103,14 @@ sync
 sudo "$MDADM" --stop "$MS_DEV" >/dev/null 2>&1
 udevadm settle 2>/dev/null
 
+# The bit-identical superblock makes the in-tree md_mod auto-assemble LA/LB the
+# moment they reappear after --stop; that array holds the members and its page
+# cache shadows a direct read of the loops.  Stop it and drop caches so the
+# bit-2 plant lands on the real on-disk bitmap super.
+llbitmap_stop_inkernel_md "$LA" "$LB"
+blockdev --flushbufs "$LA" 2>/dev/null || true
+blockdev --flushbufs "$LB" 2>/dev/null || true
+
 STATE_A=$(read_state_byte0 "$LA")
 STATE_B=$(read_state_byte0 "$LB")
 echo "  state byte0 before plant: A=$STATE_A B=$STATE_B"
@@ -121,10 +129,26 @@ STATE_A_PLANTED=$(read_state_byte0 "$LA")
 STATE_B_PLANTED=$(read_state_byte0 "$LB")
 echo "  state byte0 after plant: A=$STATE_A_PLANTED B=$STATE_B_PLANTED (expect bit 0x04 set, 0x08 clear)"
 
+# Prove the injection actually landed BEFORE any verdict.  The whole test turns
+# on BITMAP_WRITE_ERROR (bit 2) being present on disk at assemble; if the forge
+# was a no-op (wrong sb offset from a stale loop cache, dd failure, in-tree md
+# rewriting the super), the bitmap-alive + events-advanced PASS below is
+# satisfied trivially without ever exercising the load-side mask -- a false PASS.
+# dm/dd are already confirmed working, so a missing bit is a broken harness: FAIL
+# loudly rather than skip, so the guard cannot silently stop covering the bug.
+if [ $(( STATE_A_PLANTED & 4 )) -eq 0 ] || [ $(( STATE_B_PLANTED & 4 )) -eq 0 ]; then
+	llbitmap_fail "bit-2 (WRITE_ERROR) forge did not land on disk (A=$STATE_A_PLANTED B=$STATE_B_PLANTED) -- cannot exercise the load-side mask"
+fi
+
 EVENTS_BEFORE=$(read_events "$LA")
 echo "  sb->events before assemble: $EVENTS_BEFORE"
 
 sudo dmesg --clear 2>/dev/null || true
+# Releasing the members re-triggered udev auto-assembly into the in-tree md;
+# stop it so our explicit assemble opens the members instead of failing with
+# "is busy - skipping" (which would drop the array and misread as a disabled
+# bitmap).
+llbitmap_stop_inkernel_md "$LA" "$LB"
 out=$(sudo "$MDADM" --assemble "$MS_DEV" "$LA" "$LB" --run 2>&1 || true)
 echo "  assemble output: $out"
 udevadm settle 2>/dev/null

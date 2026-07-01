@@ -95,6 +95,13 @@ sync
 sudo "$MDADM" --stop "$MS_DEV" >/dev/null 2>&1
 udevadm settle 2>/dev/null
 
+# Bit-identical superblocks let the in-tree md_mod re-grab LA/LB after --stop and
+# shadow direct reads of the loops; stop it and drop caches so the plant lands on
+# the real on-disk bitmap super.
+llbitmap_stop_inkernel_md "$LA" "$LB"
+blockdev --flushbufs "$LA" 2>/dev/null || true
+blockdev --flushbufs "$LB" 2>/dev/null || true
+
 STATE_A=$(read_state_byte0 "$LA")
 STATE_B=$(read_state_byte0 "$LB")
 echo "  state byte0 before plant: A=$STATE_A B=$STATE_B"
@@ -112,10 +119,21 @@ STATE_A_PLANTED=$(read_state_byte0 "$LA")
 STATE_B_PLANTED=$(read_state_byte0 "$LB")
 echo "  state byte0 after plant: A=$STATE_A_PLANTED B=$STATE_B_PLANTED (expect bit 0x04 set)"
 
+# Prove the injection landed BEFORE any verdict.  BIT2_PERSISTS below is
+# (STATE_A_FINAL & 4); if the forge was a no-op it is trivially 0 and the PASS
+# gate is met without ever exercising the load-side mask -- a false PASS.  dd is
+# confirmed working, so a missing bit is a broken harness: FAIL, don't skip.
+if [ $(( STATE_A_PLANTED & 4 )) -eq 0 ] || [ $(( STATE_B_PLANTED & 4 )) -eq 0 ]; then
+	llbitmap_fail "bit-2 (WRITE_ERROR) forge did not land on disk (A=$STATE_A_PLANTED B=$STATE_B_PLANTED) -- cannot exercise the load-side mask"
+fi
+
 EVENTS_BEFORE=$(read_events "$LA")
 echo "  sb->events before assemble: $EVENTS_BEFORE"
 
 sudo dmesg --clear 2>/dev/null || true
+# Stop any in-tree md that re-grabbed the members so our explicit assemble opens
+# them instead of failing with "is busy - skipping".
+llbitmap_stop_inkernel_md "$LA" "$LB"
 out=$(sudo "$MDADM" --assemble "$MS_DEV" "$LA" "$LB" --run 2>&1 || true)
 echo "  assemble output: $out"
 udevadm settle 2>/dev/null

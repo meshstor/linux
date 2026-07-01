@@ -15,6 +15,14 @@
 # sync I/O regardless of what the bitmap says — bookkeeping completes
 # even if the bitmap state machine declines to transition. This test
 # verifies the I/O actually copied real data.
+#
+# CAVEAT -- this too passes on BOTH the fixed and unfixed kernel, so it is a
+# smoke/liveness check, NOT a regression guard.  The marker is written while
+# the array is CLEAN (before degrading), so fullsync copies it to the spare on
+# either kernel; the bug only corrupts data written DURING the degraded window.
+# The discriminating guards (write-while-degraded + data oracle, which FAIL on
+# the unfixed kernel) are test_recovery_degraded_writes.sh and
+# test_classic_bitmap_double_degraded_re_add.sh.
 
 set -eu
 

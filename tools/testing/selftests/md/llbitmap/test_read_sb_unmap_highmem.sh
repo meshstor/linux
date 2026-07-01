@@ -35,8 +35,11 @@
 #   PASS  read_sb error path reached AND no llbitmap_read_sb WARN/splat.
 #   FAIL  a WARN/backtrace names llbitmap_read_sb (or a highmem/kmap
 #         debug splat fired) -- the free-before-unmap order regressed.
-#   SKIP  not a DEBUG_HIGHMEM kernel, config undeterminable, or the
-#         read_sb error path could not be engaged.
+#   SKIP  not a DEBUG_HIGHMEM kernel, or the config is undeterminable (a
+#         genuinely absent/unfit environment, checked before the run).
+#   FAIL  on a DEBUG_HIGHMEM kernel, the read_sb error path could not be
+#         engaged (forge/assemble exercised nothing) -- a broken harness that
+#         must be loud, never a silent skip that hides lost coverage.
 
 set -u
 
@@ -174,7 +177,12 @@ echo "  read_sb error path engaged: $ENGAGED"
 echo "  llbitmap_read_sb WARN/splat: $WARN_FIRED"
 
 if [ "$ENGAGED" -eq 0 ]; then
-	llbitmap_skip "could not engage llbitmap_read_sb error path (no chunksize pr_err); nothing tested"
+	# We are on a DEBUG_HIGHMEM kernel (gated at the top); the forged bad
+	# chunksize should have driven read_sb down its out_put_page error path.
+	# No "chunksize not a power of 2" pr_err means the forge/assemble never
+	# exercised the reordered unmap/free -- a broken harness, not an absent
+	# environment: FAIL loudly, never a green-tolerated skip.
+	llbitmap_fail "could not engage llbitmap_read_sb error path (no 'chunksize not a power of 2' pr_err) on a DEBUG_HIGHMEM kernel -- the unmap-order path was never exercised"
 fi
 if [ "$WARN_FIRED" -ne 0 ]; then
 	echo "FAIL: WARN/backtrace through llbitmap_read_sb -- free-before-unmap order regressed"
