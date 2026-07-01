@@ -78,7 +78,7 @@ echo "  boundary chunk: $BOUNDARY_CHUNK  shrink->${C1_CHUNKS}ch  regrow->${C2_CH
 # Sum of all per-state counts == llbitmap->chunks (bits walks [0, chunks)).
 bits_total() {
 	awk '{s += $NF} END {print s + 0}' \
-		"/sys/block/${MS_NAME}/ms/llbitmap/bits" 2>/dev/null || echo 0
+		"/sys/block/${MS_NAME}/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>/dev/null || echo 0
 }
 
 # Create at the larger size so nr_pages == 2 from the start; the high-water
@@ -90,13 +90,13 @@ bits_total() {
 	--assume-clean "$LA" "$LB" --run --force >/dev/null 2>&1 \
 	|| llbitmap_skip "mdadm create failed (size ${C2_KIB}K may exceed reserved bitmap space)"
 
-bt=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bt=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bt" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "expected llbitmap, got '$bt'" ;;
 esac
 
-CS_FILE="/sys/block/$MS_NAME/ms/component_size"
+CS_FILE="/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/component_size"
 [ -w "$CS_FILE" ] || llbitmap_skip "component_size not writable: $CS_FILE"
 
 "$MDADM" --wait "$MS_DEV" >/dev/null 2>&1 || true
@@ -154,7 +154,7 @@ BUGGY_SPAN=$(( BOUNDARY_CHUNK - CH1 ))		# what the one-page clamp clears
 TOL=16
 
 echo "  bits after regrow:"
-sed 's/^/    /' "/sys/block/${MS_NAME}/ms/llbitmap/bits" 2>/dev/null || true
+sed 's/^/    /' "/sys/block/${MS_NAME}/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>/dev/null || true
 echo "  unwritten=$UNWRITTEN  expected grown span=$EXPECT_SPAN  (buggy~=$BUGGY_SPAN)"
 
 # Guard the discriminator: the span above the boundary must be non-trivial,

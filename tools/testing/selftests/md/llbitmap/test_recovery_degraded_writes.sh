@@ -65,8 +65,8 @@ llbitmap_require_root
 llbitmap_require_modules
 llbitmap_require_tools
 
-if ! head -1 /proc/msstat 2>/dev/null | grep -qw raid10; then
-	llbitmap_skip "raid10 personality not registered in /proc/msstat"
+if ! head -1 ${LLBITMAP_PROC_STAT} 2>/dev/null | grep -qw raid10; then
+	llbitmap_skip "raid10 personality not registered in ${LLBITMAP_PROC_STAT}"
 fi
 
 HEAL_MODE="${LLBITMAP_HEAL:-both}"
@@ -99,7 +99,7 @@ make_loop_reg() {
 llbitmap_alloc_ms_dev >/dev/null
 MS_DEV="$LLBITMAP_TEST_MS_DEV"
 MS_NAME="$LLBITMAP_TEST_MS_NAME"
-SYS="/sys/block/$MS_NAME/ms"
+SYS="/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}"
 
 MEMBERS=()
 for i in 0 1 2 3; do

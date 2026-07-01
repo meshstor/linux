@@ -93,7 +93,7 @@ echo "  members: $LA $LB  md: $MS_DEV"
 	--bitmap=auto --assume-clean "$LA" "$LB" --run --force \
 	>/dev/null 2>&1 || llbitmap_skip "mdadm create failed"
 
-bt=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bt=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bt" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "not llbitmap ($bt)" ;;
@@ -131,7 +131,7 @@ udevadm settle 2>/dev/null
 
 # The array assembles either way (a disabled bitmap does not block the
 # run); read the bitmap liveness directly from sysfs while it is up.
-BITS_RAW="$(cat "/sys/block/$MS_NAME/ms/llbitmap/bits" 2>&1 || echo "READ_FAILED")"
+BITS_RAW="$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>&1 || echo "READ_FAILED")"
 echo "  --- llbitmap/bits ---"
 echo "$BITS_RAW" | head -8
 
@@ -140,7 +140,7 @@ for i in $(seq 1 4); do
 	"$DD" if=/dev/urandom of="$MS_DEV" bs=1M count=1 seek=$((i*5)) \
 		oflag=direct status=none 2>/dev/null || true
 	sync
-	echo idle | sudo tee "/sys/block/$MS_NAME/ms/sync_action" >/dev/null 2>&1 || true
+	echo idle | sudo tee "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/sync_action" >/dev/null 2>&1 || true
 	sleep 0.3
 done
 sync

@@ -42,7 +42,7 @@ echo "INFO: ms_dev=$MS_DEV members=$LA,$LB spare=$LC"
 	--assume-clean "$LA" "$LB" --run --force >/dev/null 2>&1
 
 # Verify llbitmap is the active bitmap.
-bt=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bt=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bt" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "expected llbitmap, got '$bt'" ;;
@@ -76,7 +76,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 state=$(llbitmap_member_state "$MS_NAME" "$LC_BASE")
 if ! printf '%s' "$state" | grep -qw "in_sync"; then
-	cat "/sys/block/$MS_NAME/ms/llbitmap/bits" 2>&1 | sed 's/^/  /'
+	cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>&1 | sed 's/^/  /'
 	llbitmap_fail "spare did not reach in_sync within 90s; state='$state'"
 fi
 echo "INFO: spare reached in_sync"

@@ -81,13 +81,13 @@ echo "  members: $LA $LB $LC  ms: $MS_DEV  chunk: $BITMAP_CHUNK"
 	--assume-clean "$LA" "$LB" "$LC" --run --force >/dev/null 2>&1 \
 	|| llbitmap_skip "mdadm create raid5 failed"
 
-bt=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bt=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bt" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "expected llbitmap, got '$bt'" ;;
 esac
 
-CS_FILE="/sys/block/$MS_NAME/ms/component_size"
+CS_FILE="/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/component_size"
 [ -w "$CS_FILE" ] || llbitmap_skip "component_size not writable: $CS_FILE"
 
 # Let the initial (assume-clean) state settle.

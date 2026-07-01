@@ -95,7 +95,7 @@ if llbitmap_member_present "$MS_NAME" "$LB_BASE"; then
 fi
 
 # Sanity: array is degraded (1 of 2).
-deg=$(cat "/sys/block/$MS_NAME/ms/degraded" 2>/dev/null || echo "?")
+deg=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/degraded" 2>/dev/null || echo "?")
 if [ "$deg" != "1" ]; then
 	llbitmap_fail "expected degraded=1 after kick, got '$deg'"
 fi

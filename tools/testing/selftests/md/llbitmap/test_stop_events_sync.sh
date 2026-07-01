@@ -40,7 +40,7 @@ if ! command -v fio >/dev/null 2>&1; then
 	exit 4
 fi
 
-PARAM=/sys/module/ms_mod/parameters/legacy_async_del_gendisk
+PARAM=/sys/module/${LLBITMAP_CORE_MOD}/parameters/legacy_async_del_gendisk
 if [ ! -w "$PARAM" ]; then
 	echo "SKIP: $PARAM not writable" >&2
 	exit 4
