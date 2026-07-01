@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# run-selftests — run the meshstor selftests exactly as bin/rebuild-meshstor-main's
+# TEST stage (4a + 4b) does, but WITHOUT rebuilding the tree or (re)loading any
+# modules.  Two suites, same as rebuild-meshstor-main:
+#
+#   dkms tooling (4a)  — tools/testing/selftests/dkms/run_all.sh with
+#                        KERNEL_TREE=<tree>.  Validates the packaging pipeline
+#                        (patch apply, rename, build-tarball, compile) against a
+#                        source tree; needs no root/modules; source-dependent
+#                        tests SKIP without a drivers/md tree.
+#   md runtime   (4b)  — every tools/testing/selftests/md/**/test_*.sh (minus
+#                        lib.sh helpers and evidence_*.sh probes) against the
+#                        CURRENTLY-LOADED driver; needs root + modules + a
+#                        patched mdadm (tests self-skip otherwise).
+#
+# Discovery, per-test environment, timeout handling and the pass/fail/skip tally
+# are copied from rebuild-meshstor-main so results are directly comparable; the
+# only added knob is --subsys, which selects ms (default) vs the in-tree md
+# driver for the md suite.
+#
+# Usage: bin/run-selftests [options] [FILTER ...]
+#
+#   FILTER   substring(s) matched against each md test's path relative to the md
+#            dir (e.g. "llbitmap", "torn_state", "raid10/test_discard").  Giving
+#            a filter implies --md-only (filters do not apply to the dkms suite).
+#            With no filter and no --*-only, BOTH suites run.
+#
+# Options:
+#   -s, --subsys ms|md   Subsystem for the md suite (default: ms).  Sets
+#                        MD_SUBSYS and the RAID10_ device/sysfs/stat knobs.  See
+#                        the WARNING below before using md.
+#       --md-only        Run only the md runtime suite (skip dkms tooling).
+#       --dkms-only      Run only the dkms tooling suite (skip md runtime).
+#   -d, --dir PATH       Tree root or md dir to run from.  Accepts either a
+#                        .../tools/testing/selftests/md directory or a tree/
+#                        worktree root that contains one; the tree root is also
+#                        used as KERNEL_TREE for the dkms suite.  Default:
+#                        auto-detect (composed worktree, then the in-repo tree).
+#   -m, --mdadm PATH     meshstor-patched mdadm (md suite).  Default: $MDADM,
+#                        else build/msadm, else ~/mdadm/mdadm.
+#   -t, --test-timeout N Per-md-test wall-clock limit in seconds (0 disables).
+#                        A test that exceeds it is killed (TERM, then KILL after
+#                        15s) and counted as a failure.  Default: 120.
+#   -l, --list           List the selected tests, then exit.
+#   -h, --help           Show this help.
+#
+# WARNING: --subsys md runs the md suite against the IN-TREE md driver.  A couple
+# of raid10 reproducers (notably raid10/test_recovery_freeze_deadlock.sh) target
+# a genuine upstream barrier deadlock and self-skip under md — but if a guard
+# ever regresses, md can wedge in-kernel kthreads (D state, reboot to clear).
+# The default --subsys ms is safe.
+set -euo pipefail
+
+PROG="$(basename "$0")"
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null)" \
+    || REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Defaults
+SUBSYS=ms
+TEST_TIMEOUT=120
+MD_DIR=
+MDADM_ARG=
+LIST_ONLY=
+RUN_DKMS=1
+RUN_MD=1
+SUITE_FORCED=          # set if the user passed --md-only/--dkms-only
+FILTERS=()
+
+log()  { printf '%s: %s\n' "$PROG" "$*"; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; }
+
+while (($#)); do
+    case "$1" in
+        -s|--subsys)       SUBSYS="${2:?--subsys needs ms|md}"; shift 2 ;;
+        --md-only)         RUN_DKMS=0; RUN_MD=1; SUITE_FORCED=1; shift ;;
+        --dkms-only)       RUN_MD=0; RUN_DKMS=1; SUITE_FORCED=1; shift ;;
+        -d|--dir)          MD_DIR="${2:?--dir needs a path}"; shift 2 ;;
+        -m|--mdadm)        MDADM_ARG="${2:?--mdadm needs a path}"; shift 2 ;;
+        -t|--test-timeout) TEST_TIMEOUT="${2:?--test-timeout needs a number}"; shift 2 ;;
+        -l|--list)         LIST_ONLY=1; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        --)                shift; while (($#)); do FILTERS+=("$1"); shift; done ;;
+        -*)                die "unknown option: $1 (see --help)" ;;
+        *)                 FILTERS+=("$1"); shift ;;
+    esac
+done
+
+case "$SUBSYS" in ms|md) : ;; *) die "invalid --subsys '$SUBSYS' (want 'ms' or 'md')" ;; esac
+
+# A filter targets md tests; unless a suite was explicitly forced, scope to md.
+if ((${#FILTERS[@]})) && [[ -z "$SUITE_FORCED" ]]; then
+    RUN_DKMS=0
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve the md selftest dir and the tree root (KERNEL_TREE for dkms)
+# ---------------------------------------------------------------------------
+resolve_md_dir() {
+    local cand="$1"
+    [[ -z "$cand" ]] && return 1
+    if [[ -d "$cand/tools/testing/selftests/md" ]]; then echo "$cand/tools/testing/selftests/md"; return 0; fi
+    if [[ -d "$cand" && "$cand" == */selftests/md ]]; then echo "$cand"; return 0; fi
+    return 1
+}
+
+if [[ -n "$MD_DIR" ]]; then
+    MD_DIR="$(resolve_md_dir "$MD_DIR")" || die "no tools/testing/selftests/md under: $MD_DIR"
+else
+    for c in \
+        "$REPO_ROOT/.worktrees/meshstor-main-rebuild" \
+        "$REPO_ROOT/build/linux-meshstor-rebuilt"; do
+        if MD_DIR="$(resolve_md_dir "$c" 2>/dev/null)"; then break; fi
+        MD_DIR=
+    done
+    [[ -z "$MD_DIR" && -d "$REPO_ROOT/tools/testing/selftests/md" ]] \
+        && MD_DIR="$REPO_ROOT/tools/testing/selftests/md"
+    [[ -n "$MD_DIR" ]] || die "could not auto-detect an md selftest dir; pass --dir <tree-or-md-dir>
+  (e.g. --dir .worktrees/meshstor-main-rebuild, or --dir .worktrees/llbitmap-fixes)"
+fi
+# Tree root = md dir with the standard suffix stripped; used as KERNEL_TREE.
+KERNEL_TREE="${MD_DIR%/tools/testing/selftests/md}"
+
+# ---------------------------------------------------------------------------
+# Elevation (only the md suite needs root; dkms tooling runs as the caller)
+# ---------------------------------------------------------------------------
+if [[ "$(id -u)" -eq 0 ]]; then
+    SUDO=()
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO=(sudo)
+else
+    SUDO=()
+    ((RUN_MD)) && warn "not root and no sudo — md runtime tests will SKIP"
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve the patched mdadm (md suite; same order as rebuild-meshstor-main)
+# ---------------------------------------------------------------------------
+MDADM="${MDADM_ARG:-${MDADM:-}}"
+if [[ -z "$MDADM" ]]; then
+    if   [[ -x "$REPO_ROOT/build/msadm" ]]; then MDADM="$REPO_ROOT/build/msadm"
+    elif [[ -x "$HOME/mdadm/mdadm"       ]]; then MDADM="$HOME/mdadm/mdadm"
+    fi
+fi
+((RUN_MD)) && [[ -z "$MDADM" ]] && warn "no patched mdadm found (pass --mdadm or set MDADM=…) — md tests will SKIP"
+
+if [[ "$SUBSYS" == md ]]; then
+    test_env=(MD_SUBSYS=md RAID10_DEV_PREFIX=md RAID10_SYSFS_SUBDIR=md RAID10_MDSTAT=/proc/mdstat)
+else
+    test_env=(MD_SUBSYS=ms RAID10_DEV_PREFIX=ms RAID10_SYSFS_SUBDIR=ms RAID10_MDSTAT=/proc/msstat)
+fi
+[[ -n "$MDADM" ]] && test_env+=(MDADM="$MDADM")
+
+DKMS_RUNNER="$REPO_ROOT/tools/testing/selftests/dkms/run_all.sh"
+
+# ---------------------------------------------------------------------------
+# Discover md tests (identical glob to rebuild-meshstor-main), apply filters
+# ---------------------------------------------------------------------------
+mapfile -t all_tests < <(find "$MD_DIR" -type f -name '*.sh' ! -name 'lib.sh' ! -name 'evidence_*' | sort)
+md_tests=()
+if ((${#FILTERS[@]})); then
+    for t in "${all_tests[@]}"; do
+        rel="${t#"$MD_DIR"/}"
+        for f in "${FILTERS[@]}"; do
+            [[ "$rel" == *"$f"* ]] && { md_tests+=("$t"); break; }
+        done
+    done
+    ((RUN_MD)) && ((${#md_tests[@]} == 0)) && die "no md tests match filter(s): ${FILTERS[*]}"
+else
+    md_tests=("${all_tests[@]}")
+fi
+
+if [[ -n "$LIST_ONLY" ]]; then
+    if ((RUN_DKMS)); then
+        echo "dkms tooling (KERNEL_TREE=$KERNEL_TREE):"
+        if [[ -d "$(dirname "$DKMS_RUNNER")" ]]; then
+            ( cd "$(dirname "$DKMS_RUNNER")" && ls test_*.sh 2>/dev/null | sed 's/^/  /' )
+        else
+            echo "  (no dkms dir at $(dirname "$DKMS_RUNNER"))"
+        fi
+    fi
+    if ((RUN_MD)); then
+        echo "md runtime (md dir=$MD_DIR):"
+        printf '  %s\n' "${md_tests[@]#"$MD_DIR"/}"
+        printf '  (%d md test%s)\n' "${#md_tests[@]}" "$([ "${#md_tests[@]}" -eq 1 ] || echo s)"
+    fi
+    exit 0
+fi
+
+# ===========================================================================
+# Run
+# ===========================================================================
+log "tree:    $KERNEL_TREE"
+((RUN_DKMS)) && log "dkms:    $DKMS_RUNNER"
+((RUN_MD))   && log "md dir:  $MD_DIR"
+((RUN_MD))   && log "subsys:  $SUBSYS  |  mdadm: ${MDADM:-<none — tests will SKIP>}"
+((RUN_MD)) && ((TEST_TIMEOUT > 0)) && log "timeout: ${TEST_TIMEOUT}s/md-test"
+if ((RUN_MD)) && [[ "$SUBSYS" == md ]]; then
+    warn "MD_SUBSYS=md exercises the IN-TREE md driver; a regressed deadlock guard can wedge kthreads (reboot). See --help."
+fi
+if ((RUN_MD)) && [[ "$SUBSYS" == ms && -r /sys/module/ms_mod/version ]]; then
+    log "loaded ms_mod version: $(cat /sys/module/ms_mod/version)"
+fi
+
+overall_fail=0
+
+# --- Suite 4a: dkms tooling ---
+dkms_result="skipped"
+if ((RUN_DKMS)); then
+    if [[ -x "$DKMS_RUNNER" ]]; then
+        echo; echo "########## dkms tooling selftests (KERNEL_TREE=$KERNEL_TREE) ##########"
+        if KERNEL_TREE="$KERNEL_TREE" bash "$DKMS_RUNNER"; then
+            dkms_result="ok"
+        else
+            dkms_result="FAILED"
+            overall_fail=1
+        fi
+    else
+        warn "no dkms tooling runner at $DKMS_RUNNER — skipping"
+        dkms_result="no runner"
+    fi
+fi
+
+# --- Suite 4b: md runtime ---
+mpass=0 mfail=0 mskip=0 mfailed=()
+if ((RUN_MD)); then
+    echo; echo "########## md runtime selftests (subsys=$SUBSYS) ##########"
+    for t in "${md_tests[@]}"; do
+        rel="${t#"$MD_DIR"/}"
+        echo "=== md: $rel ==="
+        tcmd=("${SUDO[@]}")
+        ((TEST_TIMEOUT > 0)) && tcmd+=(timeout --kill-after=15 --signal=TERM "$TEST_TIMEOUT")
+        tcmd+=(env "${test_env[@]}" bash "$t")
+        if "${tcmd[@]}"; then
+            mpass=$((mpass + 1))
+        else
+            rc=$?
+            case "$rc" in
+                4)   mskip=$((mskip + 1)) ;;
+                124) mfail=$((mfail + 1)); mfailed+=("$rel (timed out after ${TEST_TIMEOUT}s)") ;;
+                *)   mfail=$((mfail + 1)); mfailed+=("$rel (rc=$rc)") ;;
+            esac
+        fi
+    done
+    ((mfail > 0)) && overall_fail=1
+fi
+
+# --- Summary ---
+echo
+echo "=============================================================="
+echo "$PROG: summary"
+((RUN_DKMS)) && echo "  dkms tooling:  $dkms_result"
+((RUN_MD))   && echo "  md runtime:    pass=$mpass fail=$mfail skip=$mskip (subsys=$SUBSYS)"
+if ((mfail > 0)); then printf '    FAILED: %s\n' "${mfailed[@]}"; fi
+echo "=============================================================="
+((overall_fail == 0))
