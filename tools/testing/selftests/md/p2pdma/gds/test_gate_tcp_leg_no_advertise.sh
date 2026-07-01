@@ -20,19 +20,23 @@ M0="$P2PDMA_M0"; M1="$P2PDMA_M1"
 
 gds_nvmet_export tcp "$M1"
 REMOTE="${GDS_REMOTE_DEVS[0]}"
-if "$QF" "$REMOTE"; then
-	echo "FAIL: loopback nvme-tcp namespace $REMOTE advertises P2P (Finding E violated?)" >&2
-	exit 1
-fi
+rc=0; "$QF" "$REMOTE" >/dev/null || rc=$?
+case $rc in
+	0) echo "FAIL: loopback nvme-tcp namespace $REMOTE advertises P2P (Finding E violated?)" >&2; exit 1;;
+	1) : ;;
+	*) echo "SKIP: cannot probe queue features on $REMOTE (rc=$rc)" >&2; exit 4;;
+esac
 
 gds_csi_mdadm_create /dev/ms0 1 "$M0" "$REMOTE" >/dev/null 2>&1 \
 	|| { echo "SKIP: array create failed" >&2; exit 4; }
 P2PDMA_ARRAY=/dev/ms0
 
-if "$QF" /dev/ms0; then
-	echo "FAIL: array advertises P2P with a tcp (non-P2P) leg -- member-AND gate broken" >&2
-	exit 1
-fi
+rc=0; "$QF" /dev/ms0 >/dev/null || rc=$?
+case $rc in
+	0) echo "FAIL: array advertises P2P with a tcp (non-P2P) leg -- member-AND gate broken" >&2; exit 1;;
+	1) : ;;
+	*) echo "SKIP: cannot probe queue features on /dev/ms0 (rc=$rc)" >&2; exit 4;;
+esac
 gds_verdict p4a member_and PASS "local=adv tcp-ns=not array=not"
 echo "PASS: tcp leg correctly suppresses the array's P2P advertisement"
 exit 0
