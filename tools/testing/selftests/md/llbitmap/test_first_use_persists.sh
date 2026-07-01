@@ -44,7 +44,7 @@ echo "INFO: ms_dev=$MS_DEV members=$LA,$LB"
 
 # Confirm llbitmap is the active bitmap. If something else is selected
 # this test is meaningless.
-bt=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bt=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bt" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "expected llbitmap, got '$bt'" ;;
@@ -52,7 +52,7 @@ esac
 
 # Capture the in-memory llbitmap->chunksize chosen by llbitmap_init.
 # This is what sb->chunksize SHOULD be after Fix 2 lands.
-LLBITMAP_CHUNKSIZE=$(awk '/^chunksize /{print $2; exit}' "/sys/block/$MS_NAME/ms/llbitmap/metadata")
+LLBITMAP_CHUNKSIZE=$(awk '/^chunksize /{print $2; exit}' "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/metadata")
 if [ -z "$LLBITMAP_CHUNKSIZE" ] || [ "$LLBITMAP_CHUNKSIZE" -le 0 ]; then
 	llbitmap_fail "could not read llbitmap chunksize from sysfs"
 fi

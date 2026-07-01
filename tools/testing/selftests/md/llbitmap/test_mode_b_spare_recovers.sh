@@ -43,7 +43,7 @@ echo "INFO: ms_dev=$MS_DEV members=$LA,$LB spare=$LC"
 	--assume-clean "$LA" "$LB" --run --force >/dev/null 2>&1
 
 # Sanity: confirm llbitmap is the active bitmap implementation.
-bitmap_type=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bitmap_type=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bitmap_type" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "bitmap_type='$bitmap_type', expected llbitmap to be selected" ;;
@@ -81,9 +81,9 @@ done
 if [ -z "$final_state" ]; then
 	state=$(llbitmap_member_state "$MS_NAME" "$LC_BASE")
 	echo "INFO: bitmap stats at timeout:"
-	cat "/sys/block/$MS_NAME/ms/llbitmap/bits" 2>&1 | sed 's/^/  /'
+	cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>&1 | sed 's/^/  /'
 	echo "INFO: mdstat:"
-	cat /proc/msstat 2>&1 | sed 's/^/  /'
+	cat ${LLBITMAP_PROC_STAT} 2>&1 | sed 's/^/  /'
 	llbitmap_fail "spare $LC_BASE did not reach in_sync within 90s; final state='$state'"
 fi
 

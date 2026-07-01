@@ -122,7 +122,7 @@ echo "  members: $LA $LB  md: $MS_DEV"
 	--bitmap=auto --assume-clean "$LA" "$LB" --run --force \
 	>/dev/null 2>&1 || llbitmap_skip "mdadm create failed"
 
-bt=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bt=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bt" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "not llbitmap ($bt)" ;;

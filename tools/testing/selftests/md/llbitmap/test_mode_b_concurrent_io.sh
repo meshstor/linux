@@ -46,7 +46,7 @@ echo "INFO: ms_dev=$MS_DEV members=$LA,$LB spare=$LC"
 	--assume-clean "$LA" "$LB" --run --force >/dev/null 2>&1
 
 # Sanity: llbitmap is the active bitmap.
-bt=$(cat "/sys/block/$MS_NAME/ms/bitmap_type" 2>/dev/null || echo "")
+bt=$(cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/bitmap_type" 2>/dev/null || echo "")
 case "$bt" in
 	*"[llbitmap]"*) : ;;
 	*) llbitmap_skip "expected llbitmap, got '$bt'" ;;
@@ -95,7 +95,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 		break
 	fi
 	if [ $((elapsed % 10)) -eq 0 ] && [ "$elapsed" -gt 0 ]; then
-		bits_summary=$(awk '{printf "%s=%s ", $1$2, $NF}' "/sys/block/$MS_NAME/ms/llbitmap/bits" 2>/dev/null || echo "?")
+		bits_summary=$(awk '{printf "%s=%s ", $1$2, $NF}' "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>/dev/null || echo "?")
 		echo "INFO: t=${elapsed}s state='$state' bits=$bits_summary"
 	fi
 	sleep 1
@@ -110,9 +110,9 @@ rm -f "$WRITER_PID_FILE"
 state=$(llbitmap_member_state "$MS_NAME" "$LC_BASE")
 if ! printf '%s' "$state" | grep -qw "in_sync"; then
 	echo "INFO: bitmap stats at timeout:"
-	cat "/sys/block/$MS_NAME/ms/llbitmap/bits" 2>&1 | sed 's/^/  /'
+	cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>&1 | sed 's/^/  /'
 	echo "INFO: msstat:"
-	cat /proc/msstat | sed 's/^/  /'
+	cat ${LLBITMAP_PROC_STAT} | sed 's/^/  /'
 	umount "$LLBITMAP_TEST_MOUNT" 2>/dev/null || true
 	llbitmap_fail "spare did not reach in_sync within 180s under concurrent I/O; state='$state'"
 fi

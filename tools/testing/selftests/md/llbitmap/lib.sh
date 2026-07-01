@@ -1,22 +1,53 @@
 # SPDX-License-Identifier: GPL-2.0
 # Shared helpers for llbitmap selftests.
 #
-# These tests target the meshstor-ms out-of-tree build, which renames md-* to
-# ms-* so it can coexist with the in-kernel md_mod (built into vmlinuz on RHEL
-# 10.x). Devices are /dev/msN with major 252.
+# A single knob, MD_SUBSYS, selects the subsystem and derives the device
+# prefix, sysfs subdir, personality (/proc) file and core/raid1 module names
+# -- matching the takeover/, raid10/ and latency/ suites so one MD_SUBSYS=ms
+# (the default) drives the whole composed md selftest tree.
 #
-# The test environment requires:
-#   - ms_mod.ko + raid1_ms.ko built and loaded
-#       (build dir: build/linux-meshstor-rebuilt/build/meshstor-ms-0.1.0-baseline)
-#   - /home/mykola/mdadm/mdadm — meshstor-patched mdadm that recognises
-#       major 252 as an MD-class device. The system /usr/sbin/mdadm rejects
-#       /dev/msN as "not an md device".
+#   MD_SUBSYS=ms (default) -> out-of-tree meshstor-ms build, which renames
+#                md-* to ms-* so it can coexist with the in-kernel md_mod
+#                (built into vmlinuz on RHEL 10.x / Ubuntu). Devices are
+#                /dev/msN (major 252) under /sys/block/msN/ms, personalities
+#                in /proc/msstat, modules ms_mod.ko + raid1_ms.ko loaded.
+#   MD_SUBSYS=md           -> in-tree md driver (stock /dev/mdN,
+#                /sys/block/mdN/md, /proc/mdstat, built-in md_mod + raid1).
+#
+# BOTH subsystems need the meshstor-patched mdadm: the llbitmap arrays are
+# created with --bitmap=lockless, which the stock distro mdadm does not
+# understand. The patched mdadm infers the subsystem from the device-name
+# prefix (msN -> major 252, mdN -> major 9), so no --subsys flag is needed.
 #
 # Sourced by each test_*.sh under this directory; never run directly.
 
 set -u
 
-# Path to the meshstor-patched mdadm (recognises /dev/msN).
+# MD_SUBSYS selects the subsystem and derives the per-subsystem knobs.
+MD_SUBSYS="${MD_SUBSYS:-ms}"
+case "$MD_SUBSYS" in
+ms)
+	LLBITMAP_DEV_PREFIX="ms"	# /dev/msN
+	LLBITMAP_SYSFS_SUBDIR="ms"	# /sys/block/msN/ms
+	LLBITMAP_PROC_STAT="/proc/msstat"
+	LLBITMAP_CORE_MOD="ms_mod"
+	LLBITMAP_RAID1_MOD="raid1_ms"
+	;;
+md)
+	LLBITMAP_DEV_PREFIX="md"	# /dev/mdN
+	LLBITMAP_SYSFS_SUBDIR="md"	# /sys/block/mdN/md
+	LLBITMAP_PROC_STAT="/proc/mdstat"
+	LLBITMAP_CORE_MOD="md_mod"
+	LLBITMAP_RAID1_MOD="raid1"
+	;;
+*)
+	echo "FAIL: unknown MD_SUBSYS=$MD_SUBSYS (want 'ms' or 'md')" >&2
+	exit 1
+	;;
+esac
+
+# Path to the meshstor-patched mdadm (understands --bitmap=lockless and the
+# msN device-name prefix); required for BOTH subsystems. Override via MDADM=...
 MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
 
 # Resolve a dd that handles non-page-aligned O_DIRECT buffers.  The Rust
@@ -53,17 +84,35 @@ llbitmap_require_root() {
 }
 
 llbitmap_require_modules() {
-	if ! lsmod | grep -q '^ms_mod '; then
-		echo "SKIP: ms_mod not loaded" >&2
-		exit 4
-	fi
-	if ! lsmod | grep -q '^raid1_ms '; then
-		echo "SKIP: raid1_ms not loaded" >&2
-		exit 4
-	fi
 	if [ ! -x "$MDADM" ]; then
 		echo "SKIP: meshstor mdadm not found at $MDADM" >&2
 		exit 4
+	fi
+	# Both subsystems create llbitmap arrays with --bitmap=lockless; the
+	# stock distro mdadm lacks that option. Probe for it when we can so
+	# the skip message is clear (otherwise every --create just fails).
+	if command -v strings >/dev/null 2>&1 \
+	   && ! strings "$MDADM" 2>/dev/null | grep -qiw lockless; then
+		echo "SKIP: $MDADM lacks --bitmap=lockless support (need patched mdadm)" >&2
+		exit 4
+	fi
+	if [ "$MD_SUBSYS" = ms ]; then
+		# Out-of-tree modules must be explicitly loaded.
+		if ! lsmod | grep -q "^${LLBITMAP_CORE_MOD} "; then
+			echo "SKIP: ${LLBITMAP_CORE_MOD} not loaded" >&2
+			exit 4
+		fi
+		if ! lsmod | grep -q "^${LLBITMAP_RAID1_MOD} "; then
+			echo "SKIP: ${LLBITMAP_RAID1_MOD} not loaded" >&2
+			exit 4
+		fi
+	else
+		# In-tree md core is typically built into vmlinux (absent from
+		# lsmod); the sysfs module dir is the portable presence signal.
+		if [ ! -d "/sys/module/${LLBITMAP_CORE_MOD}" ]; then
+			echo "SKIP: ${LLBITMAP_CORE_MOD} not present" >&2
+			exit 4
+		fi
 	fi
 }
 
@@ -90,28 +139,31 @@ llbitmap_make_loop() {
 	echo "$loop"
 }
 
-# llbitmap_alloc_ms_dev: pick an unused ms device name (not yet allocated),
-# set the globals LLBITMAP_TEST_MS_DEV and LLBITMAP_TEST_MS_NAME, and echo
-# the path. mdadm --create will create the device node itself. We
-# deliberately do NOT precreate via /sys/module/ms_mod/parameters/new_array
-# because that path leaves the device in a state where mdadm assemble
-# silently bypasses bitmap revalidation (observed: a corrupted bitmap
-# super that should EINVAL is accepted instead).
+# llbitmap_alloc_ms_dev: pick an unused device name for the selected
+# subsystem (/dev/msN or /dev/mdN), set the globals LLBITMAP_TEST_MS_DEV and
+# LLBITMAP_TEST_MS_NAME, and echo the path. mdadm --create will create the
+# device node itself. We deliberately do NOT precreate via
+# /sys/module/<core>/parameters/new_array because that path leaves the device
+# in a state where mdadm assemble silently bypasses bitmap revalidation
+# (observed: a corrupted bitmap super that should EINVAL is accepted instead).
 #
-# Globals do NOT propagate out of $(...) subshells, so the caller must
-# additionally set LLBITMAP_TEST_MS_DEV itself or call this without
+# The MS_ in the global names is historical; under MD_SUBSYS=md they hold the
+# /dev/mdN path/name. Globals do NOT propagate out of $(...) subshells, so the
+# caller must additionally set LLBITMAP_TEST_MS_DEV itself or call this without
 # command substitution.
 llbitmap_alloc_ms_dev() {
 	local n
 	for n in $(seq 200 250); do
+		local dev="/dev/${LLBITMAP_DEV_PREFIX}${n}"
+		local name="${LLBITMAP_DEV_PREFIX}${n}"
 		# Ensure no existing array AND no leftover device node.
 		# If a stale node exists, stop any array on it and remove
 		# the node so mdadm can create a fresh one.
-		if [ -b "/dev/ms${n}" ]; then
-			"$MDADM" --stop "/dev/ms${n}" >/dev/null 2>&1 || true
+		if [ -b "$dev" ]; then
+			"$MDADM" --stop "$dev" >/dev/null 2>&1 || true
 			# array_state=clear means no array is running.
 			local state
-			state=$(cat "/sys/block/ms${n}/ms/array_state" 2>/dev/null || echo "")
+			state=$(cat "/sys/block/${name}/${LLBITMAP_SYSFS_SUBDIR}/array_state" 2>/dev/null || echo "")
 			if [ "$state" = "clear" ] || [ -z "$state" ]; then
 				# Acceptable: stale device node, mdadm will reuse it.
 				:
@@ -119,12 +171,12 @@ llbitmap_alloc_ms_dev() {
 				continue
 			fi
 		fi
-		LLBITMAP_TEST_MS_DEV="/dev/ms${n}"
-		LLBITMAP_TEST_MS_NAME="ms${n}"
-		echo "/dev/ms${n}"
+		LLBITMAP_TEST_MS_DEV="$dev"
+		LLBITMAP_TEST_MS_NAME="$name"
+		echo "$dev"
 		return 0
 	done
-	echo "FAIL: no free ms device in 200-250 range" >&2
+	echo "FAIL: no free ${LLBITMAP_DEV_PREFIX} device in 200-250 range" >&2
 	exit 1
 }
 
@@ -184,12 +236,12 @@ llbitmap_state_count() {
 	local ms_name="$1"
 	local state="$2"
 	awk -v s="$state" '$0 ~ "^"s" "{print $NF; found=1; exit} END{if (!found) print "0"}' \
-		"/sys/block/${ms_name}/ms/llbitmap/bits"
+		"/sys/block/${ms_name}/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits"
 }
 
 # llbitmap_member_state MS_NAME MEMBER -> contents of dev-<member>/state
 llbitmap_member_state() {
-	cat "/sys/block/$1/ms/dev-$2/state" 2>/dev/null || echo "missing"
+	cat "/sys/block/$1/${LLBITMAP_SYSFS_SUBDIR}/dev-$2/state" 2>/dev/null || echo "missing"
 }
 
 llbitmap_pass() { echo "PASS: $1"; exit 0; }
@@ -218,6 +270,6 @@ llbitmap_events_of() {
 llbitmap_member_present() {
 	local ms_name="$1"
 	local member="$2"
-	local state_file="/sys/block/${ms_name}/ms/dev-${member}/state"
+	local state_file="/sys/block/${ms_name}/${LLBITMAP_SYSFS_SUBDIR}/dev-${member}/state"
 	[ -r "$state_file" ] && [ -n "$(cat "$state_file" 2>/dev/null)" ]
 }

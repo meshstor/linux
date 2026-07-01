@@ -121,7 +121,7 @@ echo "INFO: mdadm output: $ASSEMBLE_OUTPUT"
 # The assemble must fail.
 if echo "$ASSEMBLE_OUTPUT" | grep -qi "started"; then
 	"$MDADM" --stop "$MS_DEV" >/dev/null 2>&1 || true
-	cat "/sys/block/$MS_NAME/ms/llbitmap/bits" 2>&1 | head | sed 's/^/  /'
+	cat "/sys/block/$MS_NAME/${LLBITMAP_SYSFS_SUBDIR}/llbitmap/bits" 2>&1 | head | sed 's/^/  /'
 	llbitmap_fail "assemble with corrupted chunksize=64 should fail but succeeded: $ASSEMBLE_OUTPUT"
 fi
 
