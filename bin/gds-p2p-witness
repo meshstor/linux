@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+#
+# gds-p2p-witness — kernel-side proof that an I/O workload took the native
+# P2PDMA path (GPU BAR pages through md, member queues mapping peer addresses)
+# rather than a CPU bounce.  Wraps a command with a bpftrace count of:
+#   @p2p_bios : bios entering ms_submit_bio whose first bvec page is
+#               ZONE_DEVICE MEMORY_DEVICE_PCI_P2PDMA (impossible after a bounce)
+#   @host_bios: other bios entering ms_submit_bio
+#   @map_hits : calls into pci_p2pdma_* (member DMA-map path)
+# A compat/CPU run must show p2p_bios=0 map_hits=0; a native GDS run > 0.
+# The pgmap union read can't false-negative and false-positives are excluded
+# by the mandatory zero-control runs (P1 calibration / rehearsal).
+#
+# Usage: gds-p2p-witness [--expect-ms zero|nonzero|any]
+#                        [--expect-map zero|nonzero|any] [-o FILE] -- CMD...
+# Exit: 0 ok, 1 expectation violated, 2 usage, 4 cannot attach (skip)
+set -u
+EXPECT_MS=any EXPECT_MAP=any OUTFILE=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--expect-ms)  EXPECT_MS=$2; shift 2;;
+		--expect-map) EXPECT_MAP=$2; shift 2;;
+		-o)           OUTFILE=$2; shift 2;;
+		--)           shift; break;;
+		*) echo "usage: gds-p2p-witness [--expect-ms MODE] [--expect-map MODE] [-o FILE] -- CMD..." >&2; exit 2;;
+	esac
+done
+[ $# -gt 0 ] || { echo "no command given" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "SKIP: root required" >&2; exit 4; }
+command -v bpftrace >/dev/null 2>&1 || { echo "SKIP: bpftrace not installed" >&2; exit 4; }
+FF=/sys/kernel/tracing/available_filter_functions
+grep -q '^ms_submit_bio\b' "$FF" 2>/dev/null \
+	|| { echo "SKIP: ms_submit_bio not traceable (ms_mod loaded?)" >&2; exit 4; }
+HAVE_MAP=1
+grep -q '^pci_p2pdma_' "$FF" 2>/dev/null || HAVE_MAP=0
+
+WORK=$(mktemp -d)
+PROG="$WORK/witness.bt"
+cat > "$PROG" <<'BT'
+kprobe:ms_submit_bio {
+	$b = (struct bio *)arg0;
+	if ($b->bi_io_vec != 0) {
+		/* struct page no longer carries a directly-named "pgmap" field
+		 * (folio conversion moved it into struct folio's anonymous
+		 * union); struct folio aliases struct page byte-for-byte at
+		 * this offset, so cast through folio to reach it. */
+		$pg = (struct folio *)$b->bi_io_vec->bv_page;
+		if ($pg->pgmap != 0 && $pg->pgmap->type == MEMORY_DEVICE_PCI_P2PDMA) {
+			@p2p_bios = count();
+		} else {
+			@host_bios = count();
+		}
+	}
+}
+BT
+[ "$HAVE_MAP" = 1 ] && echo 'kprobe:pci_p2pdma_* { @map_hits[func] = count(); }' >> "$PROG"
+
+bpftrace "$PROG" > "$WORK/trc" 2> "$WORK/err" &
+BPID=$!
+trap cleanup EXIT
+cleanup() { kill "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null; rm -rf "$WORK"; }
+for _ in $(seq 60); do grep -q Attaching "$WORK/trc" 2>/dev/null && break; sleep 0.25; done
+if ! grep -q Attaching "$WORK/trc" 2>/dev/null; then
+	cat "$WORK/err" >&2; cleanup
+	echo "SKIP: bpftrace failed to attach" >&2; exit 4
+fi
+
+"$@"; RC=$?
+
+kill -INT "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null
+P2P=$(awk -F': ' '/^@p2p_bios/  {print $2}' "$WORK/trc"); P2P=${P2P:-0}
+HOST=$(awk -F': ' '/^@host_bios/ {print $2}' "$WORK/trc"); HOST=${HOST:-0}
+MAPS=$(awk -F': ' '/^@map_hits/  {s+=$2} END {print s+0}' "$WORK/trc")
+[ "$HAVE_MAP" = 1 ] || MAPS=unavailable
+REPORT="p2p_bios=$P2P host_bios=$HOST map_hits=$MAPS cmd_rc=$RC"
+if [ -n "$OUTFILE" ]; then
+	{ echo "$REPORT"; echo "--- raw bpftrace ---"; cat "$WORK/trc"; } > "$OUTFILE"
+fi
+echo "$REPORT"
+rm -rf "$WORK"; trap - EXIT
+
+BAD=0
+case "$EXPECT_MS" in
+	zero)    [ "$P2P" -eq 0 ] || BAD=1;;
+	nonzero) { [ "$P2P" -gt 0 ] && [ "$RC" -eq 0 ]; } || BAD=1;;
+esac
+case "$EXPECT_MAP" in
+	zero)    [ "$MAPS" = unavailable ] || [ "$MAPS" -eq 0 ] || BAD=1;;
+	nonzero) [ "$MAPS" != unavailable ] && [ "$MAPS" -gt 0 ] || BAD=1;;
+esac
+[ "$EXPECT_MS" = any ] && [ "$EXPECT_MAP" = any ] && exit "$RC"
+exit "$BAD"
