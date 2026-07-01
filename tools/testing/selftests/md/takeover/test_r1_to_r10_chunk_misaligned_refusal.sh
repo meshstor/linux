@@ -12,6 +12,7 @@
 md_require_root
 md_require_tools
 md_require_modules
+md_require_takeover
 
 loop0="$(md_make_loop 64)"
 loop1="$(md_make_loop 64)"

@@ -5,6 +5,7 @@
 md_require_root
 md_require_tools
 md_require_modules
+md_require_takeover
 
 loop0="$(md_make_loop 64)"
 MD_TEST_MD_DEV="$(md_find_free_md_dev)"

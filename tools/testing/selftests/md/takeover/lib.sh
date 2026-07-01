@@ -110,6 +110,40 @@ md_require_modules() {
 	done
 }
 
+# md_require_takeover: SKIP unless the running driver supports the raid1 ->
+# raid10 takeover this suite exercises.  Under ms it always does (this branch's
+# feature), so we short-circuit.  Under MD_SUBSYS=md it depends on the in-tree
+# kernel -- stock md rejects the level switch with -EINVAL.  Capability-detected
+# by probing a throwaway healthy raid1 (which converts iff the takeover is
+# present), so a future in-tree md that gains it runs the suite instead of
+# skipping.  Positive tests that convert via md_sysfs_write are auto-skipped
+# there and need not call this; the refusal/CLI tests (which EXPECT a refusal
+# and so cannot detect absence from "conversion failed") do.
+md_require_takeover() {
+	[ "$MD_SUBSYS" = ms ] && return 0
+	local l0 l1 dev sysfs supported=0
+	l0="$(md_make_loop 32)"
+	l1="$(md_make_loop 32)"
+	dev="$(md_find_free_md_dev)"
+	if md_mdadm --create --run --metadata=1.2 --level=1 --raid-devices=2 \
+	     "$dev" "$l0" "$l1" >/dev/null 2>&1; then
+		md_wait_sync "$dev" >/dev/null 2>&1 || true
+		sysfs="$(md_sysfs_path "$dev")"
+		local _rc=0
+		_md_write_level_raid10 "$sysfs/level" || _rc=$?
+		md_mdadm --stop "$dev" >/dev/null 2>&1 || true
+		case "$_rc" in
+			0) supported=1 ;;
+			2) : ;;   # -EINVAL: takeover unsupported -> md_skip below
+			*) md_fail "takeover capability probe failed unexpectedly under MD_SUBSYS=md (not -EINVAL: ${MD_LAST_WRITE_ERR:-unknown}) -- not masking" ;;
+		esac
+	fi
+	# The probe's loops are registry-tracked; md_cleanup tears them down at EXIT.
+	[ "$supported" = 1 ] || \
+		md_skip "raid1->raid10 takeover not supported by the running driver (MD_SUBSYS=$MD_SUBSYS) -- it is a meshstor (ms) feature"
+	return 0
+}
+
 # md_make_loop SIZE_MB -> echoes loop device path
 #
 # Default scratch dir is /var/tmp rather than /tmp because /tmp is
@@ -201,9 +235,46 @@ md_sysfs_path() {
 }
 
 # md_sysfs_write PATH VALUE
+# _md_write_level_raid10 PATH -> attempt the raid1 -> raid10 level switch and
+# CLASSIFY the outcome, so callers can tell "takeover unsupported by this
+# driver" apart from an unexpected failure that must NOT be masked:
+#   0  the switch was accepted
+#   2  rejected with -EINVAL ("Invalid argument") -- the target level/takeover
+#      is not supported by this driver (feature absent)
+#   3  rejected with some OTHER errno (EBUSY/EIO/ENOMEM/...) -- unexpected;
+#      MD_LAST_WRITE_ERR holds the errno text
+# LC_ALL=C pins the errno string so the match is locale-stable.
+MD_LAST_WRITE_ERR=""
+_md_write_level_raid10() {
+	local path="$1" err
+	if err="$( { LC_ALL=C printf '%s\n' raid10 > "$path"; } 2>&1 )"; then
+		return 0
+	fi
+	case "$err" in
+		*"Invalid argument"*) return 2 ;;
+		*) MD_LAST_WRITE_ERR="${err##*: }"; return 3 ;;
+	esac
+}
+
+# md_sysfs_write PATH VALUE
 md_sysfs_write() {
 	local path="$1"
 	local value="$2"
+	# The raid1 -> raid10 takeover is a meshstor (ms) feature.  Under
+	# MD_SUBSYS=md the in-tree driver rejects the level switch.  ONLY -EINVAL
+	# means the takeover is unsupported by this driver (feature absent) -> SKIP;
+	# any OTHER errno is an unexpected conversion failure that must NOT be masked
+	# -> FAIL.  Capability-detected: if a future in-tree md accepts the switch,
+	# the write succeeds and the test runs normally.  Inert under ms.
+	if [ "$MD_SUBSYS" = md ] && [ "$value" = raid10 ] && [ "${path##*/}" = level ]; then
+		local _rc=0
+		_md_write_level_raid10 "$path" || _rc=$?
+		case "$_rc" in
+			0) return 0 ;;
+			2) md_skip "raid1->raid10 takeover not supported by the in-tree md driver (MD_SUBSYS=md, -EINVAL) -- it is a meshstor (ms) feature" ;;
+			*) md_fail "raid1->raid10 level switch failed unexpectedly under MD_SUBSYS=md (not -EINVAL: ${MD_LAST_WRITE_ERR:-unknown}) -- not masking" ;;
+		esac
+	fi
 	echo "$value" > "$path"
 }
 
