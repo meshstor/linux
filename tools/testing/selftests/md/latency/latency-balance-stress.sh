@@ -74,25 +74,45 @@ latbal_dmesg_mark start
 
 # Continuous read load for phases A-C.  continue_on_error so a transient
 # blip while a leg is failed does not abort the load generator.
+reads_before=0
+for i in 0 1 2; do reads_before=$(( reads_before + $(latbal_reads_of "$i") )); done
 fio --name=stress --filename="$LATBAL_DEV" --rw=randread --bs=8k \
     --time_based --runtime=600 --direct=1 --iodepth=16 --numjobs=4 \
     --continue_on_error=all --group_reporting --minimal >/dev/null 2>&1 &
 FIO_PID=$!
 sleep 2		# let the fold worker spin up and publish EWMAs
 
+# Prove the read load actually engaged BEFORE relying on a "no splat" verdict:
+# a dead fio (bad args, device gone) or a run that issues no reads drives none
+# of the lockless-completion / lifetime paths, yet the dmesg scan would still be
+# clean and PASS.  Require the load generator alive AND reads reaching the legs.
+kill -0 "$FIO_PID" 2>/dev/null \
+	|| latbal_fail "background read load (fio) died at startup -- lifetime/UAF paths not exercised"
+reads_after=0
+for i in 0 1 2; do reads_after=$(( reads_after + $(latbal_reads_of "$i") )); done
+[ "$(( reads_after - reads_before ))" -gt 100 ] \
+	|| latbal_fail "read load did not reach the legs ($reads_before -> $reads_after reads) -- no read completions to race teardown against"
+
 # Phase A: membership churn.  fail -> remove (md_rdev_clear frees lat_stats
 # while the worker may be mid-walk) -> add (raid1_add_disk kicks the worker)
 # -> recover.  Alternate legs 1 and 2 so leg 0 always anchors the array.
 echo "phaseA: $CHURN_ITERS rounds of fail/remove/add under load"
+churn_ok=0
 for i in $(seq 1 "$CHURN_ITERS"); do
 	idx=$(( (i % 2) + 1 ))
 	leg="$(latbal_leg_path "$idx")"
 	latbal_mdadm "$LATBAL_DEV" --fail "$leg"   >/dev/null 2>&1 || true
-	latbal_mdadm "$LATBAL_DEV" --remove "$leg" >/dev/null 2>&1 || true
+	# Count real removes: this is the op that frees lat_stats under the
+	# worker's feet (the race under test).  Kept resilient (|| true elsewhere)
+	# but a phase A where nothing ever removed is a no-op, not coverage.
+	if latbal_mdadm "$LATBAL_DEV" --remove "$leg" >/dev/null 2>&1; then
+		churn_ok=$(( churn_ok + 1 ))
+	fi
 	sleep 0.2
 	latbal_mdadm "$LATBAL_DEV" --add "$leg"    >/dev/null 2>&1 || true
 	latbal_wait_idle 60
 done
+[ "$churn_ok" -gt 0 ] || latbal_fail "phaseA membership churn never engaged (0/$CHURN_ITERS removes succeeded) -- the free-vs-worker race was not exercised"
 
 # Phase B: kill-switch toggle churn.  Drives the worker's park/kick races
 # and the kill-switch park path against live completions.
