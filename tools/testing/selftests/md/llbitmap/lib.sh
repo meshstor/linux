@@ -76,6 +76,14 @@ LLBITMAP_TEST_MS_DEV=""
 LLBITMAP_TEST_MS_NAME=""
 LLBITMAP_TEST_MOUNT=""
 
+# Side-file registry.  llbitmap_make_loop is almost always called via command
+# substitution (LA=$(llbitmap_make_loop ...)), which runs it in a subshell, so
+# the LLBITMAP_TEST_LOOPS/FILES appends below are LOST in the parent and cleanup
+# would detach/unlink nothing -- leaking a loop + backing file per call.  A file
+# append survives the subshell, so record loop+image here too and replay it in
+# cleanup.  Auto-created at source time; each test process gets its own.
+LLBITMAP_TEST_REGISTRY="$(mktemp "${TMPDIR:-/tmp}/llbitmap-registry.XXXXXX" 2>/dev/null || echo /dev/null)"
+
 llbitmap_require_root() {
 	if [ "$(id -u)" -ne 0 ]; then
 		echo "SKIP: must run as root (try: sudo $0)" >&2
@@ -136,6 +144,9 @@ llbitmap_make_loop() {
 	loop="$(losetup -f --show "$tmp")"
 	LLBITMAP_TEST_LOOPS+=("$loop")
 	LLBITMAP_TEST_FILES+=("$tmp")
+	# Survives command substitution (the array appends above do not); cleanup
+	# replays this to tear down loops/files created as LA=$(llbitmap_make_loop).
+	echo "$loop $tmp" >> "${LLBITMAP_TEST_REGISTRY:-/dev/null}"
 	echo "$loop"
 }
 
@@ -190,6 +201,16 @@ llbitmap_cleanup() {
 		"$MDADM" --stop "$LLBITMAP_TEST_MS_DEV" >/dev/null 2>&1
 	fi
 	udevadm settle >/dev/null 2>&1
+	# Replay the side-file registry: recover loops/backing files created in
+	# command-substitution subshells, where the in-function array appends were
+	# lost.  Without this the loops below (and their images) leak every run.
+	local _rl _rf
+	if [ -n "${LLBITMAP_TEST_REGISTRY:-}" ] && [ -r "$LLBITMAP_TEST_REGISTRY" ]; then
+		while read -r _rl _rf; do
+			[ -n "$_rl" ] && LLBITMAP_TEST_LOOPS+=("$_rl")
+			[ -n "$_rf" ] && LLBITMAP_TEST_FILES+=("$_rf")
+		done < "$LLBITMAP_TEST_REGISTRY"
+	fi
 	local loop tries still
 	for loop in "${LLBITMAP_TEST_LOOPS[@]:-}"; do
 		losetup -d "$loop" >/dev/null 2>&1
@@ -209,6 +230,7 @@ llbitmap_cleanup() {
 	for f in "${LLBITMAP_TEST_FILES[@]:-}"; do
 		rm -f "$f"
 	done
+	rm -f "${LLBITMAP_TEST_REGISTRY:-}" 2>/dev/null
 	set -e
 }
 
