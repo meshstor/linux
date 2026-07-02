@@ -1,0 +1,29 @@
+Backport of upstream 23528aa3320a ("nvme: enable PCI P2PDMA support
+for RDMA transport", first in v7.1-rc2) onto the u2404-hwe vendored rdma.c.
+Applied by bin/build-nvme-tarball: patch -p1 --fuzz=0 -d <variant dir>.
+Regeneration after re-vendoring: dkms-nvme/README.md, 'Refreshing'.
+
+--- a/rdma.c	2026-07-02 17:21:57.464794127 +0000
++++ b/rdma.c	2026-07-02 17:21:57.469363889 +0000
+@@ -2189,6 +2189,13 @@
+ 	nvme_rdma_reconnect_or_remove(ctrl, ret);
+ }
+ 
++static bool nvme_rdma_supports_pci_p2pdma(struct nvme_ctrl *ctrl)
++{
++	struct nvme_rdma_ctrl *r_ctrl = to_rdma_ctrl(ctrl);
++
++	return ib_dma_pci_p2p_dma_supported(r_ctrl->device->dev);
++}
++
+ static const struct nvme_ctrl_ops nvme_rdma_ctrl_ops = {
+ 	.name			= "rdma",
+ 	.module			= THIS_MODULE,
+@@ -2202,6 +2209,7 @@
+ 	.delete_ctrl		= nvme_rdma_delete_ctrl,
+ 	.get_address		= nvmf_get_address,
+ 	.stop_ctrl		= nvme_rdma_stop_ctrl,
++	.supports_pci_p2pdma	= nvme_rdma_supports_pci_p2pdma,
+ };
+ 
+ /*
