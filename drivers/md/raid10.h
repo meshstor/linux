@@ -76,6 +76,8 @@ struct r10conf {
 	atomic_t		*nr_waiting;
 	atomic_t		*nr_queued;
 	atomic_t		*barrier;
+	/* sync/recovery/reshape r10bios holding a raised barrier */
+	atomic_t		nr_sync_pending;
 	int			array_freeze_pending;
 	sector_t		next_resync;
 	int			fullsync;  /* set to 1 if a full sync is needed,
