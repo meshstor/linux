@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Assemble the meshstor-nvme-rdma DKMS tarball from dkms-nvme/.
+#
+# Unlike bin/build-tarball (md package): NO rename pass, NO keep-list,
+# NO KERNEL_TREE. Sources are the vendored per-target files in
+# dkms-nvme/vendor/ (byte-identical distro copies), and the only
+# transformation is the per-variant p2pdma backport patch, applied at
+# --fuzz=0 so vendor drift is caught here, not on a customer's DKMS build.
+#
+# Usage: bin/build-nvme-tarball <version>
+set -euo pipefail
+
+VER="${1:?usage: $0 <version>}"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+OUT="$REPO_ROOT/build/meshstor-nvme-rdma-$VER"
+VARIANTS=(u2404-hwe u2604 rhel10)
+FILES=(rdma.c nvme.h fabrics.h PROVENANCE)
+
+cd "$REPO_ROOT"
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+for v in "${VARIANTS[@]}"; do
+    [[ -d "dkms-nvme/vendor/$v" ]] \
+        || { echo "error: dkms-nvme/vendor/$v missing — run bin/vendor-nvme-sources" >&2; exit 1; }
+    mkdir -p "$OUT/$v"
+    for f in "${FILES[@]}"; do
+        cp "dkms-nvme/vendor/$v/$f" "$OUT/$v/"
+    done
+    shopt -s nullglob
+    for p in dkms-nvme/patches/"$v"/*.patch; do
+        echo "Applying $(basename "$p") ($v)"
+        patch -p1 --fuzz=0 --no-backup-if-mismatch -d "$OUT/$v" < "$p"
+    done
+    shopt -u nullglob
+    # A variant whose distro already backported 23528aa ships no patch;
+    # either way the assembled source must carry the op.
+    grep -q 'supports_pci_p2pdma' "$OUT/$v/rdma.c" \
+        || { echo "error: $v/rdma.c lacks supports_pci_p2pdma after patching" >&2; exit 1; }
+done
+
+sed "s/@VERSION@/$VER/g" dkms-nvme/dkms.conf.in > "$OUT/dkms.conf"
+sed "s/@VERSION@/$VER/g" dkms-nvme/Makefile.in  > "$OUT/Makefile"
+cp dkms-nvme/README.md "$OUT/README.md"
+cp dkms/COPYING "$OUT/COPYING"
+
+cd "$REPO_ROOT/build"
+tar czf "meshstor-nvme-rdma-$VER.dkms.tar.gz" "meshstor-nvme-rdma-$VER/"
+
+echo "Built: $REPO_ROOT/build/meshstor-nvme-rdma-$VER.dkms.tar.gz"
