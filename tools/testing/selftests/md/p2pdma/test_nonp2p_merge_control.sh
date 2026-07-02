@@ -14,7 +14,11 @@ p2pdma_pick_members raid1; M0="$P2PDMA_M0"; M1="$P2PDMA_M1"
 "$MDADM" --create /dev/ms0 --level=1 --raid-devices=2 --assume-clean \
 	--run "$M0" "$M1" >/dev/null 2>&1 || { echo "SKIP: array create failed" >&2; exit 4; }
 P2PDMA_ARRAY=/dev/ms0
-KN="$(lsblk -no KNAME "$M0" | head -1)"
+# -d (nodeps): with the array active, a dependent-tree listing can emit the
+# md holder (ms0) first and `head -1` then reads the ARRAY's stat -- md never
+# merges, so the assertion always failed against the wrong device (hit live
+# on the L40S box; the fix reads the member partition itself).
+KN="$(lsblk -dno KNAME "$M0")"
 
 before="$(awk '{print $6}' /sys/class/block/"$KN"/stat)"   # field 6 = write merges (wrqm)
 fio --name=seq --filename=/dev/ms0 --rw=write --bs=8k --iodepth=16 \

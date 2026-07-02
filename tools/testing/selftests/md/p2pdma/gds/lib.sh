@@ -110,14 +110,18 @@ GDS_REMOTE_DEVS=()
 GDS_NVMET_BACKING=()            # local DEV args passed to gds_nvmet_export
 GDS_MNT="${GDS_MNT:-/mnt/gds-test}"
 
-# first IPv4 on an RDMA-capable netdev (hw NIC or rxe); rc 1 if none
+# first IPv4 on an RDMA-capable netdev (hw NIC or rxe); rc 1 if none.
+# HW devices link their netdev under device/net/; soft devices (rxe/siw)
+# have no PCI device dir and name their netdev in the "parent" attribute
+# instead (observed live: rxe0 on bond0 was invisible to the device/net
+# scan and the rdma tests skipped with "no RDMA-capable address").
 gds_rdma_addr() {
-	local ibdev netdev addr
+	local ibdev nd addr
 	for ibdev in /sys/class/infiniband/*; do
 		[ -e "$ibdev" ] || continue
-		for netdev in "$ibdev"/device/net/*; do
-			[ -e "$netdev" ] || continue
-			addr=$(ip -4 -o addr show dev "$(basename "$netdev")" \
+		for nd in $(ls "$ibdev/device/net" 2>/dev/null) \
+		          $(cat "$ibdev/parent" 2>/dev/null); do
+			addr=$(ip -4 -o addr show dev "$nd" 2>/dev/null \
 				| awk '{print $4}' | cut -d/ -f1 | head -1)
 			[ -n "$addr" ] && { echo "$addr"; return 0; }
 		done
@@ -162,6 +166,16 @@ gds_nvmet_export() {
 	esac
 	GDS_NVMET_NQN="nqn.2025-12.io.meshstor:$tr:gdstest:$(hostname -s)"
 	GDS_NVMET_BACKING=("$@")
+	# Hygiene: a leftover md 1.2 superblock on a backing device reappears on
+	# the initiator-side namespace at connect time, and the distro's in-tree
+	# incremental-assembly udev rule then grabs the fresh /dev/nvmeXnY into a
+	# stray /dev/mdN *after* gds_nvmet_disarm_incremental has already run
+	# (observed live: raid1 fabric create EBUSY on the L40S box while raid10
+	# passed). Zeroing the backing device before export prevents the
+	# assembly outright instead of racing it.
+	for dev in "$@"; do
+		[ -b "$dev" ] && "$MDADM" --zero-superblock "$dev" >/dev/null 2>&1 || true
+	done
 	local ss=/sys/kernel/config/nvmet/subsystems/$GDS_NVMET_NQN
 	mkdir -p "$ss" && echo 1 > "$ss/attr_allow_any_host"
 	for dev in "$@"; do
@@ -191,6 +205,10 @@ gds_nvmet_export() {
 		gds_nvmet_teardown
 		echo "SKIP: nvme connect ($tr) failed" >&2; exit 4
 	fi
+	# Let the connect-time block uevents (and any incremental assembly they
+	# trigger) finish before callers probe or disarm, so the disarm sees the
+	# final state instead of racing udev.
+	udevadm settle 2>/dev/null || true
 	# resolve initiator-side namespaces (NSID order == DEV order). NOTE: with
 	# native NVMe multipathing on (nvme_core.multipath=Y, common default),
 	# a fabrics namespace is split into a *hidden* per-controller-path device
@@ -275,11 +293,14 @@ gds_require_gdsio() {
 }
 
 # gds_gdsio_write MNT MODE JSON   (MODE: 0=GDS, 1=POSIX-through-CPU)
+# -V is required on the write too: gdsio only lays down its verifiable
+# pattern in -V mode, and a later -I 0 -V read of a non-V file fails with
+# "files not created with -V mode" (confirmed against gdsio 1.12 on L40S).
 gds_gdsio_write() {
 	local mnt=$1 mode=$2 json=$3
 	mkdir -p "$GDS_RESULTS"
 	CUFILE_ENV_PATH_JSON="$json" "$GDSIO" -f "$mnt/gds-test.bin" \
-		-d 0 -w 4 -s 256M -i 1M -x "$mode" -I 1 \
+		-d 0 -w 4 -s 256M -i 1M -x "$mode" -I 1 -V \
 		> "$GDS_RESULTS/gdsio-w.out" 2>&1
 }
 
