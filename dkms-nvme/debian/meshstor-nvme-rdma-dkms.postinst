@@ -11,6 +11,16 @@ case "$1" in
             dkms add -m "$NAME" -v "$VERSION" || :
             dkms build -m "$NAME" -v "$VERSION" || :
             dkms install -m "$NAME" -v "$VERSION" || :
+            # Non-fatal: for this package a failed DKMS build is invisible
+            # otherwise — the stock in-tree nvme-rdma keeps loading and
+            # P2PDMA is silently absent. Also fires (truthfully) on a
+            # kernel outside BUILD_EXCLUSIVE_KERNEL, where DKMS skips the
+            # build by design; that's an expected, not an error, case.
+            if ! dkms status -m "$NAME" -v "$VERSION" 2>/dev/null | grep -q installed; then
+                echo "WARNING: meshstor-nvme-rdma $VERSION is NOT active for $(uname -r);" >&2
+                echo "         the in-tree nvme-rdma (no PCI P2PDMA) remains in use." >&2
+                echo "         Check: dkms status; /var/lib/dkms/meshstor-nvme-rdma/$VERSION/build/make.log" >&2
+            fi
         fi
         ;;
 esac
