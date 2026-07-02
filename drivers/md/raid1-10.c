@@ -18,6 +18,43 @@
 #define BIO_SPECIAL(bio) ((unsigned long)bio <= 2)
 #define MAX_PLUG_BIO 32
 
+/*
+ * Per-bucket I/O barrier constants, shared by RAID 1 and RAID 10.
+ *
+ * Each barrier unit covers 64 MB (BARRIER_UNIT_SECTOR_SIZE sectors).
+ * The number of buckets is chosen so that four arrays of atomic_t
+ * (nr_pending, nr_waiting, nr_queued, barrier) each fit in one page.
+ */
+#define BARRIER_UNIT_SECTOR_BITS	17
+#define BARRIER_UNIT_SECTOR_SIZE	(1 << BARRIER_UNIT_SECTOR_BITS)
+#define BARRIER_BUCKETS_NR_BITS		(PAGE_SHIFT - ilog2(sizeof(atomic_t)))
+#define BARRIER_BUCKETS_NR		(1 << BARRIER_BUCKETS_NR_BITS)
+
+static inline int sector_to_idx(sector_t sector)
+{
+	return hash_long(sector >> BARRIER_UNIT_SECTOR_BITS,
+			 BARRIER_BUCKETS_NR_BITS);
+}
+
+static inline sector_t align_to_barrier_unit_end(sector_t start_sector,
+						 sector_t sectors)
+{
+	sector_t len;
+
+	WARN_ON(sectors == 0);
+	/*
+	 * len is the number of sectors from start_sector to end of the
+	 * barrier unit which start_sector belongs to.
+	 */
+	len = round_up(start_sector + 1, BARRIER_UNIT_SECTOR_SIZE) -
+	      start_sector;
+
+	if (len > sectors)
+		len = sectors;
+
+	return len;
+}
+
 /* for managing resync I/O pages */
 struct resync_pages {
 	void		*raid_bio;
