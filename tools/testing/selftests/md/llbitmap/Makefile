@@ -9,8 +9,12 @@
 
 TEST_PROGS := \
 	test_read_sb_unmap_highmem.sh \
+	test_cache_pages_enomem_double_free.sh \
+	test_first_use_persist_failure.sh \
+	test_first_use_persist_data_page_failure.sh \
 	test_torn_state_write_error_llbitmap.sh \
-	test_torn_state_write_error_md_bitmap.sh
+	test_torn_state_write_error_md_bitmap.sh \
+	test_first_use_persists.sh
 
 TEST_FILES := lib.sh
 
