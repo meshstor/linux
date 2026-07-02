@@ -1,0 +1,71 @@
+# meshstor-nvme-rdma-dkms.spec — DKMS backport package for nvme-rdma
+# with PCI P2PDMA support (upstream 23528aa3320a, v7.1-rc2).
+#
+# Ships per-target vendored sources (u2404-hwe / u2604 / rhel10) into
+# /usr/src/meshstor-nvme-rdma-@MODULE_VERSION@/; DKMS builds the variant
+# matching each kernel at install/kernel-update time. The module lands
+# in /updates so depmod prefers it over the in-tree nvme-rdma; removal
+# restores the stock module. dkms.conf sets NO_WEAK_MODULES, so no
+# weak-updates symlink pruning is needed here (contrast meshstor-ms).
+
+%global pkgname         meshstor-nvme-rdma
+%global module_version  @MODULE_VERSION@
+
+Name:           %{pkgname}-dkms
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        nvme-rdma host driver with PCI P2PDMA support (DKMS backport)
+
+License:        GPL-2.0-only
+URL:            https://example.com/meshstor-ms
+Source0:        %{pkgname}-%{module_version}.dkms.tar.gz
+
+BuildArch:      noarch
+Requires:       dkms >= 3.0
+Requires:       kernel-devel
+Requires(post):   dkms
+Requires(preun):  dkms
+
+%description
+Rebuilds the running kernel's own nvme-rdma module with the upstream
+v7.1 commit 23528aa3320a ("nvme: enable PCI P2PDMA support for RDMA
+transport") backported, and installs it to updates/ where depmod
+prefers it over the in-tree module. The in-tree nvme-core and
+nvme-fabrics are used unchanged. Supported kernel families:
+RHEL/Rocky 10 (6.12.el10), Ubuntu 24.04 HWE (6.17), Ubuntu 26.04 (7.0);
+other kernels are skipped via BUILD_EXCLUSIVE_KERNEL and keep their
+stock driver.
+
+%prep
+%setup -q -n %{pkgname}-%{module_version}
+
+%build
+# DKMS compiles per-kernel; nothing to do at package-build time.
+
+%install
+mkdir -p %{buildroot}/usr/src/%{pkgname}-%{module_version}
+cp -a . %{buildroot}/usr/src/%{pkgname}-%{module_version}/
+
+%post
+dkms add -m %{pkgname} -v %{module_version} || :
+dkms build -m %{pkgname} -v %{module_version} || :
+dkms install -m %{pkgname} -v %{module_version} || :
+
+%preun
+if [ "$1" = "0" ]; then
+    dkms remove -m %{pkgname} -v %{module_version} --all || :
+    # The override is gone; refresh module indexes so the in-tree
+    # nvme-rdma is found again without waiting for the next depmod.
+    for kdir in /usr/lib/modules/*; do
+        [ -d "$kdir/kernel" ] && /usr/sbin/depmod -a "$(basename "$kdir")" 2>/dev/null || :
+    done
+fi
+
+%files
+%license COPYING
+/usr/src/%{pkgname}-%{module_version}/
+
+%changelog
+* @CHANGELOG_DATE@ Meshstor <support@example.com> - @VERSION@-1
+- DKMS backport of nvme-rdma PCI P2PDMA support (upstream 23528aa3320a)
+  for RHEL/Rocky 10 (6.12), Ubuntu 24.04 HWE (6.17), Ubuntu 26.04 (7.0).
