@@ -173,7 +173,14 @@ JSON
 export CUFILE_ENV_PATH_JSON="$CONF"
 export CUFILE_LOGGING_LEVEL=TRACE
 PASS "wrote $CONF (use_pci_p2pdma=true incl. block.raid.use_pci_p2pdma=true)"
+# cuFile 1.15 ignores the configured file name's tail and writes
+# cufile_<pid>_<date>.log into the logging dir; resolve whichever exists
+# after the run via log_path() rather than assuming a fixed name.
 LOG="$WORK/cufile.log"
+log_path() {
+	if [ -s "$LOG" ]; then printf '%s\n' "$LOG"; return; fi
+	ls -t "$WORK"/cufile_*.log 2>/dev/null | head -1
+}
 
 # ===========================================================================
 sec "5. Exercise cuFile against a file on the array (+ trace cuFile's own probing)"
@@ -218,14 +225,18 @@ fi
 
 # ===========================================================================
 sec "6. Verdict"
-if [ -s "$LOG" ]; then
-	INFO "cufile.log RAID/p2pdma lines:"
-	grep -iE 'raid|p2pdma|compat|not supported|verify' "$LOG" | sed 's/^/        /' | tail -25
+CUFLOG="$(log_path)"
+if [ -n "$CUFLOG" ] && [ -s "$CUFLOG" ]; then
+	INFO "cufile log ($CUFLOG) RAID/p2pdma lines:"
+	grep -iE 'raid|p2pdma|compat|not supported|verify' "$CUFLOG" | sed 's/^/        /' | tail -25
 fi
 real=0; compat=0
-if [ -s "$LOG" ]; then
-	grep -qiE 'cannot verify RAID members|RAID member not supported|GDS not supported|compat mode' "$LOG" && compat=1
-	grep -qiE 'p2pdma.*(enabled|true|using)|using p2p|BUS_ADDR' "$LOG" && real=1
+if [ -n "$CUFLOG" ] && [ -s "$CUFLOG" ]; then
+	grep -qiE 'cannot verify RAID members|RAID member not supported|GDS not supported|RAID level not supported' "$CUFLOG" && compat=1
+	# per-I/O stats markers: cuFile 1.15 TRACE prints "p2p mode: 1 compat: 0"
+	# on every native transfer (older doc-derived spellings kept as fallback).
+	grep -qiE 'p2p mode: 1|p2pdma.*(enabled|true|using)|using p2p|BUS_ADDR' "$CUFLOG" && real=1
+	grep -qiE 'compat: 1|compat mode' "$CUFLOG" && compat=1
 fi
 # Corroborate with gdsio (it prints whether it used GDS or fell back).
 if [ -s "$WORK/gdsio.out" ]; then
