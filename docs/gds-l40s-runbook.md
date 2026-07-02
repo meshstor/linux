@@ -22,19 +22,51 @@ grep CONFIG_PCI_P2PDMA "/boot/config-$(uname -r)"   # want: =y  (else native P2P
 grep CONFIG_DEBUG_INFO_BTF "/boot/config-$(uname -r)"  # want: =y (bpftrace tools are BTF-only)
 uname -r                                      # want: >= 6.11 (6.17-class expected)
 modinfo -F license nvidia                     # want: GPL/MIT (OpenRM open module; proprietary = no native P2P)
+cat /proc/driver/nvidia/version               # want: >= 595 on a >= 6.15 kernel (see driver gate below)
 command -v bpftrace nvme fio gdsio gdscheck   # all must resolve (gds tools: CUDA 12.8+ package)
 nvidia-smi topo -m                            # note which GPU has PIX/PXB (not SYS) to the test NVMe
+                                              # (all-NODE is OK: host-bridge P2P confirmed working on SPR + iommu=pt)
 ```
 
 - Secure Boot **enabled** → enroll the DKMS MOK + reboot (`mokutil --import
   /var/lib/dkms/mok.pub`, or `bin/mok-enroll` from a git checkout), or disable SB.
 - Missing distro tools: `sudo apt install -y dkms "linux-headers-$(uname -r)" bpftrace nvme-cli fio`.
 
+### Step 0b: NVIDIA driver gate for kernel-native P2PDMA (found live on the L40S, 2026-07-02)
+
+cuFile's kernel-native path needs the GPU BAR1 registered as kernel p2pdma
+memory, which takes **both** of:
+
+1. **Open driver >= 595 on >= 6.15 kernels.** 580.x's UVM requires free p2pdma
+   pages at refcount 1, but kernel commit b7e282378773 (>= ~6.15) initializes
+   them at 0 → `UVM_ALLOC_DEVICE_P2P` always fails `NV_ERR_INVALID_ARGUMENT`,
+   cuFile logs "Failed to get cuda p2p device address ... CUDA_ERROR_INVALID_VALUE"
+   and driver-open errors 5001. 595.71.05+ carries the fix
+   (`set_page_count(page, 1)` in `alloc_device_p2p_mem`).
+2. **Two RM regkeys** (static BAR1 + uncached BAR1 iomap — WC mapping blocks
+   UVM's `pci_p2pdma_add_resource`):
+
+```bash
+printf 'options nvidia NVreg_RegistryDwords="RMForceStaticBar1=1;RmForceDisableIomapWC=1"\n' \
+    | sudo tee /etc/modprobe.d/nvidia-gds-p2pdma.conf
+sudo systemctl stop nvidia-dcgm nvidia-persistenced 2>/dev/null
+sudo modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia && sudo modprobe nvidia nvidia_uvm nvidia_drm
+sudo systemctl start nvidia-persistenced nvidia-dcgm 2>/dev/null
+cat /sys/bus/pci/devices/0000:XX:00.0/p2pmem/size   # want: BAR1 size (e.g. 68719476736) per GPU
+```
+
+No `p2pmem/` dir after a CUDA context touches the GPU → the regkeys or the
+driver version gate above is not met; P1 will fail with map_hits=0.
+
 ## Step 1: install + partitions
 
 ```bash
 tar xzf /opt/gds-kit-0.1.0.tar.gz -C /opt && cd /opt/gds-kit-0.1.0
 sudo ./install.sh                             # dkms featured variant + modprobe + udev rule
+sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm   # REQUIRED: the udev rule's IMPORT{program}
+                                              # runs /usr/sbin/msadm; install.sh does not install
+                                              # it (known gap) and without it /dev/msN gets NO
+                                              # MD_* properties -> cuFile "Unsupported block device"
 grep Personalities /proc/msstat               # want: [raid1] [raid10]
 sudo bin/perf-make-test-partitions /dev/nvmeXnY    # 4K-LBA NVMe with trailing free space
 ls /dev/disk/by-partlabel/*-meshstor-test-*   # want: >=2 labels (4, across two drives, for raid10 fabric)
@@ -53,6 +85,27 @@ Pick the `-d` GPU index with the tightest PCIe path to the NVMe (step 0's topo o
 
 ## Step 3: the main run (p0–p5; p6 runs separately — see step 5)
 
+**cuFile 1.15 gate (found live): cuFile registers files only on `MD_LEVEL=raid0`
+arrays** — raid1/raid10 are refused in userspace ("RAID level not supported by
+cuFile for RAID group"), *identically for in-tree kernel md*, so this is cuFile
+policy, not the ms rename. For the kernel-path phases (p1/p2) to run natively,
+install this TEST-ONLY override first, and remove it when done:
+
+```bash
+printf 'SUBSYSTEM=="block", KERNEL=="ms*", ENV{MD_LEVEL}="raid0"\n' \
+    | sudo tee /run/udev/rules.d/64-ms-raid0-spoof.rules
+sudo udevadm control --reload
+# ... campaign ...
+sudo rm -f /run/udev/rules.d/64-ms-raid0-spoof.rules && sudo udevadm control --reload
+```
+
+The spoof only lifts cuFile's userspace level policy; the kernel still performs
+real raid1/raid10 mirroring, which the witness + leg-compare then prove
+(L40S evidence: p2p_bios=520, map_hits=779, legs identical). `/run` placement
+means it disappears on reboot. **Never ship it**: cuFile also derives member
+checks from the level, and production behavior on a lied-to cuFile is untested
+beyond these probes.
+
 ```bash
 sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign \
      --phases p0,p1,p2,p3,p4,p5 --results /root/gds-results
@@ -62,10 +115,10 @@ column -t -s $'\t' /root/gds-results/verdict.tsv 2>/dev/null || cat /root/gds-re
 The campaign continues past failures; it stops only on a node-heartbeat wedge
 (exit 3). Read `verdict.tsv`, not just the exit code. Two **expected** oddities:
 
-- **`merge_control` FAIL when the NVMe scheduler is `none`.** No observable
-  request merges exist even on a raw device (confirmed with no md involved).
-  Check `cat /sys/block/<dev>/queue/scheduler`; a FAIL while it reads `none`
-  is environment noise, not a p2pdma regression.
+- **`merge_control` FAIL on fast NVMe.** Zero observable request merges occur
+  even on a raw partition with *no md* and `mq-deadline` set (confirmed on
+  PM9A3: requests dispatch before they can queue). Treat the FAIL as
+  environment noise, not a p2pdma regression.
 - **p5 restore check:** after p5, confirm the featured package is back —
   `dkms status | grep meshstor` must show `*.gds1`. If the campaign aborted
   with exit 3 during p5, the box is on the BASELINE module: rerun
@@ -84,9 +137,21 @@ sudo MSADM=$PWD/bin/mdadm-ms bin/probe-cufile-recognition /mnt/ms0 |& tee /root/
 sudo umount /mnt/ms0 && sudo $PWD/bin/mdadm-ms --stop /dev/ms0
 ```
 
-Exit 0 = cuFile takes real GDS on `/dev/ms0`. Exit 1 = compat fallback — the
-kernel side may still be perfect (the witness proves that); the failure is
-cuFile's userspace classification of the `ms` naming. See briefing §4.6.
+Exit 0 = cuFile takes real GDS on `/dev/ms0` (L40S-confirmed: per-I/O TRACE
+`p2p mode: 1 compat: 0`; cuFile never exec'd mdadm — it reads the udev DB and
+sysfs only). Exit 1 = compat fallback; the kernel side may still be perfect
+(the witness proves that). Failure ladder as diagnosed live (§4.6):
+
+1. No `MD_*` properties on `/dev/ms0` → `/usr/sbin/msadm` missing (step 1) or
+   rule not triggered (`sudo udevadm trigger --subsystem-match=block
+   --action=change /dev/ms0; udevadm settle`).
+2. `MD_LEVEL:raid1` present but "RAID level not supported by cuFile" →
+   **cuFile 1.15 raid0-only policy** (libcufile contains exactly one level
+   string, "raid0"; stock md raid1 is rejected identically). Needs the step-3
+   spoof for kernel-path evidence; **escalate as a product finding** — CSI
+   raid1/raid10 volumes cannot do cuFile-native GDS on this cuFile release.
+3. "unknown NVMe transport type ... transport: tcp" → cuFile also rejects
+   nvme-tcp RAID members in userspace (its own member-transport AND).
 
 ## Step 5: p6 divergence repro — its OWN invocation (p4 traffic makes udev reload in-tree raid1, which steals the kprobe symbol and p6 SKIPs)
 
@@ -153,6 +218,15 @@ sudo ./install.sh && dkms status | grep gds1
 Whatever happens (INVAL errors, works-but-slow, oops) **is** the finding — save
 it verbatim. Never leave the box on baseline.
 
+**Observed outcome on the L40S (2026-07-02, cuFile 1.15):** benign refusal.
+Even with the step-3 level spoof in place, cuFile rejected the array in
+userspace *before any kernel I/O* — "unknown NVMe transport type for device:
+nvmeXnY transport: tcp" → "RAID member not supported" — witness all-zero,
+dmesg clean. cuFile independently ANDs member transports, so the kernel
+false-advertise is not reachable through cuFile file I/O on this stack; the
+residual exposure is limited to non-cuFile p2pdma producers. Evidence:
+`gds-results/p5-manual/`.
+
 ## Copy off the box (BEFORE the window ends)
 
 ```bash
@@ -178,3 +252,16 @@ advertises with a tcp leg (justifies the fork's member-AND); p6 = BLK_STS_INVAL
 silent divergence reproduced (evidence for the fail-the-write follow-up);
 step 4's probe = cuFile actually classifies `/dev/msN` as RAID and takes the
 real P2P path (the kernel flag alone is necessary, not sufficient).
+
+## L40S 2026-07-02 outcome snapshot (gpu-cluster-manassas, 6.17.0-35, nvidia 595.71.05)
+
+All of the above achieved except two hardware impossibilities on that box:
+P3 real-RoCE (mlx5 ports uncabled; answered on rxe, labeled UNREPRESENTATIVE:
+nvme-rdma loopback leg does NOT advertise on 6.17) and P6 (root fs on in-tree
+md RAID1 → `raid1.ko` unremovable → guard SKIPs; repro stays banked from the
+dev box, injected=64). P2 kernel-witnessed under the step-3 spoof:
+p2p_bios=520 / map_hits=779 / legs identical; recognition probe rc=0.
+Standing product escalations: (1) cuFile 1.15 is raid0-only — CSI raid1/raid10
+volumes cannot do cuFile-native GDS without an NVIDIA-side change or a
+level-presentation shim; (2) kit install.sh must install `/usr/sbin/msadm`.
+Full chain of custody: `FINDINGS.md` inside the evidence tarball.
