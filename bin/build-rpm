@@ -9,7 +9,23 @@
 # Default rpmbuild topdir: build/rpmbuild
 set -euo pipefail
 
-VER="${1:?usage: $0 <version> [<rpmbuild_topdir>]}"
+PKG=ms
+ARGS=()
+while (($#)); do
+    case "$1" in
+        --pkg) PKG="${2:?--pkg needs a value}"; shift 2 ;;
+        *)     ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+case "$PKG" in
+    ms)        PKGNAME=meshstor-ms;        TARBALL_SCRIPT=build-tarball ;;
+    nvme-rdma) PKGNAME=meshstor-nvme-rdma; TARBALL_SCRIPT=build-nvme-tarball ;;
+    *) echo "error: unknown --pkg '$PKG' (supported: ms, nvme-rdma)" >&2; exit 2 ;;
+esac
+TEMPLATE_DIR=dkms; [ "$PKG" = nvme-rdma ] && TEMPLATE_DIR=dkms-nvme
+
+VER="${1:?usage: $0 [--pkg ms|nvme-rdma] <version> [<rpmbuild_topdir>]}"
 # RPM's `Version:` tag forbids '-' (it is the Version-Release separator).
 # Translate it to '~' for that field only — the rest of the pipeline (tarball
 # name, unpacked dir, DKMS module version) keeps the original dashed form,
@@ -23,22 +39,22 @@ TOPDIR="$(realpath -m "${2:-$REPO_ROOT/build/rpmbuild}")"
 cd "$REPO_ROOT"
 
 # 1. Build the DKMS tarball.
-"$REPO_ROOT/bin/build-tarball" "$VER"
+"$REPO_ROOT/bin/$TARBALL_SCRIPT" "$VER"
 
 # 2. Stage rpmbuild tree.
 mkdir -p "$TOPDIR"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
-cp "$REPO_ROOT/build/meshstor-ms-${VER}.dkms.tar.gz" "$TOPDIR/SOURCES/"
+cp "$REPO_ROOT/build/${PKGNAME}-${VER}.dkms.tar.gz" "$TOPDIR/SOURCES/"
 
 # 3. Render spec.
 sed -e "s/@VERSION@/$RPM_VER/g" \
     -e "s/@MODULE_VERSION@/$VER/g" \
     -e "s/@CHANGELOG_DATE@/$(LC_ALL=C date '+%a %b %d %Y')/" \
-    "$REPO_ROOT/dkms/rpm/meshstor-ms-dkms.spec.in" \
-    > "$TOPDIR/SPECS/meshstor-ms-dkms.spec"
+    "$REPO_ROOT/$TEMPLATE_DIR/rpm/${PKGNAME}-dkms.spec.in" \
+    > "$TOPDIR/SPECS/${PKGNAME}-dkms.spec"
 
 # 4. Build.
-rpmbuild --define "_topdir $TOPDIR" -bb "$TOPDIR/SPECS/meshstor-ms-dkms.spec"
+rpmbuild --define "_topdir $TOPDIR" -bb "$TOPDIR/SPECS/${PKGNAME}-dkms.spec"
 
 echo
 echo "=== Output ==="
-find "$TOPDIR/RPMS" -name "meshstor-ms-dkms-${RPM_VER}-*.rpm" -exec ls -la {} \;
+find "$TOPDIR/RPMS" -name "${PKGNAME}-dkms-${RPM_VER}-*.rpm" -exec ls -la {} \;
