@@ -37,12 +37,43 @@ package cannot.
 
 1. `bin/vendor-nvme-sources [--u2404 TAG] [--u2604 TAG] [--rhel10 NVR]`
    (defaults to latest; exit 3 = files changed).
-2. If a vendored `rdma.c` changed, regenerate that variant's patch: the
-   awk insertion + `diff -u` procedure in
-   `docs/superpowers/plans/2026-07-02-nvme-rdma-p2pdma-dkms.md` Task 2
-   (helper before the `nvme_rdma_ctrl_ops` table, member as its last
-   entry), then re-run
-   `bash tools/testing/selftests/dkms/test_nvme_tarball_assembles.sh`.
+2. For each variant `V` whose vendored `rdma.c` changed, regenerate that
+   variant's patch:
+
+   ```bash
+   V=rhel10   # or u2404-hwe / u2604
+   d="$(mktemp -d)"
+   cp "dkms-nvme/vendor/$V/rdma.c" "$d/a-rdma.c"
+   cp "dkms-nvme/vendor/$V/rdma.c" "$d/b-rdma.c"
+
+   # (a) insert the capability-check helper immediately before the
+   #     nvme_ctrl_ops table it feeds.
+   perl -0pi -e 's/(static const struct nvme_ctrl_ops nvme_rdma_ctrl_ops = \{)/static bool nvme_rdma_supports_pci_p2pdma(struct nvme_ctrl *ctrl)\n\{\n\tstruct nvme_rdma_ctrl *r_ctrl = to_rdma_ctrl(ctrl);\n\n\treturn ib_dma_pci_p2p_dma_supported(r_ctrl->device->dev);\n}\n\n$1/' "$d/b-rdma.c"
+
+   # (b) wire the op into the table, immediately before its closing "};"
+   #     (scoped to the ops-table block so it doesn't match some other
+   #     struct's closing brace earlier in the file).
+   perl -0pi -e 's/(static const struct nvme_ctrl_ops nvme_rdma_ctrl_ops = \{.*?\n)\};\n/$1\t.supports_pci_p2pdma\t= nvme_rdma_supports_pci_p2pdma,\n};\n/s' "$d/b-rdma.c"
+
+   {
+       echo "Backport of upstream 23528aa3320a (\"nvme: enable PCI P2PDMA support"
+       echo "for RDMA transport\", first in v7.1-rc2) onto the $V vendored rdma.c."
+       echo "Applied by bin/build-nvme-tarball: patch -p1 --fuzz=0 -d <variant dir>."
+       echo "Regeneration after re-vendoring: dkms-nvme/README.md, 'Refreshing'."
+       echo
+       diff -u --label a/rdma.c --label b/rdma.c "$d/a-rdma.c" "$d/b-rdma.c"
+   } > "dkms-nvme/patches/$V/0001-nvme-rdma-enable-pci-p2pdma.patch"
+   ```
+
+   The `--label` form keeps the diff free of embedded timestamps
+   (deliberate improvement over the original hand-generation). Verify it
+   applies clean before trusting it:
+
+   ```bash
+   patch -p1 --dry-run --fuzz=0 -d dkms-nvme/vendor/$V \
+       < "dkms-nvme/patches/$V/0001-nvme-rdma-enable-pci-p2pdma.patch"
+   bash tools/testing/selftests/dkms/test_nvme_tarball_assembles.sh
+   ```
 3. Rebuild + redeploy the package.
 
 ## Caveats

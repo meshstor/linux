@@ -50,10 +50,27 @@ cp -a . %{buildroot}/usr/src/%{pkgname}-%{module_version}/
 dkms add -m %{pkgname} -v %{module_version} || :
 dkms build -m %{pkgname} -v %{module_version} || :
 dkms install -m %{pkgname} -v %{module_version} || :
+# Non-fatal: for this package a failed DKMS build is invisible otherwise —
+# the stock in-tree nvme-rdma keeps loading and P2PDMA is silently absent.
+# Also fires (truthfully) on a kernel outside BUILD_EXCLUSIVE_KERNEL, where
+# DKMS skips the build by design; that's an expected, not an error, case.
+if ! dkms status -m %{pkgname} -v %{module_version} 2>/dev/null | grep -q installed; then
+    echo "WARNING: meshstor-nvme-rdma %{module_version} is NOT active for $(uname -r);" >&2
+    echo "         the in-tree nvme-rdma (no PCI P2PDMA) remains in use." >&2
+    echo "         Check: dkms status; /var/lib/dkms/%{pkgname}/%{module_version}/build/make.log" >&2
+fi
 
 %preun
+# $1 = 0: erase (last/only version being removed). $1 = 1: upgrade — rpm
+# runs the NEW package's %post (which dkms-adds/builds/installs the new
+# version) BEFORE the OLD package's %preun, so by the time we get here the
+# old version's DKMS registration is stale (its /usr/src tree is about to
+# be erased) but the new version is already active. Remove the old
+# registration unconditionally on both paths; only refresh module indexes
+# on erase, since on upgrade the new version's modules are already in place
+# and a stale/rebuilt index is a no-op either way.
+dkms remove -m %{pkgname} -v %{module_version} --all || :
 if [ "$1" = "0" ]; then
-    dkms remove -m %{pkgname} -v %{module_version} --all || :
     # The override is gone; refresh module indexes so the in-tree
     # nvme-rdma is found again without waiting for the next depmod.
     for kdir in /usr/lib/modules/*; do
