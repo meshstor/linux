@@ -579,25 +579,6 @@ static void raid1_end_write_request(struct bio *bio)
 		bio_put(to_put);
 }
 
-static sector_t align_to_barrier_unit_end(sector_t start_sector,
-					  sector_t sectors)
-{
-	sector_t len;
-
-	WARN_ON(sectors == 0);
-	/*
-	 * len is the number of sectors from start_sector to end of the
-	 * barrier unit which start_sector belongs to.
-	 */
-	len = round_up(start_sector + 1, BARRIER_UNIT_SECTOR_SIZE) -
-	      start_sector;
-
-	if (len > sectors)
-		len = sectors;
-
-	return len;
-}
-
 static void update_read_sectors(struct r1conf *conf, int disk,
 				sector_t this_sector, int len)
 {
