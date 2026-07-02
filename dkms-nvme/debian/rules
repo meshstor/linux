@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# debian/rules for meshstor-nvme-rdma-dkms
+# DKMS handles compilation per-kernel; the package itself is just a source drop.
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Nothing to build at package time; DKMS does it per-kernel.
+
+override_dh_auto_install:
+	# Source tree is installed via dkms.install file pattern.
+
+override_dh_install:
+	# The *.install glob (`*`) matches the top-level debian/ staging dir
+	# itself; exclude it so dh_install doesn't try to copy debian/ into
+	# its own subtree.
+	dh_install -X debian

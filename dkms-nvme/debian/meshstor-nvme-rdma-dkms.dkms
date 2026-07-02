@@ -1,0 +1,12 @@
+PACKAGE_NAME="meshstor-nvme-rdma"
+PACKAGE_VERSION="#MODULE_VERSION#"
+
+MAKE[0]="make -j$(nproc) KDIR=/lib/modules/${kernelver}/build KVER=${kernelver}"
+CLEAN="make clean"
+
+BUILT_MODULE_NAME[0]="nvme-rdma"
+DEST_MODULE_LOCATION[0]="/updates"
+
+AUTOINSTALL="yes"
+NO_WEAK_MODULES="yes"
+BUILD_EXCLUSIVE_KERNEL="^(6\.12\..*\.el10|6\.17\..*-generic|7\.0\..*-generic)"
