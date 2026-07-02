@@ -42,6 +42,7 @@ for t in curl git rpm2cpio cpio xz tar; do
         || { echo "error: required tool '$t' not installed" >&2; exit 1; }
 done
 
+mkdir -p "$REPO_ROOT/build"
 TMP="$(mktemp -d "$REPO_ROOT/build/vendor-nvme.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -63,6 +64,10 @@ write_provenance() { # $1=variant  $2=source line  $3=ref line  $4=reverify line
     } > "$dir/PROVENANCE"
 }
 
+files_changed() { # $1=variant -> true if any of its 3 vendored files differ from the committed tree
+    git -C "$REPO_ROOT" status --porcelain -- "${FILES[@]/#/dkms-nvme/vendor/$1/}" | grep -q .
+}
+
 fetch_launchpad() { # $1=variant  $2=repo url  $3=tag  $4=pin flag name
     local variant="$1" repo="$2" tag="$3" flag="$4" f
     mkdir -p "$VENDOR/$variant"
@@ -70,8 +75,10 @@ fetch_launchpad() { # $1=variant  $2=repo url  $3=tag  $4=pin flag name
         curl -fsS "$repo/plain/drivers/nvme/host/$f?h=$tag" \
             -o "$VENDOR/$variant/$f"
     done
-    write_provenance "$variant" "$repo" "$tag" \
-        "bin/vendor-nvme-sources $flag $tag && git diff --exit-code dkms-nvme/vendor/$variant"
+    if [[ ! -f "$VENDOR/$variant/PROVENANCE" ]] || files_changed "$variant"; then
+        write_provenance "$variant" "$repo" "$tag" \
+            "bin/vendor-nvme-sources $flag $tag && git diff --exit-code dkms-nvme/vendor/$variant"
+    fi
     echo "vendored $variant  <-  $tag"
 }
 
@@ -85,6 +92,7 @@ fetch_rocky() { # $1=NVR like 6.12.0-211.26.1.el10_2, or empty = latest
     else
         srpm="kernel-$nvr.src.rpm"
     fi
+    nvr="${srpm#kernel-}"; nvr="${nvr%.src.rpm}"
     mkdir -p "$VENDOR/rhel10"
     echo "downloading $srpm (large; a few hundred MB)"
     curl -fS -o "$TMP/$srpm" "$ROCKY_SRC/$srpm"
@@ -96,8 +104,10 @@ fetch_rocky() { # $1=NVR like 6.12.0-211.26.1.el10_2, or empty = latest
     for f in "${FILES[@]}"; do
         cp "$TMP"/linux-*/drivers/nvme/host/"$f" "$VENDOR/rhel10/$f"
     done
-    write_provenance rhel10 "$ROCKY_SRC/$srpm" "${srpm%.src.rpm}" \
-        "bin/vendor-nvme-sources --rhel10 ${srpm#kernel-} && git diff --exit-code dkms-nvme/vendor/rhel10"
+    if [[ ! -f "$VENDOR/rhel10/PROVENANCE" ]] || files_changed rhel10; then
+        write_provenance rhel10 "$ROCKY_SRC/$srpm" "$nvr" \
+            "bin/vendor-nvme-sources --rhel10 $nvr && git diff --exit-code dkms-nvme/vendor/rhel10"
+    fi
 }
 
 [[ -n "$U2404_TAG" ]] || U2404_TAG="$(latest_tag "$NOBLE_GIT" 'Ubuntu-hwe-6.17-*')"
