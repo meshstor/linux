@@ -11,13 +11,29 @@ false so its callers (REQ_NOMERGE preserve, write-behind skip) still build.
 raid1_p2pdma_clear_on_add() folds to an empty inline stub so the four call sites
 become no-ops with no per-call gating.
 
+Stage-1 fail-the-write (branch p2pdma) adds error-path sites on top: raid1/raid10
+tag P2P master bios at submit (set_bit R1BIO_P2P / R10BIO_P2P keyed on
+md_bio_is_p2pdma()); a leg completing BLK_STS_INVAL/BLK_STS_TARGET on a tagged
+bio marks R1BIO_P2PError/R10BIO_P2PError and fails the whole write loud
+(master forced to BLK_STS_INVAL in call_bio_endio / raid_end_bio_io) instead of
+silently diverging the mirrors; reads keep their real status. Gate the six
+consumers: the two end_write_request completion arms, both master-status
+overrides, and both end_read_request read-fidelity blocks. The R1BIO_P2P*/
+R10BIO_P2P* enum bits and the submit-time detection sites stay deliberately
+UNGATED: with md_bio_is_p2pdma() folded to constant false,
+`if (md_bio_is_p2pdma(bio)) set_bit(...)` is provably dead code the compiler
+discards, so gating them would add #ifdef noise for zero object-code change.
+The write-arm gate rewrites `} else if (...)` to `} else` + `#endif` + `if (...)`
+so the flag-off preprocess reduces to the pre-feature `if/else if/else` chain
+with braces balanced in both personalities.
+
 Source-level, not a header shim: it adds preprocessor structure to drivers/md.
 
 diff --git a/md.h b/md.h
-index d1c7fc08..050221d3 100644
+index bee2420..4daf5a1 100644
 --- a/md.h
 +++ b/md.h
-@@ -36,8 +36,12 @@
+@@ -39,8 +39,12 @@
   */
  static inline bool md_bio_is_p2pdma(struct bio *bio)
  {
@@ -31,7 +47,7 @@ index d1c7fc08..050221d3 100644
  /*
   * Number of guaranteed raid bios in case of extreme VM load:
 diff --git a/raid1-10.c b/raid1-10.c
-index fa907a12..d938d532 100644
+index 9113e8d..f6e2fb4 100644
 --- a/raid1-10.c
 +++ b/raid1-10.c
 @@ -304,6 +304,7 @@ static inline bool raid1_should_handle_error(struct bio *bio)
@@ -51,10 +67,53 @@ index fa907a12..d938d532 100644
 +					     struct md_rdev *rdev) { }
 +#endif
 diff --git a/raid1.c b/raid1.c
-index dab72170..1ce30346 100644
+index 0db5753..a3b3baf 100644
 --- a/raid1.c
 +++ b/raid1.c
-@@ -3234,8 +3234,10 @@ static int raid1_set_limits(struct mddev *mddev)
+@@ -324,8 +324,10 @@ static void call_bio_endio(struct r1bio *r1_bio)
+ 
+ 	if (!test_bit(R1BIO_Uptodate, &r1_bio->state))
+ 		bio->bi_status = BLK_STS_IOERR;
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 	if (test_bit(R1BIO_P2PError, &r1_bio->state))
+ 		bio->bi_status = BLK_STS_INVAL;
++#endif
+ 
+ 	bio_endio(bio);
+ }
+@@ -404,10 +406,12 @@ static void raid1_end_read_request(struct bio *bio)
+ 		 * want to retry */
+ 		;
+ 	} else if (!raid1_should_handle_error(bio)) {
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 		if (test_bit(R1BIO_P2P, &r1_bio->state) &&
+ 		    (bio->bi_status == BLK_STS_INVAL ||
+ 		     bio->bi_status == BLK_STS_TARGET))
+ 			set_bit(R1BIO_P2PError, &r1_bio->state);
++#endif
+ 		uptodate = 1;
+ 	} else {
+ 		/* If all other devices have failed, we want to return
+@@ -488,6 +492,7 @@ static void raid1_end_write_request(struct bio *bio)
+ 	/*
+ 	 * 'one mirror IO has finished' event handler:
+ 	 */
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 	if (bio->bi_status && test_bit(R1BIO_P2P, &r1_bio->state) &&
+ 	    (bio->bi_status == BLK_STS_INVAL ||
+ 	     bio->bi_status == BLK_STS_TARGET)) {
+@@ -507,7 +512,9 @@ static void raid1_end_write_request(struct bio *bio)
+ 				    blk_status_to_errno(bio->bi_status));
+ 		r1_bio->bios[mirror] = NULL;
+ 		to_put = bio;
+-	} else if (bio->bi_status && !ignore_error) {
++	} else
++#endif
++	if (bio->bi_status && !ignore_error) {
+ 		set_bit(WriteErrorSeen,	&rdev->flags);
+ 		if (!test_and_set_bit(WantReplacement, &rdev->flags))
+ 			set_bit(MD_RECOVERY_NEEDED, &
+@@ -3267,8 +3274,10 @@ static int raid1_set_limits(struct mddev *mddev)
  	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
  	if (err)
  		return err;
@@ -66,10 +125,53 @@ index dab72170..1ce30346 100644
  }
  
 diff --git a/raid10.c b/raid10.c
-index 7cb477cb..343d3679 100644
+index c142ee9..6c9e180 100644
 --- a/raid10.c
 +++ b/raid10.c
-@@ -3965,8 +3965,10 @@ static int raid10_set_queue_limits(struct mddev *mddev)
+@@ -325,8 +325,10 @@ static void raid_end_bio_io(struct r10bio *r10_bio)
+ 	if (!test_and_set_bit(R10BIO_Returned, &r10_bio->state)) {
+ 		if (!test_bit(R10BIO_Uptodate, &r10_bio->state))
+ 			bio->bi_status = BLK_STS_IOERR;
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 		if (test_bit(R10BIO_P2PError, &r10_bio->state))
+ 			bio->bi_status = BLK_STS_INVAL;
++#endif
+ 		bio_endio(bio);
+ 	}
+ 
+@@ -404,10 +406,12 @@ static void raid10_end_read_request(struct bio *bio)
+ 		 */
+ 		set_bit(R10BIO_Uptodate, &r10_bio->state);
+ 	} else if (!raid1_should_handle_error(bio)) {
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 		if (test_bit(R10BIO_P2P, &r10_bio->state) &&
+ 		    (bio->bi_status == BLK_STS_INVAL ||
+ 		     bio->bi_status == BLK_STS_TARGET))
+ 			set_bit(R10BIO_P2PError, &r10_bio->state);
++#endif
+ 		uptodate = 1;
+ 	} else {
+ 		/* If all other devices that store this block have
+@@ -481,6 +485,7 @@ static void raid10_end_write_request(struct bio *bio)
+ 	/*
+ 	 * this branch is our 'one mirror IO has finished' event handler:
+ 	 */
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 	if (bio->bi_status && test_bit(R10BIO_P2P, &r10_bio->state) &&
+ 	    (bio->bi_status == BLK_STS_INVAL ||
+ 	     bio->bi_status == BLK_STS_TARGET)) {
+@@ -502,7 +507,9 @@ static void raid10_end_write_request(struct bio *bio)
+ 		else
+ 			r10_bio->devs[slot].bio = NULL;
+ 		to_put = bio;
+-	} else if (bio->bi_status && !ignore_error) {
++	} else
++#endif
++	if (bio->bi_status && !ignore_error) {
+ 		if (repl)
+ 			/* Never record new bad blocks to replacement,
+ 			 * just fail it.
+@@ -3999,8 +4006,10 @@ static int raid10_set_queue_limits(struct mddev *mddev)
  	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
  	if (err)
  		return err;

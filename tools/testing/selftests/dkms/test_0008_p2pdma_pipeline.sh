@@ -141,10 +141,24 @@ assert_file_matches "$OUT/raid1_ms.c" '!ms_bio_is_p2pdma\(bio\)' \
 # feature branch: it stays upstream, with no is_pci_p2pdma_page check there.
 assert_file_not_matches "$OUT/raid1-10_ms.c" 'is_pci_p2pdma_page' \
 	"raid1_should_handle_error must carry NO P2P change"
-# base must NOT contain the deferred error-path/self-heal code (separate checks,
-# regex-dialect-agnostic):
-assert_file_not_matches "$OUT/raid1_ms.c" 'R1BIO_P2P' \
-	"base raid1 must not carry the deferred R1BIO_P2P/P2PError state"
+# --- stage-1 fail-the-write (branch p2pdma) survived the rename ----------
+# The R1BIO_P2P*/R10BIO_P2P* state bits carry no md_/MD_ substring, so the
+# rename pass must leave them byte-identical in the renamed headers/sources.
+assert_file_matches "$OUT/raid1_ms.h" 'R1BIO_P2PError' \
+	"R1BIO_P2PError state bit must survive the rename un-mangled in raid1_ms.h"
+assert_file_matches "$OUT/raid10_ms.h" 'R10BIO_P2PError' \
+	"R10BIO_P2PError state bit must survive the rename un-mangled in raid10_ms.h"
+assert_file_matches "$OUT/raid1_ms.c" 'R1BIO_P2PError' \
+	"raid1 error-path sites must reference R1BIO_P2PError after the rename"
+assert_file_matches "$OUT/raid10_ms.c" 'R10BIO_P2PError' \
+	"raid10 error-path sites must reference R10BIO_P2PError after the rename"
+# the completion arms match on BLK_STS_INVAL || BLK_STS_TARGET; TARGET is a
+# kernel token (no md_/MD_ substring) and must survive in both personalities
+assert_file_matches "$OUT/raid1_ms.c" 'BLK_STS_TARGET' \
+	"raid1 P2P completion arm must match BLK_STS_TARGET"
+assert_file_matches "$OUT/raid10_ms.c" 'BLK_STS_TARGET' \
+	"raid10 P2P completion arm must match BLK_STS_TARGET"
+# base must NOT contain the deferred self-heal code:
 assert_file_not_matches "$OUT/raid1_ms.c" 'dirty_bits' \
 	"base must not carry the deferred self-heal dirty_bits call"
 # is_pci_p2pdma_page is NOT orphaned -- ms.h still uses it via ms_bio_is_p2pdma:
@@ -158,6 +172,38 @@ assert_file_matches "$OUT/raid1_ms.c" '#ifdef HAVE_BLK_FEAT_PCI_P2PDMA' \
 	"the raid1 advertise block must be gated on HAVE_BLK_FEAT_PCI_P2PDMA"
 assert_file_not_matches "$OUT/raid1_ms.c" 'BLK_FEAT_PCI_P2PDMA.*MS_\|HAVE_BLK_FEAT_PCI_P2PMS' \
 	"the P2PDMA capability tokens must not be corrupted by the md_*->ms_* rename"
+
+# assert_gated FILE EXTENDED_REGEX MESSAGE -- the pattern must appear in FILE
+# and EVERY non-preprocessor occurrence must sit inside an
+# #ifdef HAVE_BLK_FEAT_PCI_P2PDMA span (its #else or matching #endif ends the
+# span; nested #if levels are tracked). Same scoped-awk style as the
+# raid1_write_request ordering check above.
+assert_gated() {
+	awk -v rx="$2" '
+		/^[ \t]*#[ \t]*if/    { st[++sp] = /#[ \t]*ifdef[ \t]+HAVE_BLK_FEAT_PCI_P2PDMA/ }
+		/^[ \t]*#[ \t]*else/  { if (sp) st[sp] = 0 }
+		/^[ \t]*#[ \t]*endif/ { if (sp) sp-- }
+		$0 ~ rx && $0 !~ /^[ \t]*#/ {
+			g = 0; for (i = 1; i <= sp; i++) if (st[i]) g = 1
+			if (g) found = 1; else bad = 1
+		}
+		END { exit !(found && !bad) }
+	' "$1" || dkms_fail "$3"
+}
+# The stage-1 consumers -- both end_write_request completion arms, both
+# master-status overrides, both end_read_request fidelity blocks -- must sit
+# inside HAVE_BLK_FEAT_PCI_P2PDMA regions (they reference R1BIO_P2PError /
+# BLK_STS_TARGET, which appear NOWHERE ungated in the .c personalities; the
+# ungated-by-design sites -- enum bits, submit-time set_bit(R1BIO_P2P,...)
+# detection -- never mention either token).
+assert_gated "$OUT/raid1_ms.c" 'R1BIO_P2PError' \
+	"every raid1 R1BIO_P2PError site must be inside a HAVE_BLK_FEAT_PCI_P2PDMA region"
+assert_gated "$OUT/raid1_ms.c" 'BLK_STS_TARGET' \
+	"every raid1 BLK_STS_TARGET match must be inside a HAVE_BLK_FEAT_PCI_P2PDMA region"
+assert_gated "$OUT/raid10_ms.c" 'R10BIO_P2PError' \
+	"every raid10 R10BIO_P2PError site must be inside a HAVE_BLK_FEAT_PCI_P2PDMA region"
+assert_gated "$OUT/raid10_ms.c" 'BLK_STS_TARGET' \
+	"every raid10 BLK_STS_TARGET match must be inside a HAVE_BLK_FEAT_PCI_P2PDMA region"
 
 # --- 4. it compiles as kernel modules with the feature present ----------
 if ! mk_out="$(make -C "$OUT" KDIR="$KDIR" -j"$(nproc)" 2>&1)"; then
