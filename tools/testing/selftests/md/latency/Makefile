@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0
 TEST_PROGS := \
 	latency-balance-raid1.sh \
-	latency-balance-raid10.sh
+	latency-balance-raid10.sh \
+	latency-balance-stress.sh
 
 TEST_FILES := lib.sh
 
