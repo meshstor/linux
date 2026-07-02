@@ -125,6 +125,58 @@ verify with `dpkg-deb --info`. The trade-off: no debhelper magic, so
 any future changes to `debian/control` field semantics need manual
 updates in this script.
 
+## The meshstor-nvme-rdma package (`dkms-nvme/`)
+
+A second, independent DKMS package: it rebuilds each target kernel's
+**own** `nvme-rdma` driver with upstream `23528aa3320a` ("nvme: enable
+PCI P2PDMA support for RDMA transport", first in v7.1-rc2) backported,
+and installs it to `/updates` where depmod prefers it over the in-tree
+module. No rename pass; the in-tree `nvme-core`/`nvme-fabrics` are used
+unchanged (the `supports_pci_p2pdma` op they consult exists since v6.0).
+Removing the package restores the stock driver.
+
+Supported kernel families — and only these (enforced by
+`BUILD_EXCLUSIVE_KERNEL`):
+
+| Variant     | Family           | Vendored from                        |
+|-------------|------------------|--------------------------------------|
+| `u2404-hwe` | `6.17.*-generic` | Launchpad noble `Ubuntu-hwe-6.17-*`  |
+| `u2604`     | `7.0.*-generic`  | Launchpad resolute `Ubuntu-7.0.0-*`  |
+| `rhel10`    | `6.12.*.el10*`   | Rocky 10 BaseOS kernel SRPM          |
+
+```bash
+bin/build-nvme-tarball 0.1.0            # tarball only
+bin/build-rpm --pkg nvme-rdma 0.1.0     # noarch rpm
+bin/build-deb --pkg nvme-rdma 0.1.0     # deb (native Debian/Ubuntu host)
+# Bare invocations (no --pkg) still build meshstor-ms, unchanged.
+```
+
+**Why per-target vendored sources and version-keyed variant selection —
+the one deliberate exception to the "gate on `HAVE_*`, never versions"
+rule.** `rdma.c` includes the private headers `nvme.h`/`fabrics.h`,
+which no linux-headers/kernel-devel package ships, and
+`struct nvme_ctrl` is shared *by layout* with the running `nvme-core`
+(MODVERSIONS does not catch drift for out-of-tree modules — modpost
+copies import CRCs from `Module.symvers` verbatim). There is nothing on
+the target system a capability grep could probe, so each family carries
+its own byte-identical vendored copy of the three files
+(`dkms-nvme/vendor/<variant>/`, provenance + sha256 recorded), selected
+by kernel release and cross-checked against `KDIR`'s `utsrelease.h`.
+Do not "fix" this into a `HAVE_*` probe.
+
+When a target distro moves (RHEL z-streams recur), re-vendor and check
+the backport patches still apply:
+
+```bash
+bin/vendor-nvme-sources        # exit 3 = files changed — re-check patches
+# per-variant pins: --u2404 TAG --u2604 TAG --rhel10 NVR
+```
+
+The patch-regeneration recipe and operational caveats (initramfs,
+Secure Boot, z-stream drift) live in
+[`dkms-nvme/README.md`](../dkms-nvme/README.md), which also ships
+inside the tarball.
+
 ## Signing infrastructure
 
 Three signing paths, in increasing order of operational cleanliness:

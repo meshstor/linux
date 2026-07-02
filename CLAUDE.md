@@ -60,6 +60,9 @@ the two personalities. RAID0/5/6 and md-cluster are intentionally out of scope
   (`rename.sed`), compat shims (`compat/compat.h`), structural patches
   (`patches/`), packaging templates (`dkms.conf.in`, `Makefile.in`, `debian/`,
   `rpm/`), and the manifest (`manifest.txt`) all live here.
+- **`dkms-nvme/` is ours alone too** — the standalone `meshstor-nvme-rdma`
+  package (nvme-rdma P2PDMA backport; see "Second package" below). Vendored
+  per-target kernel sources, backport patches, and its own templates.
 - `bin/` = build / perf / deploy helpers. `tools/testing/selftests/` = tests.
 - `build/`, `results/`, `.worktrees/`, `docs/superpowers/` are **gitignored**.
 
@@ -148,6 +151,29 @@ bin/build-deb-direct <ver> [outdir]   # cross-build a .deb from RHEL (dpkg-deb, 
 
 Both consume the same tarball. The rpm `dist` tag (`.el10`) is cosmetic; a
 noarch DKMS package is portable across distros.
+
+### Second package: meshstor-nvme-rdma (`dkms-nvme/`)
+
+Rebuilds each target kernel's **own** `nvme-rdma` with upstream `23528aa3320a`
+(PCI P2PDMA for the RDMA transport, v7.1) backported; overrides the in-tree
+module via `/updates` depmod priority. **No rename pass**; in-tree
+nvme-core/fabrics untouched. Exactly three kernel families
+(`BUILD_EXCLUSIVE_KERNEL`): Ubuntu 24.04 HWE 6.17 (`u2404-hwe`), Ubuntu 26.04
+7.0 (`u2604`), Rocky/RHEL 10 6.12 (`rhel10`).
+
+- Build: `bin/build-nvme-tarball <ver>`; package with
+  `bin/build-rpm|build-deb --pkg nvme-rdma <ver>` (bare invocations still
+  build meshstor-ms, unchanged).
+- **Variant selection is version-keyed — the one deliberate exception to the
+  `HAVE_*` rule.** `rdma.c` needs private headers (`nvme.h`, `fabrics.h`)
+  that headers packages don't ship, and `struct nvme_ctrl` is shared
+  by-layout with the running nvme-core, so there is nothing on the target a
+  capability grep could probe. Each family gets byte-identical vendored
+  sources (`dkms-nvme/vendor/`, provenance + sha256). Do not "fix" this into
+  a `HAVE_*` probe.
+- Re-vendor on distro moves: `bin/vendor-nvme-sources` (exit 3 = files
+  changed → re-check `dkms-nvme/patches/`). Regeneration recipe + caveats:
+  `dkms-nvme/README.md`; operator doc: `docs/build.md` § meshstor-nvme-rdma.
 
 ## Compat strategy (this is non-obvious — read before touching it)
 
