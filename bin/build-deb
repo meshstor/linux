@@ -34,7 +34,12 @@ esac
 
 VER="${1:?usage: $0 [--pkg ms|nvme-rdma] <version> [<staging_dir>]}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-STAGE="${2:-$REPO_ROOT/build/debbuild}"
+# Default staging dir is per-package so back-to-back builds of different
+# --pkg values don't rm -rf each other's output; ms keeps the historical
+# path so bare invocations are unchanged.
+DEFAULT_STAGE="$REPO_ROOT/build/debbuild"
+[ "$PKG" = ms ] || DEFAULT_STAGE="$REPO_ROOT/build/debbuild-$PKG"
+STAGE="${2:-$DEFAULT_STAGE}"
 
 if ! command -v dpkg-buildpackage >/dev/null 2>&1; then
     echo "ERROR: dpkg-buildpackage not found. Run on a Debian/Ubuntu host or container." >&2
