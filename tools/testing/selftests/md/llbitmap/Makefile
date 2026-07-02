@@ -20,8 +20,13 @@ TEST_PROGS := \
 	test_torn_state_write_error_llbitmap.sh \
 	test_torn_state_write_error_md_bitmap.sh \
 	test_assemble_kick_non_fresh.sh \
-	test_first_use_persists.sh
+	test_first_use_persists.sh \
+	test_lbs_stability.sh \
+	test_mode_a_chunksize_einval.sh
 
-TEST_FILES := lib.sh
+# evidence_stop_events_sync.sh is an evidence probe, not a pass/fail test:
+# it is shipped (TEST_FILES) but deliberately NOT in TEST_PROGS, so the harness
+# does not run it and bank a meaningless verdict. Run it by hand.
+TEST_FILES := lib.sh evidence_stop_events_sync.sh
 
 include ../../../lib.mk
