@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 TEST_PROGS := \
+	test_recovery_freeze_deadlock.sh \
 	test_resync_barrier_contention.sh
 
 TEST_FILES := lib.sh
