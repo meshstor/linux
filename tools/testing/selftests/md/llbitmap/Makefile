@@ -10,9 +10,11 @@
 TEST_PROGS := \
 	test_read_sb_unmap_highmem.sh \
 	test_cache_pages_enomem_double_free.sh \
+	test_classic_bitmap_double_degraded_re_add.sh \
 	test_first_use_persist_failure.sh \
 	test_first_use_persist_data_page_failure.sh \
 	test_grow_resize_pctl.sh \
+	test_recovery_degraded_writes.sh \
 	test_resize_race_concurrent_write.sh \
 	test_shrink_regrow_stale_state.sh \
 	test_torn_state_write_error_llbitmap.sh \
