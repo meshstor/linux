@@ -72,10 +72,10 @@ struct r10conf {
 	struct bio_list		pending_bio_list;
 
 	seqlock_t		resync_lock;
-	atomic_t		nr_pending;
-	int			nr_waiting;
-	int			nr_queued;
-	int			barrier;
+	atomic_t		*nr_pending;
+	atomic_t		*nr_waiting;
+	atomic_t		*nr_queued;
+	atomic_t		*barrier;
 	int			array_freeze_pending;
 	sector_t		next_resync;
 	int			fullsync;  /* set to 1 if a full sync is needed,
