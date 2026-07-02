@@ -1,0 +1,23 @@
+Source: meshstor-nvme-rdma-dkms
+Section: kernel
+Priority: optional
+Maintainer: Meshstor <support@example.com>
+Build-Depends: debhelper (>= 13)
+Standards-Version: 4.6.2
+Homepage: https://example.com/meshstor-ms
+
+Package: meshstor-nvme-rdma-dkms
+Architecture: all
+Depends: dkms (>= 3.0), ${misc:Depends}
+Recommends: linux-headers-generic
+Description: nvme-rdma host driver with PCI P2PDMA support (DKMS backport)
+ Rebuilds the running kernel's own nvme-rdma module with the upstream
+ v7.1 commit 23528aa3320a ("nvme: enable PCI P2PDMA support for RDMA
+ transport") backported, installed to updates/dkms where depmod prefers
+ it over the in-tree module. In-tree nvme-core and nvme-fabrics are
+ used unchanged; removing this package restores the stock module.
+ .
+ Supported kernel families: Ubuntu 24.04 HWE (6.17.*-generic),
+ Ubuntu 26.04 (7.0.*-generic), RHEL/Rocky 10 (6.12.*.el10). Other
+ kernels are skipped via BUILD_EXCLUSIVE_KERNEL and keep their stock
+ driver.

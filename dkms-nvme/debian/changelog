@@ -1,0 +1,9 @@
+meshstor-nvme-rdma-dkms (#MODULE_VERSION#-1) unstable; urgency=medium
+
+  * DKMS backport of nvme-rdma PCI P2PDMA support (upstream 23528aa3320a,
+    v7.1-rc2) for Ubuntu 24.04 HWE (6.17), Ubuntu 26.04 (7.0), and
+    RHEL/Rocky 10 (6.12.el10).
+  * Overrides the in-tree module via updates/dkms depmod priority;
+    in-tree nvme-core/nvme-fabrics unchanged.
+
+ -- Meshstor <support@example.com>  Thu, 02 Jul 2026 12:00:00 +0000

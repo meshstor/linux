@@ -17,7 +17,22 @@
 # Usage: bin/build-deb <version> [<staging_dir>]
 set -euo pipefail
 
-VER="${1:?usage: $0 <version> [<staging_dir>]}"
+PKG=ms
+ARGS=()
+while (($#)); do
+    case "$1" in
+        --pkg) PKG="${2:?--pkg needs a value}"; shift 2 ;;
+        *)     ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+case "$PKG" in
+    ms)        PKGNAME=meshstor-ms;        TARBALL_SCRIPT=build-tarball;      TEMPLATE_DIR=dkms ;;
+    nvme-rdma) PKGNAME=meshstor-nvme-rdma; TARBALL_SCRIPT=build-nvme-tarball; TEMPLATE_DIR=dkms-nvme ;;
+    *) echo "error: unknown --pkg '$PKG' (supported: ms, nvme-rdma)" >&2; exit 2 ;;
+esac
+
+VER="${1:?usage: $0 [--pkg ms|nvme-rdma] <version> [<staging_dir>]}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 STAGE="${2:-$REPO_ROOT/build/debbuild}"
 
@@ -28,16 +43,16 @@ if ! command -v dpkg-buildpackage >/dev/null 2>&1; then
 fi
 
 cd "$REPO_ROOT"
-"$REPO_ROOT/bin/build-tarball" "$VER"
+"$REPO_ROOT/bin/$TARBALL_SCRIPT" "$VER"
 
 # Stage <pkg>-<version>/ with debian/ inside.
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "$REPO_ROOT/build/meshstor-ms-${VER}.dkms.tar.gz" "$STAGE/"
+cp "$REPO_ROOT/build/${PKGNAME}-${VER}.dkms.tar.gz" "$STAGE/"
 cd "$STAGE"
-tar xzf "meshstor-ms-${VER}.dkms.tar.gz"
-PKGDIR="$STAGE/meshstor-ms-${VER}"
-cp -r "$REPO_ROOT/dkms/debian" "$PKGDIR/debian"
+tar xzf "${PKGNAME}-${VER}.dkms.tar.gz"
+PKGDIR="$STAGE/${PKGNAME}-${VER}"
+cp -r "$REPO_ROOT/$TEMPLATE_DIR/debian" "$PKGDIR/debian"
 
 # Substitute #MODULE_VERSION# in debian/* templates.
 find "$PKGDIR/debian" -type f -exec sed -i "s/#MODULE_VERSION#/${VER}/g" {} \;
@@ -47,4 +62,4 @@ dpkg-buildpackage -us -uc -b
 
 echo
 echo "=== Output ==="
-ls -la "$STAGE/meshstor-ms-dkms_${VER}"*.deb 2>/dev/null
+ls -la "$STAGE/${PKGNAME}-dkms_${VER}"*.deb 2>/dev/null
