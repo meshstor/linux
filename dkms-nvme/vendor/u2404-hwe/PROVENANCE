@@ -1,0 +1,9 @@
+# Provenance of dkms-nvme/vendor/u2404-hwe — written by bin/vendor-nvme-sources
+# Vendored: 2026-07-02T16:57:14Z
+source: https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/noble
+ref: Ubuntu-hwe-6.17-6.17.0-35.35_24.04.1
+re-verify: bin/vendor-nvme-sources --u2404 Ubuntu-hwe-6.17-6.17.0-35.35_24.04.1 && git diff --exit-code dkms-nvme/vendor/u2404-hwe
+# sha256 of vendored files:
+f3118aa3cf1f7831396787d0f7461ade46100243e0501becd61d142860348a5c  rdma.c
+6d2cf811402acd1647445ab3f9da47ef682fe9a2e434b2a63cde55f1e7296fdf  nvme.h
+d7a07390e1b5cbb01f146af8d22a9d1a68bc14e9134543bc64a2728898bfe06c  fabrics.h
