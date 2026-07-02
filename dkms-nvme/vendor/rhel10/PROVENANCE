@@ -2,7 +2,7 @@
 # Vendored: 2026-07-02T16:59:04Z
 source: https://dl.rockylinux.org/pub/rocky/10/BaseOS/source/tree/Packages/k/kernel-6.12.0-211.26.1.el10_2.src.rpm
 ref: kernel-6.12.0-211.26.1.el10_2
-re-verify: bin/vendor-nvme-sources --rhel10 6.12.0-211.26.1.el10_2.src.rpm && git diff --exit-code dkms-nvme/vendor/rhel10
+re-verify: bin/vendor-nvme-sources --rhel10 6.12.0-211.26.1.el10_2 && git diff --exit-code dkms-nvme/vendor/rhel10
 # sha256 of vendored files:
 f38869cf2f1321e7b14a3d77d86cbc0dfb771958fb63b3f1b5ac6fee6e12776e  rdma.c
 75194d6235e86e1b7ccf15d7abe71a75939bf681aee9ba672208925baa38f4b3  nvme.h
