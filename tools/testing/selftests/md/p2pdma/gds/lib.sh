@@ -66,6 +66,10 @@ gds_csi_mdadm_create() {
 	done
 	local lvlextra=()
 	[ "$level" = 10 ] && lvlextra=(--chunk=64 --layout=n2)
+	local _m
+	for _m in "${members[@]}"; do
+		[ -b "$_m" ] && "$MDADM" --zero-superblock "$_m" >/dev/null 2>&1 || true
+	done
 	"$MDADM" --create "$dev" --level="$level" --raid-devices="${#members[@]}" \
 		--metadata=1.2 --homehost=any --assume-clean \
 		--bitmap=internal --bitmap-chunk=128M --consistency-policy=bitmap \
@@ -290,7 +294,7 @@ gds_gdsio_readverify() {
 # gds_sha_direct FILE -> sha256 via CPU O_DIRECT read (page cache dropped)
 gds_sha_direct() {
 	sync; echo 3 > /proc/sys/vm/drop_caches
-	dd if="$1" bs=1M iflag=direct status=none | sha256sum | awk '{print $1}'
+	( set -o pipefail; dd if="$1" bs=1M iflag=direct status=none | sha256sum | awk '{print $1}' )
 }
 
 # gds_leg_sha MEMBER RELPATH -> sha256 of RELPATH on that leg's filesystem
@@ -303,7 +307,7 @@ gds_leg_sha() {
 	if ! mount -t xfs -o ro,nouuid "$lo" "$mnt" 2>/dev/null; then
 		losetup -d "$lo"; rmdir "$mnt"; return 1
 	fi
-	sha=$(sha256sum "$mnt/$rel" | awk '{print $1}')
+	sha=$(set -o pipefail; sha256sum "$mnt/$rel" | awk '{print $1}')
 	umount "$mnt"; losetup -d "$lo"; rmdir "$mnt"
 	echo "$sha"
 }

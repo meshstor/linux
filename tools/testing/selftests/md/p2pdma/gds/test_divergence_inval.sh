@@ -107,13 +107,18 @@ echo 0 > /sys/module/inval_inject/parameters/remaining
 [ "$INJECTED" -gt 0 ] || { echo "FAIL: injector never fired (vacuous run)" >&2; exit 1; }
 # [FLIP] with fail-the-write shipped, RC must be nonzero (EINVAL) instead.
 [ "$RC" -eq 0 ] || { echo "FAIL: write returned rc=$RC, expected silent success (bug gone?)" >&2; exit 1; }
-grep -q '\[UU\]' /proc/msstat \
+ms0line=$(awk '/^ms0 :/{print;getline;print}' /proc/msstat)
+echo "$ms0line" | grep -q '\[UU\]' \
 	|| { echo "FAIL: a leg was faulted -- INVAL was not swallowed (bug gone?)" >&2; exit 1; }
 
 # --- contrast control: same failure WITHOUT the rewrite -> IOERR faults leg --
 dd if="$PAT_A" of=/dev/ms0 bs=1M count=8 oflag=direct conv=notrunc status=none || true
 ok=0
-for _ in $(seq 50); do grep -q '\[U_\]\|\[_U\]' /proc/msstat && { ok=1; break; }; sleep 0.2; done
+for _ in $(seq 50); do
+	ms0line=$(awk '/^ms0 :/{print;getline;print}' /proc/msstat)
+	echo "$ms0line" | grep -q '\[U_\]\|\[_U\]' && { ok=1; break; }
+	sleep 0.2
+done
 [ "$ok" = 1 ] || { echo "FAIL: control IOERR write did not fault the leg" >&2; exit 1; }
 
 "$MDADM" --stop /dev/ms0 >/dev/null 2>&1; P2PDMA_ARRAY=""

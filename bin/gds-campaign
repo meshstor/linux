@@ -217,7 +217,11 @@ p5() {
 	if [ "$REHEARSAL" = 0 ] && [ -x "${GDSIO:-/usr/local/cuda/gds/tools/gdsio}" ]; then
 		verd p5 gds_on_false_advert INFO "manual: strict gdsio on the false-advertising array — see runbook §P5"
 	fi
-	kit_install_variant featured || { verd p5 restore FAIL "featured re-install failed"; return 1; }
+	if ! kit_install_variant featured; then
+		verd p5 restore FAIL "featured re-install FAILED -- box left on BASELINE module"
+		log "CRITICAL: box is on the baseline (non-member-AND) module; reinstall featured before trusting any later phase"
+		exit 3
+	fi
 	verd p5 restore PASS "featured package restored"
 	heartbeat || { log "NODE UNHEALTHY after p5"; exit 3; }
 }
