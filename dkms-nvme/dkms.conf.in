@@ -1,0 +1,22 @@
+PACKAGE_NAME="meshstor-nvme-rdma"
+PACKAGE_VERSION="@VERSION@"
+
+MAKE[0]="make -j$(nproc) KDIR=/lib/modules/${kernelver}/build KVER=${kernelver}"
+CLEAN="make clean"
+
+BUILT_MODULE_NAME[0]="nvme-rdma"
+DEST_MODULE_LOCATION[0]="/updates"
+
+AUTOINSTALL="yes"
+
+# Never weak-link this ABI-pinned override across kernels (RHEL
+# weak-modules would symlink a module built against one kernel's private
+# nvme.h into another kernel — the exact mismatch this package's
+# per-variant sources exist to prevent).
+NO_WEAK_MODULES="yes"
+
+# Only the three vendored kernel families may build. Anything newer has
+# (or will get) 23528aa in-tree, and its private headers would not match
+# the vendored copies. DKMS skips non-matching kernels gracefully; the
+# in-tree nvme-rdma keeps working there.
+BUILD_EXCLUSIVE_KERNEL="^(6\.12\..*\.el10|6\.17\..*-generic|7\.0\..*-generic)"
