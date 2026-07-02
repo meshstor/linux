@@ -1,0 +1,65 @@
+# meshstor-nvme-rdma DKMS wrapper Makefile.
+# Builds ONLY nvme-rdma.ko from the vendored per-target sources; the
+# running kernel's in-tree nvme-core / nvme-fabrics are used unchanged.
+#
+# Variant selection is deliberately VERSION-KEYED, not HAVE_*-keyed
+# (the repo-wide rule): we are matching private-header struct layout —
+# nvme.h / fabrics.h are not shipped by linux-headers / kernel-devel,
+# so there is nothing on the target system a capability grep could
+# probe. See README.md.
+
+KVER ?= $(shell uname -r)
+KDIR ?= /lib/modules/$(KVER)/build
+
+# kbuild section — read when kbuild recurses with M=$(CURDIR).
+obj-m := nvme-rdma.o
+nvme-rdma-y := rdma.o
+
+ifneq ($(findstring .el10,$(KVER)),)
+VARIANT := rhel10
+else ifneq ($(filter 6.17.%,$(KVER)),)
+VARIANT := u2404-hwe
+else ifneq ($(filter 7.0.%,$(KVER)),)
+VARIANT := u2604
+else
+VARIANT :=
+endif
+
+# Same DKMS gotcha as dkms/Makefile.in: DKMS sets KERNELRELEASE= on the
+# OUTER command line, so only KBUILD_EXTMOD (set by kbuild's M= recursion
+# alone) distinguishes "DKMS called me" from "kbuild recursed into me".
+ifeq ($(KBUILD_EXTMOD),)
+
+.PHONY: all variant-check copy-src print-variant clean modules_install
+
+all: copy-src
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
+variant-check:
+	@if [ -z "$(VARIANT)" ]; then \
+	    echo "error: unsupported kernel $(KVER)" >&2; \
+	    echo "       supported families: 6.12.*.el10* (rhel10), 6.17.* (u2404-hwe), 7.0.* (u2604)" >&2; \
+	    exit 1; \
+	fi
+	@utsrel=$$(sed -n 's/^#define UTS_RELEASE "\(.*\)"$$/\1/p' \
+	    "$(KDIR)/include/generated/utsrelease.h" 2>/dev/null); \
+	if [ -n "$$utsrel" ] && [ "$$utsrel" != "$(KVER)" ]; then \
+	    echo "error: KVER=$(KVER) but KDIR=$(KDIR) is for $$utsrel" >&2; \
+	    exit 1; \
+	fi
+
+copy-src: variant-check
+	@echo "meshstor-nvme-rdma: building variant $(VARIANT) for $(KVER)"
+	cp -f $(VARIANT)/rdma.c $(VARIANT)/nvme.h $(VARIANT)/fabrics.h .
+
+print-variant:
+	@echo $(VARIANT)
+
+clean:
+	-$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	rm -f rdma.c nvme.h fabrics.h
+
+modules_install:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
+
+endif
