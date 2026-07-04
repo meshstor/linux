@@ -1,40 +1,29 @@
-P2PDMA feature-flag gating -- compile the P2P advertise out on pre-6.11 kernels.
+P2PDMA advertise feature-flag gating -- compile the P2P advertise out on
+pre-6.11 kernels.
 
-The P2P feature lives in drivers/md (feature branch p2pdma-fixes): the member-AND
-advertise, the raid1_can_advertise_p2pdma() helper, md_bio_is_p2pdma(), and the
-add-path re-gate helper raid1_p2pdma_clear_on_add(). On kernels without
-BLK_FEAT_PCI_P2PDMA (pre-6.11, e.g. RHEL9/5.14, which also lack the FOLL_PCI_P2PDMA
-O_DIRECT path) the whole feature must compile out. Gate every site on
-HAVE_BLK_FEAT_PCI_P2PDMA (dkms/Makefile.in feature_flags probe): the helpers and
-both advertise sites #ifdef out entirely; md_bio_is_p2pdma() folds to a constant
-false so its callers (REQ_NOMERGE preserve, write-behind skip) still build.
+The P2P advertise machinery lives in drivers/md (feature branch p2pdma-fixes)
+and is present in BOTH featured variants the kit builds: the member-AND
+advertise via raid1_can_advertise_p2pdma(), the md_bio_is_p2pdma() detector,
+and the add-path re-gate helper raid1_p2pdma_clear_on_add(). On kernels without
+BLK_FEAT_PCI_P2PDMA (pre-6.11, e.g. RHEL9/5.14, which also lack the
+FOLL_PCI_P2PDMA O_DIRECT path) the whole advertise must compile out. Gate every
+site on HAVE_BLK_FEAT_PCI_P2PDMA (dkms/Makefile.in feature_flags probe): the
+helpers and both advertise sites (raid1_set_limits, raid10_set_queue_limits)
+#ifdef out entirely; md_bio_is_p2pdma() folds to a constant false so its callers
+(REQ_NOMERGE preserve, write-behind skip) still build;
 raid1_p2pdma_clear_on_add() folds to an empty inline stub so the four call sites
 become no-ops with no per-call gating.
 
-Stage-1 fail-the-write (branch p2pdma) adds error-path sites on top: raid1/raid10
-tag P2P master bios at submit (set_bit R1BIO_P2P / R10BIO_P2P keyed on
-md_bio_is_p2pdma()); a leg completing BLK_STS_INVAL/BLK_STS_TARGET on a tagged
-bio marks R1BIO_P2PError/R10BIO_P2PError and fails the whole write loud
-(master forced to BLK_STS_INVAL in call_bio_endio / raid_end_bio_io) instead of
-silently diverging the mirrors; reads keep their real status. Gate the six
-consumers: the two end_write_request completion arms, both master-status
-overrides, and both end_read_request read-fidelity blocks. The R1BIO_P2P*/
-R10BIO_P2P* enum bits and the submit-time detection sites stay deliberately
-UNGATED: with md_bio_is_p2pdma() folded to constant false,
-`if (md_bio_is_p2pdma(bio)) set_bit(...)` is provably dead code the compiler
-discards, so gating them would add #ifdef noise for zero object-code change.
-The write-arm gate rewrites `} else if (...)` to `} else` + `#endif` + `if (...)`
-so the flag-off preprocess reduces to the pre-feature `if/else if/else` chain
-with braces balanced in both personalities.
-
-The raid10 read-fidelity hunk carries minimal symmetric context (leading anchor
-`} else if (!raid1_should_handle_error(bio)) {`, trailing `uptodate = 1;`): in
-the composed meshstor-main tree the md-latency-ewma branch inserts its fold-kick
-block directly above that anchor (before `set_bit(R10BIO_Uptodate ...)`), so
-diff-default three-line context anchors on shape-specific lines and rejects at
---fuzz=0 on whichever p2pdma-bearing composition it wasn't diffed against.
-regenerate.sh preserves this patch (.when guard); edit by hand, keep that hunk
-minimal.
+The stage-1 fail-the-write COMPLETION arms (feature branch p2pdma: the
+R1BIO_P2PError / R10BIO_P2PError end_write_request arms, the call_bio_endio /
+raid_end_bio_io master-status overrides, the end_read_request read-fidelity
+blocks) are gated separately in 0011-p2pdma-failwrite-arm-gating.patch, because
+that arm code exists ONLY in the full stage-1 tree. This advertise-gating patch
+applies to every p2pdma-bearing tree; 0011 self-selects to the stage-1 tree via
+its raid10.c:R10BIO_P2PError .when guard. This patch's own .when guard keys on
+raid1_can_advertise_p2pdma (present in both featured variants); on bare upstream
+`master` the helper is absent and 0009 handles upstream's raw P2PDMA assignment
+instead.
 
 Source-level, not a header shim: it adds preprocessor structure to drivers/md.
 
@@ -79,49 +68,6 @@ diff --git a/raid1.c b/raid1.c
 index 0db5753..a3b3baf 100644
 --- a/raid1.c
 +++ b/raid1.c
-@@ -324,8 +324,10 @@ static void call_bio_endio(struct r1bio *r1_bio)
- 
- 	if (!test_bit(R1BIO_Uptodate, &r1_bio->state))
- 		bio->bi_status = BLK_STS_IOERR;
-+#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
- 	if (test_bit(R1BIO_P2PError, &r1_bio->state))
- 		bio->bi_status = BLK_STS_INVAL;
-+#endif
- 
- 	bio_endio(bio);
- }
-@@ -404,10 +406,12 @@ static void raid1_end_read_request(struct bio *bio)
- 		 * want to retry */
- 		;
- 	} else if (!raid1_should_handle_error(bio)) {
-+#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
- 		if (test_bit(R1BIO_P2P, &r1_bio->state) &&
- 		    (bio->bi_status == BLK_STS_INVAL ||
- 		     bio->bi_status == BLK_STS_TARGET))
- 			set_bit(R1BIO_P2PError, &r1_bio->state);
-+#endif
- 		uptodate = 1;
- 	} else {
- 		/* If all other devices have failed, we want to return
-@@ -488,6 +492,7 @@ static void raid1_end_write_request(struct bio *bio)
- 	/*
- 	 * 'one mirror IO has finished' event handler:
- 	 */
-+#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
- 	if (bio->bi_status && test_bit(R1BIO_P2P, &r1_bio->state) &&
- 	    (bio->bi_status == BLK_STS_INVAL ||
- 	     bio->bi_status == BLK_STS_TARGET)) {
-@@ -507,7 +512,9 @@ static void raid1_end_write_request(struct bio *bio)
- 				    blk_status_to_errno(bio->bi_status));
- 		r1_bio->bios[mirror] = NULL;
- 		to_put = bio;
--	} else if (bio->bi_status && !ignore_error) {
-+	} else
-+#endif
-+	if (bio->bi_status && !ignore_error) {
- 		set_bit(WriteErrorSeen,	&rdev->flags);
- 		if (!test_and_set_bit(WantReplacement, &rdev->flags))
- 			set_bit(MD_RECOVERY_NEEDED, &
 @@ -3267,8 +3274,10 @@ static int raid1_set_limits(struct mddev *mddev)
  	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
  	if (err)
@@ -137,45 +83,6 @@ diff --git a/raid10.c b/raid10.c
 index c142ee9..6c9e180 100644
 --- a/raid10.c
 +++ b/raid10.c
-@@ -325,8 +325,10 @@ static void raid_end_bio_io(struct r10bio *r10_bio)
- 	if (!test_and_set_bit(R10BIO_Returned, &r10_bio->state)) {
- 		if (!test_bit(R10BIO_Uptodate, &r10_bio->state))
- 			bio->bi_status = BLK_STS_IOERR;
-+#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
- 		if (test_bit(R10BIO_P2PError, &r10_bio->state))
- 			bio->bi_status = BLK_STS_INVAL;
-+#endif
- 		bio_endio(bio);
- 	}
- 
-@@ -406,6 +408,8 @@ static void raid10_end_read_request(struct bio *bio)
- 	} else if (!raid1_should_handle_error(bio)) {
-+#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
- 		if (test_bit(R10BIO_P2P, &r10_bio->state) &&
- 		    (bio->bi_status == BLK_STS_INVAL ||
- 		     bio->bi_status == BLK_STS_TARGET))
- 			set_bit(R10BIO_P2PError, &r10_bio->state);
-+#endif
- 		uptodate = 1;
-@@ -481,6 +485,7 @@ static void raid10_end_write_request(struct bio *bio)
- 	/*
- 	 * this branch is our 'one mirror IO has finished' event handler:
- 	 */
-+#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
- 	if (bio->bi_status && test_bit(R10BIO_P2P, &r10_bio->state) &&
- 	    (bio->bi_status == BLK_STS_INVAL ||
- 	     bio->bi_status == BLK_STS_TARGET)) {
-@@ -502,7 +507,9 @@ static void raid10_end_write_request(struct bio *bio)
- 		else
- 			r10_bio->devs[slot].bio = NULL;
- 		to_put = bio;
--	} else if (bio->bi_status && !ignore_error) {
-+	} else
-+#endif
-+	if (bio->bi_status && !ignore_error) {
- 		if (repl)
- 			/* Never record new bad blocks to replacement,
- 			 * just fail it.
 @@ -3999,8 +4006,10 @@ static int raid10_set_queue_limits(struct mddev *mddev)
  	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
  	if (err)

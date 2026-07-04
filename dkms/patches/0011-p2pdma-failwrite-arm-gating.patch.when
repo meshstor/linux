@@ -1,0 +1,11 @@
+# Guard for build-tarball's conditional patch application.
+# Format: [!]<relpath-in-tarball>:<grep -E regex>   (ALL lines must hold)
+# A leading '!' negates (the pattern must NOT be present).
+#
+# 0011 gates the meshstor stage-1 fail-the-write COMPLETION arms (R1BIO_P2PError
+# / R10BIO_P2PError), which exist only in the full stage-1 tree. Guard on
+# R10BIO_P2PError so this patch self-excludes from an advertise-only variant
+# (e.g. a pin that advertises P2PDMA but has fail-the-write ABSENT), where these
+# hunks would reject against code that does not exist. 0008's advertise gating
+# applies to both variants; only these arm hunks are stage-1-only.
+raid10.c:R10BIO_P2PError
