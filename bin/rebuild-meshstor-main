@@ -9,10 +9,12 @@
 # dedicated worktree and cherry-picks origin/master..origin/<branch> for each
 # feature branch, in order. The result is ready to force-push.
 #
-# Feature branches = every refs/remotes/origin/* EXCEPT master,
-# meshstor-harness, meshstor-main. Order: llbitmap-fixes first (if present),
-# then the rest alphabetically. Each branch must be based on the current
-# origin/master (validated up front) or the run aborts.
+# Feature branches = every refs/remotes/origin/* EXCEPT the non-feature refs
+# in EXCLUDE below (master, the composition target, and harness-based tooling
+# branches such as meshstor-harness and gds-campaign, which do not descend
+# from origin/master). Order: llbitmap-fixes first (if present), then the rest
+# alphabetically. Each branch must be based on the current origin/master
+# (validated up front) or the run aborts.
 #
 # Run from the meshstor-harness checkout — it needs that branch's dkms/ + bin/
 # tooling, which meshstor-main (kernel-tree-only) does not carry.
@@ -27,7 +29,7 @@ REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 REMOTE="origin"
 BASE_REF="$REMOTE/master"
 TARGET_BRANCH="meshstor-main"
-EXCLUDE=(master meshstor-harness meshstor-main HEAD)
+EXCLUDE=(master meshstor-harness meshstor-main HEAD gds-campaign)
 PRIORITY_BRANCH="llbitmap-fixes"   # always cherry-picked first when present
 WORKTREE="$REPO_ROOT/.worktrees/meshstor-main-rebuild"
 
