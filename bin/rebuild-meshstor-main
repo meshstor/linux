@@ -237,7 +237,12 @@ for b in "${ORDERED[@]}"; do
         continue
     fi
     log "cherry-picking $n commits from $REMOTE/$b"
-    if ! git -C "$WORKTREE" cherry-pick "$BASE_REF..$REMOTE/$b"; then
+    # commit.gpgsign=false: the reconstruction is a generated artifact,
+    # rebuilt from scratch every run and published unsigned (matching the
+    # existing origin/meshstor-main history). A user-global gpgsign=true
+    # would otherwise make every cherry-pick depend on a live ssh-agent,
+    # which hangs or fails the run when the agent is absent (headless use).
+    if ! git -C "$WORKTREE" -c commit.gpgsign=false cherry-pick "$BASE_REF..$REMOTE/$b"; then
         {
             echo
             echo "$PROG: error: cherry-pick conflict while applying '$b'"
@@ -271,6 +276,19 @@ if [[ -z "$NO_BUILD" ]]; then
         [[ -f "$BUILD_DIR/$ko.ko" ]] || die "build produced no $ko.ko"
     done
     log "built modules: ms_mod.ko raid1_ms.ko raid10_ms.ko"
+
+    # p2pdma selftest helper modules (md_p2p_test, dm_errstat). Built HERE,
+    # host-side: the VM tests share the worktree read-only into the guest, so
+    # the .ko files must exist before boot. They build against the running
+    # kernel (stable p2pdma/bio/dm APIs only), same KDIR as the main modules.
+    p2p_mod_dir="$WORKTREE/tools/testing/selftests/md/p2pdma/modules"
+    if [[ -d "$p2p_mod_dir" ]]; then
+        log "building p2pdma selftest helper modules"
+        make -C "$p2p_mod_dir" KDIR="$KDIR" >/dev/null \
+            || die "p2pdma selftest helper module build failed"
+        [[ -f "$p2p_mod_dir/md_p2p_test.ko" ]] \
+            || die "p2pdma helper build produced no md_p2p_test.ko"
+    fi
 else
     log "--no-build: skipping tarball + compile"
 fi
@@ -339,13 +357,15 @@ if [[ -z "$NO_TEST" ]]; then
     #     self-skips (exit 4) without root / modules / patched mdadm.
     #     lib.sh is a helper (never run standalone); evidence_*.sh are RCA data
     #     probes, not pass/fail tests (they assert nothing and would bank a
-    #     meaningless verdict) — exclude both from the run.
+    #     meaningless verdict); run_vm.sh is the p2pdma suite's QEMU launcher
+    #     (the tests exec it — bare it just prints usage) — exclude all three.
     md_dir="$WORKTREE/tools/testing/selftests/md"
     if [[ -d "$md_dir" ]]; then
         [[ "$(id -u)" -ne 0 && ${#SUDO[@]} -eq 0 ]] \
             && warn "not root and no sudo — md runtime tests will SKIP"
         log "running md runtime selftests from $md_dir"
-        mapfile -t md_tests < <(find "$md_dir" -type f -name '*.sh' ! -name 'lib.sh' ! -name 'evidence_*' | sort)
+        mapfile -t md_tests < <(find "$md_dir" -type f -name '*.sh' \
+            ! -name 'lib.sh' ! -name 'evidence_*' ! -name 'run_vm.sh' | sort)
         mpass=0 mfail=0 mskip=0 mfailed=()
         # Force the ms subsystem across the WHOLE suite so every test exercises
         # the reconstructed modules. Every suite keys off MD_SUBSYS (default ms):
@@ -369,6 +389,17 @@ if [[ -z "$NO_TEST" ]]; then
                   RAID10_DEV_PREFIX=ms RAID10_SYSFS_SUBDIR=ms RAID10_MDSTAT=/proc/msstat)
         [[ -n "${MDADM:-}" ]] && test_env+=(MDADM="$MDADM")
         [[ -z "${MDADM:-}" ]] && warn "no patched mdadm found (set MDADM=…) — ms tests will SKIP"
+        # sudo resets PATH to secure_path, which loses user-level tool installs;
+        # the p2pdma suite boots QEMU via virtme-ng (vng), commonly installed in
+        # ~/.local/bin. Hand the invoking user's PATH through the elevation.
+        test_env+=(PATH="$PATH")
+        # The p2pdma VM tests insmod MS_MOD_DIR's modules inside the guest —
+        # point them at the reconstruction just built so they validate it.
+        # When unset (e.g. --no-build) the tests self-skip via p2p_require_rig.
+        if [[ -z "${MS_MOD_DIR:-}" && -z "$NO_BUILD" && -f "$BUILD_DIR/ms_mod.ko" ]]; then
+            MS_MOD_DIR="$BUILD_DIR"
+        fi
+        [[ -n "${MS_MOD_DIR:-}" ]] && test_env+=(MS_MOD_DIR="$MS_MOD_DIR")
         ((TEST_TIMEOUT > 0)) \
             && log "per-test timeout: ${TEST_TIMEOUT}s (override with --test-timeout)"
         for t in "${md_tests[@]}"; do
@@ -381,16 +412,23 @@ if [[ -z "$NO_TEST" ]]; then
             ((TEST_TIMEOUT > 0)) \
                 && tcmd+=(timeout --kill-after=15 --signal=TERM "$TEST_TIMEOUT")
             tcmd+=(env "${test_env[@]}" bash "$t")
-            if "${tcmd[@]}"; then
-                mpass=$((mpass + 1))
-            else
-                rc=$?
-                case "$rc" in
-                    4)   mskip=$((mskip + 1)) ;;
-                    124) mfail=$((mfail + 1)); mfailed+=("$rel (timed out after ${TEST_TIMEOUT}s)") ;;
-                    *)   mfail=$((mfail + 1)); mfailed+=("$rel") ;;
-                esac
-            fi
+            # Pipe BOTH streams through cat: the p2pdma VM tests (QEMU via
+            # virtme-ng) rewind their console fd to offset 0, and with this
+            # script's output redirected to a REGULAR file every fd-1/fd-2
+            # copy shares that one file offset — one rewind and the whole log
+            # so far is silently overwritten. Behind a pipe the test can't
+            # seek, and only cat (linear writes) touches the log. Under this
+            # script's pipefail the pipeline's status IS the test's status
+            # (cat always succeeds); `|| rc=$?` captures it while shielding
+            # the pipeline from errexit.
+            rc=0
+            "${tcmd[@]}" 2>&1 | cat || rc=$?
+            case "$rc" in
+                0)   mpass=$((mpass + 1)) ;;
+                4)   mskip=$((mskip + 1)) ;;
+                124) mfail=$((mfail + 1)); mfailed+=("$rel (timed out after ${TEST_TIMEOUT}s)") ;;
+                *)   mfail=$((mfail + 1)); mfailed+=("$rel") ;;
+            esac
         done
         log "md runtime selftests: pass=$mpass fail=$mfail skip=$mskip"
         if ((mfail > 0)); then
