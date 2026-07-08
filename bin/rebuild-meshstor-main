@@ -16,6 +16,14 @@
 # alphabetically. Each branch must be based on the current origin/master
 # (validated up front) or the run aborts.
 #
+# meshstor-harness is normally excluded (meshstor-main stays kernel-tree-only),
+# but --include-harness bakes it in as a single SQUASHED commit AFTER every
+# feature branch. It is an orphan branch (no common ancestor with origin/master)
+# whose paths are disjoint from the composed kernel tree, so it is exempt from
+# the base validation and squashed rather than cherry-picked commit-by-commit.
+# With it, meshstor-main becomes a complete, self-contained tree (also carrying
+# bin/, dkms/, docs/, and the dkms + p2pdma-vm selftests).
+#
 # Run from the meshstor-harness checkout — it needs that branch's dkms/ + bin/
 # tooling, which meshstor-main (kernel-tree-only) does not carry.
 #
@@ -31,6 +39,7 @@ BASE_REF="$REMOTE/master"
 TARGET_BRANCH="meshstor-main"
 EXCLUDE=(master meshstor-harness meshstor-main HEAD gds-campaign)
 PRIORITY_BRANCH="llbitmap-fixes"   # always cherry-picked first when present
+HARNESS_BRANCH="meshstor-harness"  # optional trailing squashed overlay (--include-harness)
 WORKTREE="$REPO_ROOT/.worktrees/meshstor-main-rebuild"
 
 # Defaults
@@ -39,6 +48,7 @@ NO_BUILD=
 NO_LOAD=
 NO_TEST=
 KEEP=
+INCLUDE_HARNESS=
 VERSION="0.1.0-mainrebuild"
 KDIR="${KDIR:-/lib/modules/$(uname -r)/build}"
 TEST_TIMEOUT=120   # per md test, seconds; 0 disables
@@ -53,6 +63,7 @@ and test the modules. Run from the meshstor-harness checkout.
 
 Feature branches: all $REMOTE/* except ${EXCLUDE[*]}.
 Order: $PRIORITY_BRANCH first (if present), then the rest alphabetically.
+With --include-harness, $HARNESS_BRANCH is squashed on top as the final commit.
 
 Stages (all on by default):
   1. reconstruct  cherry-pick the feature branches onto $BASE_REF
@@ -65,6 +76,11 @@ Options:
   --no-build        Skip the build stage.
   --no-load         Skip the module reload stage.
   --no-test         Skip the selftest stage.
+  --include-harness Squash the $HARNESS_BRANCH branch (bin/, dkms/, docs/, and
+                    the dkms + p2pdma-vm selftests) on top as the final commit,
+                    after all feature branches, so the reconstructed
+                    $TARGET_BRANCH is a complete, self-contained tree. Off by
+                    default (kernel-tree-only composition).
   --version <v>     Version passed to bin/build-tarball (sets PACKAGE_VERSION /
                     MS_VERSION / MODULE_VERSION and the tarball filename).
                     Default: $VERSION
@@ -102,6 +118,7 @@ while (($#)); do
         --no-build) NO_BUILD=1; shift ;;
         --no-load)  NO_LOAD=1; shift ;;
         --no-test)  NO_TEST=1; shift ;;
+        --include-harness) INCLUDE_HARNESS=1; shift ;;
         --keep)     KEEP=1; shift ;;
         --version)  VERSION="${2:?--version needs an argument}"; shift 2 ;;
         --test-timeout) TEST_TIMEOUT="${2:?--test-timeout needs an argument}"; shift 2 ;;
@@ -149,6 +166,16 @@ git rev-parse --verify --quiet "$BASE_REF" >/dev/null \
     || die "$BASE_REF not found — fetch $REMOTE or drop --no-fetch"
 BASE_SHA="$(git rev-parse "$BASE_REF")"
 
+# The optional harness overlay is an orphan branch (no common ancestor with
+# $BASE_REF), so $BASE_REF..harness resolves to its entire history — the count
+# we report as "squashed from N". Validated only when --include-harness.
+HARNESS_N=0
+if [[ -n "$INCLUDE_HARNESS" ]]; then
+    git rev-parse --verify --quiet "$REMOTE/$HARNESS_BRANCH" >/dev/null \
+        || die "--include-harness: $REMOTE/$HARNESS_BRANCH not found — fetch $REMOTE or drop --no-fetch"
+    HARNESS_N="$(git rev-list --count "$BASE_REF..$REMOTE/$HARNESS_BRANCH")"
+fi
+
 is_excluded() {
     local b="$1" e
     for e in "${EXCLUDE[@]}"; do [[ "$b" == "$e" ]] && return 0; done
@@ -181,6 +208,9 @@ for b in "${ORDERED[@]}"; do
     printf '       %-22s (%s commits)\n' \
         "$b" "$(git rev-list --count "$BASE_REF..$REMOTE/$b")"
 done
+[[ -n "$INCLUDE_HARNESS" ]] \
+    && printf '       %-22s (%s commits, squashed trailing overlay)\n' \
+        "$HARNESS_BRANCH" "$HARNESS_N"
 
 # ---------------------------------------------------------------------------
 # Stage 1b: base validation — every branch must descend from current base
@@ -256,6 +286,43 @@ for b in "${ORDERED[@]}"; do
     fi
     PICKED["$b"]=$n
 done
+
+# ---------------------------------------------------------------------------
+# Stage 1e: (optional) squash the meshstor-harness overlay on top, last
+# ---------------------------------------------------------------------------
+# meshstor-harness carries the tooling/docs/selftests (bin/, dkms/, dkms-nvme/,
+# docs/, CLAUDE.md, tools/testing/selftests/{dkms,md/p2pdma-vm}) on an ORPHAN
+# history whose paths are disjoint from the composed kernel tree. It is applied
+# as ONE squashed commit — not cherry-picked — because there is no shared base
+# to bound a commit range meaningfully and its 200+ tooling commits would drown
+# the feature history. `checkout <harness> -- .` writes/stages every path
+# harness carries (harness wins on the disjoint shared selftests namespace) and
+# leaves the composed kernel files untouched; the union is then a single commit.
+if [[ -n "$INCLUDE_HARNESS" ]]; then
+    log "overlaying $HARNESS_BRANCH as a single squashed commit (from $HARNESS_N commits)"
+    git -C "$WORKTREE" checkout "$REMOTE/$HARNESS_BRANCH" -- . \
+        || die "failed to overlay $REMOTE/$HARNESS_BRANCH into $WORKTREE"
+    git -C "$WORKTREE" add -A
+    if git -C "$WORKTREE" diff --cached --quiet; then
+        warn "$HARNESS_BRANCH overlay introduced no changes — nothing to commit"
+    else
+        # commit.gpgsign=false for the same headless reason as the cherry-picks
+        # above. Author/committer pinned to the repo identity because this
+        # commit is synthesized here rather than carried from a branch.
+        git -C "$WORKTREE" \
+            -c user.name="Mykola" -c user.email="mykola@meshstor.io" \
+            -c commit.gpgsign=false \
+            commit -q -m "meshstor-harness: bake in tooling, docs, and selftests
+
+Squashed overlay of $HARNESS_N commits from $REMOTE/$HARNESS_BRANCH (bin/,
+dkms/, dkms-nvme/, docs/, CLAUDE.md, and the dkms + p2pdma-vm selftests).
+Applied last, after every feature branch, so $TARGET_BRANCH is a complete,
+self-contained tree." \
+            || die "failed to commit $HARNESS_BRANCH overlay"
+        PICKED["$HARNESS_BRANCH"]=1
+        APPLIED_HARNESS=1
+    fi
+fi
 
 FINAL_SHA="$(git -C "$WORKTREE" rev-parse HEAD)"
 TOTAL="$(git -C "$WORKTREE" rev-list --count "$BASE_REF..HEAD")"
@@ -456,6 +523,8 @@ echo "Applied (in order):"
 for b in "${ORDERED[@]}"; do
     printf '  %-22s %s commits\n' "$b" "${PICKED[$b]}"
 done
+[[ -n "${APPLIED_HARNESS:-}" ]] \
+    && printf '  %-22s 1 commit (squashed from %s)\n' "$HARNESS_BRANCH" "$HARNESS_N"
 [[ -z "$NO_BUILD" ]] && echo "Build:         OK ($BUILD_DIR)"
 [[ -z "$NO_LOAD"  ]] && echo "Load:          OK (srcversion verified)"
 if [[ -z "$NO_TEST" ]]; then

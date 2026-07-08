@@ -85,9 +85,13 @@ the two personalities. RAID0/5/6 and md-cluster are intentionally out of scope
     `build/linux-meshstor-rebuilt/` (filter-repo + `git am`).
   - `bin/rebuild-meshstor-main` reconstructs the *`meshstor-main` branch itself*
     by cherry-picking every `origin` feature branch onto `origin/master` in a
-    worktree (`llbitmap-fixes` first, then alphabetical), then optionally
-    builds / reloads modules / runs both selftest suites, and prints the
-    `git push --force` to publish. Run it from the harness checkout.
+    worktree (`llbitmap-fixes` first, then alphabetical; `gds-campaign` and
+    `meshstor-harness` excluded), then optionally builds / reloads modules /
+    runs both selftest suites, and prints the `git push --force` to publish.
+    Run it from the harness checkout. `--include-harness` additionally squashes
+    `meshstor-harness` (the orphan tooling/docs/selftests branch) on top as one
+    final commit — turning the otherwise kernel-tree-only `meshstor-main` into a
+    complete, self-contained tree.
 
 ## Build pipeline (three stages)
 
