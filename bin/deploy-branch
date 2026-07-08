@@ -207,7 +207,10 @@ if [[ "$CLEANUP" -eq 0 ]]; then
         echo "==> force-rebuild: rebasing branch '$BRANCH' onto fresh upstream"
         "$REBUILD_MAIN" "$BRANCH"
         echo "==> building DKMS tarball $VERSION"
-        "$BUILD_TARBALL" "$VERSION"
+        # Package the tree rebuild-main just produced. Pass KERNEL_TREE
+        # explicitly: build-tarball's default now materializes the
+        # meshstor-main composition, not the rebuild-main output.
+        KERNEL_TREE="$REPO_ROOT/build/linux-meshstor-rebuilt" "$BUILD_TARBALL" "$VERSION"
         [[ -f "$TARBALL" ]] || die "build-tarball did not produce $TARBALL"
     else
         echo "==> packaging branch '$BRANCH' as-is (no rebase onto upstream)"

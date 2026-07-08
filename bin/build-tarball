@@ -11,20 +11,62 @@
 # Usage: bin/build-tarball <version>
 #
 # KERNEL_TREE (env, optional): directory holding drivers/md/ to copy from.
-# Defaults to the rebuild-main output dir (build/linux-meshstor-rebuilt) —
-# run bin/rebuild-main first, or set KERNEL_TREE=$(git rev-parse --show-toplevel)
-# to package directly from this repo's drivers/md/. dkms/ inputs and build
-# outputs always come from / land in this repo.
+# When unset, defaults to a worktree of the meshstor-main composition branch at
+# .worktrees/meshstor-main-rebuild, created on demand (see ensure_default_tree).
+# Set KERNEL_TREE explicitly to package from elsewhere — e.g.
+# KERNEL_TREE=build/linux-meshstor-rebuilt (the bin/rebuild-main output) or
+# KERNEL_TREE=$(git rev-parse --show-toplevel) to package straight from this
+# repo's drivers/md/. dkms/ inputs and build outputs always come from / land in
+# this repo.
 set -euo pipefail
 
 VER="${1:?usage: $0 <version>}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-KERNEL_TREE="$(realpath -m "${KERNEL_TREE:-$REPO_ROOT/build/linux-meshstor-rebuilt}")"
+
+# ensure_default_tree — materialize the meshstor-main composition as the source
+# tree when the caller gave no KERNEL_TREE. We only READ drivers/md/, so the
+# branch is checked out DETACHED at its current commit: that yields identical
+# content while avoiding (a) the push-to-master hazard a tracked meshstor-main
+# branch carries (see bin/rebuild-meshstor-main's --no-track note) and (b) the
+# "branch already checked out in another worktree" conflict. Reconstructing the
+# branch stays bin/rebuild-meshstor-main's job — here we just package whatever
+# meshstor-main currently points at (local preferred, else origin).
+DEFAULT_WORKTREE="$REPO_ROOT/.worktrees/meshstor-main-rebuild"
+ensure_default_tree() {
+    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+    # Reuse an existing tree as-is (e.g. one bin/rebuild-meshstor-main left on
+    # the meshstor-main branch).
+    [[ -d "$DEFAULT_WORKTREE/drivers/md" ]] && return
+    if [[ -e "$DEFAULT_WORKTREE" ]]; then
+        echo "error: $DEFAULT_WORKTREE exists but has no drivers/md/" >&2
+        echo "       remove it or run bin/rebuild-meshstor-main" >&2
+        exit 1
+    fi
+    local ref
+    if git -C "$REPO_ROOT" rev-parse --verify --quiet refs/heads/meshstor-main >/dev/null; then
+        ref="meshstor-main"
+    elif git -C "$REPO_ROOT" rev-parse --verify --quiet refs/remotes/origin/meshstor-main >/dev/null; then
+        ref="origin/meshstor-main"
+    else
+        echo "error: no meshstor-main branch (local or origin) to source drivers/md/ from" >&2
+        echo "       fetch origin, run bin/rebuild-meshstor-main, or set KERNEL_TREE=" >&2
+        exit 1
+    fi
+    echo "Creating worktree $DEFAULT_WORKTREE (detached @ $ref)" >&2
+    mkdir -p "$(dirname "$DEFAULT_WORKTREE")"
+    git -C "$REPO_ROOT" worktree add --detach "$DEFAULT_WORKTREE" "$ref" >&2
+}
+
+if [[ -z "${KERNEL_TREE:-}" ]]; then
+    ensure_default_tree
+    KERNEL_TREE="$DEFAULT_WORKTREE"
+fi
+KERNEL_TREE="$(realpath -m "$KERNEL_TREE")"
 OUT="$REPO_ROOT/build/meshstor-ms-$VER"
 
 if [[ ! -d "$KERNEL_TREE/drivers/md" ]]; then
     echo "error: KERNEL_TREE=$KERNEL_TREE has no drivers/md/" >&2
-    echo "       run bin/rebuild-main first, or set KERNEL_TREE explicitly" >&2
+    echo "       set KERNEL_TREE to a tree with drivers/md/, or unset it to use meshstor-main" >&2
     exit 1
 fi
 

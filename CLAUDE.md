@@ -121,9 +121,14 @@ the perf tooling all work on un-pushed local branches.
 
 ### 2. `bin/build-tarball <version>` — assemble the DKMS source tarball
 
-Reads `drivers/md/` from `KERNEL_TREE` (**default `build/linux-meshstor-rebuilt`**,
-so run `rebuild-main` first; or `KERNEL_TREE=$(git rev-parse --show-toplevel)`
-to package straight from this repo). Nine steps, **order matters**:
+Reads `drivers/md/` from `KERNEL_TREE`. **When unset, it defaults to a worktree
+of the `meshstor-main` composition branch at `.worktrees/meshstor-main-rebuild`,
+created on demand** (detached checkout of local `meshstor-main`, else
+`origin/meshstor-main`; an existing worktree — e.g. one `rebuild-meshstor-main`
+left — is reused as-is). Set `KERNEL_TREE` explicitly to package from elsewhere:
+`KERNEL_TREE=build/linux-meshstor-rebuilt` (the `rebuild-main` output, after
+running it) or `KERNEL_TREE=$(git rev-parse --show-toplevel)` to package
+straight from this repo. Nine steps, **order matters**:
 
 1. Copy files listed in `dkms/manifest.txt` from `KERNEL_TREE/drivers/md/`.
 2. Copy `dkms/compat/`.
