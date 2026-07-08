@@ -8,10 +8,11 @@
 #                        (patch apply, rename, build-tarball, compile) against a
 #                        source tree; needs no root/modules; source-dependent
 #                        tests SKIP without a drivers/md tree.
-#   md runtime   (4b)  — every tools/testing/selftests/md/**/test_*.sh (minus
-#                        lib.sh helpers and evidence_*.sh probes) against the
-#                        CURRENTLY-LOADED driver; needs root + modules + a
-#                        patched mdadm (tests self-skip otherwise).
+#   md runtime   (4b)  — every tools/testing/selftests/md/**/*.sh (minus
+#                        lib.sh helpers, evidence_*.sh probes, and the
+#                        run_vm.sh VM launcher) against the CURRENTLY-LOADED
+#                        driver; needs root + modules + a patched mdadm
+#                        (tests self-skip otherwise).
 #
 # Discovery, per-test environment, timeout handling and the pass/fail/skip tally
 # are copied from rebuild-meshstor-main so results are directly comparable; the
@@ -158,7 +159,8 @@ DKMS_RUNNER="$REPO_ROOT/tools/testing/selftests/dkms/run_all.sh"
 # ---------------------------------------------------------------------------
 # Discover md tests (identical glob to rebuild-meshstor-main), apply filters
 # ---------------------------------------------------------------------------
-mapfile -t all_tests < <(find "$MD_DIR" -type f -name '*.sh' ! -name 'lib.sh' ! -name 'evidence_*' | sort)
+mapfile -t all_tests < <(find "$MD_DIR" -type f -name '*.sh' \
+    ! -name 'lib.sh' ! -name 'evidence_*' ! -name 'run_vm.sh' | sort)
 md_tests=()
 if ((${#FILTERS[@]})); then
     for t in "${all_tests[@]}"; do
