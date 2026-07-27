@@ -8,7 +8,8 @@
 # test SKIPs (exit 4) when they are absent.
 
 TEST_PROGS := \
-	test_classic_bitmap_double_degraded_re_add.sh
+	test_classic_bitmap_double_degraded_re_add.sh \
+	test_read_sb_unmap_highmem.sh
 
 TEST_FILES := lib.sh
 
