@@ -2158,6 +2158,7 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		err = 0;
 		if (rdev->saved_raid_disk != mirror)
 			conf->fullsync = 1;
+		raid1_p2pdma_reeval_on_change(mddev);
 		WRITE_ONCE(p->rdev, rdev);
 		break;
 	}
@@ -2171,6 +2172,7 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		if (err)
 			return err;
 		conf->fullsync = 1;
+		raid1_p2pdma_reeval_on_change(mddev);
 		WRITE_ONCE(p->replacement, rdev);
 	}
 
@@ -2219,6 +2221,8 @@ static int raid10_remove_disk(struct mddev *mddev, struct md_rdev *rdev)
 		clear_bit(Replacement, &p->replacement->flags);
 		WRITE_ONCE(p->replacement, NULL);
 	}
+
+	raid1_p2pdma_reeval_on_change(mddev);
 
 	clear_bit(WantReplacement, &rdev->flags);
 	err = md_integrity_register(mddev);

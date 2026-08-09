@@ -321,11 +321,16 @@ static inline void raid1_write_error(struct mddev *mddev, struct md_rdev *rdev,
 }
 
 /*
- * Advertise PCI P2PDMA only when every non-faulty member can do it.
+ * Advertise PCI P2PDMA only when every non-faulty member can do it, unless
+ * overridden by the p2pdma_advertise=always|never module parameter.
  * BLK_FEAT_PCI_P2PDMA is excluded from BLK_FEAT_INHERIT_MASK, so md sets it
- * explicitly, and only when every member can DMA-map P2P (GPU) source pages:
- * md is a pure router that never touches the pages, but each member maps them,
- * so a member without P2P support must not be handed P2P I/O.
+ * explicitly: in the default "auto" policy, only when every member can
+ * DMA-map P2P (GPU) source pages, since md is a pure router that never
+ * touches the pages, but each member maps them, so a member without P2P
+ * support must not be handed P2P I/O. "always" forces the advertisement on
+ * regardless of member capability (e.g. when a P2P-capable path hides behind
+ * a non-advertising gendisk, such as an nvme-rdma namespace behind an nvme
+ * multipath head); "never" forces it off.
  */
 static bool raid1_can_advertise_p2pdma(struct mddev *mddev)
 {
@@ -345,4 +350,40 @@ static bool raid1_can_advertise_p2pdma(struct mddev *mddev)
 		any = true;
 	}
 	return any;
+}
+
+/*
+ * Re-evaluate the P2PDMA advertise after the member set changes.
+ *
+ * Do NOT simply clear the bit on a non-P2P add: that ignores
+ * p2pdma_advertise=always, and on a kernel where a P2P-capable path hides
+ * behind a non-advertising gendisk (nvme-rdma under a multipath head) any
+ * routine path event would then silently drop the array out of the P2P path
+ * until it is restarted. Re-running the full policy also lets a hot-REMOVE of
+ * the offending member restore the advertise.
+ *
+ * mddev->gendisk is NULL when this mddev is hosted under dm-raid
+ * (mddev_is_dm()); such arrays never set up P2PDMA limits at run() time
+ * either (see raid1_run()/raid10_run()), so skip them here too.
+ */
+static void raid1_p2pdma_reeval_on_change(struct mddev *mddev)
+{
+	struct queue_limits lim;
+	struct request_queue *q;
+	bool advertise;
+
+	if (mddev_is_dm(mddev))
+		return;
+
+	q = mddev->gendisk->queue;
+	advertise = raid1_can_advertise_p2pdma(mddev);
+	if (!!blk_queue_pci_p2pdma(q) == advertise)
+		return;
+
+	lim = queue_limits_start_update(q);
+	if (advertise)
+		lim.features |= BLK_FEAT_PCI_P2PDMA;
+	else
+		lim.features &= ~BLK_FEAT_PCI_P2PDMA;
+	queue_limits_commit_update(q, &lim);
 }
