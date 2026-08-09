@@ -359,10 +359,24 @@ static inline int ms_badblocks_check_compat(struct badblocks *bb, sector_t s,
 /*
  * BLK_STS_INVAL (added in 6.10, commit 7ba150834b04).
  *
- * Used by raid1_should_handle_error to skip retry/badblocks when the bio
- * was rejected for being invalid for the underlying device. On older
- * kernels this status is never emitted, so any unused sentinel value
- * works — pick one well above the highest defined BLK_STS_* in 6.8.
+ * On a kernel that lacks the native BLK_STS_P2PDMA status (the
+ * !HAVE_BLK_STS_P2PDMA arm of dkms/patches/0012), an unroutable P2P transfer
+ * surfaces as this status on >= 6.17 kernels (BLK_STS_TARGET on <= 6.14).
+ * 0012 translates either, on a P2P-tagged completion only, into literal
+ * BLK_STS_P2PDMA ahead of raid1/raid10's ordinary completion handling: the
+ * range is badblocked, the member is NOT faulted, WantReplacement is NOT
+ * set, and the master write succeeds off the surviving leg (upstream's
+ * design — a topology property, not a device-health one). Non-P2P INVAL is
+ * untouched and keeps upstream's own swallow semantics
+ * (raid1_should_handle_error() excludes it since f7b24c7b41f2).
+ *
+ * Sentinel note: on kernels without HAVE_BLK_FEAT_PCI_P2PDMA the whole
+ * P2PDMA surface — including 0012's translation — compiles out entirely
+ * (0008's advertise/feature gating) and this 0xFE sentinel is never
+ * compared; where BLK_STS_INVAL already exists natively, this #define is
+ * inert (guarded directly on the raw macro, not a HAVE_* probe — there is
+ * no HAVE_BLK_STS_INVAL flag; it was probed at one point but had no
+ * consumer and was dropped from dkms/Makefile.in's feature_flags recipe).
  */
 #ifndef BLK_STS_INVAL
 #define BLK_STS_INVAL  ((__force blk_status_t)0xFE)
