@@ -613,8 +613,12 @@ static inline void bh_submit(struct buffer_head *bh, blk_opf_t opf,
  * definition the packaged sources do not compile at all.
  *
  * Value 18 is upstream's, and is unused on every kernel from 6.12 through
- * 7.2-rc5, so it cannot collide with the host block layer and our patched
- * nvme-rdma (which emits it) and md (which consumes it) agree on the number.
+ * 7.2-rc5, so it cannot collide with the host block layer, and our patched
+ * nvme-rdma and md (which consumes it) agree on the number. Note the emitter
+ * side is a DEPENDENCY, not a present fact: nothing in the shipped stack
+ * produces status 18 until the sibling meshstor-nvme-rdma package carries
+ * upstream v6 p9-p11 ("nvme-rdma: return BLK_STS_P2PDMA for unsupported P2P
+ * transfers" and its siblings). Until then md's consumer side is inert.
  *
  * DANGER: on a kernel that does not know this status, blk_errors[] has a
  * zero-filled hole at index 18 that still passes the ARRAY_SIZE bounds check,
