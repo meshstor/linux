@@ -2,8 +2,7 @@
 # Out-of-tree test modules, built against the RUNNING kernel (they use
 # only stable p2pdma/bio/dm APIs, not the md tree under test).
 obj-m += md_p2p_test.o
-# Task 4: dm_errstat.o (uncomment when dm_errstat.c lands)
-#obj-m += dm_errstat.o
+obj-m += dm_errstat.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
