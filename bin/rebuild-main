@@ -50,12 +50,12 @@ Options:
 Examples:
   $(basename "$0")
       -> filtered upstream only
-  $(basename "$0") md-latency-ewma
-      -> filtered upstream + latency-ewma
-  $(basename "$0") per-bucket-arrays md-latency-ewma
-      -> filtered upstream + three features in given order
-  $(basename "$0") --with-harness md-latency-ewma
-      -> filtered upstream + harness + latency-ewma
+  $(basename "$0") read-balance
+      -> filtered upstream + read-balance
+  $(basename "$0") per-bucket-arrays read-balance
+      -> filtered upstream + both features in given order
+  $(basename "$0") --with-harness read-balance
+      -> filtered upstream + harness + read-balance
 EOF
 }
 

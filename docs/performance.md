@@ -135,7 +135,7 @@ RHEL 10+ / Ubuntu 24.04 HWE+ / Ubuntu 26.04. For RHEL 9 use
 ### Latency-EWMA effects
 
 The +56% raid1 randread number on RHEL 10 (and the +45% raid10
-randread on RHEL 9) comes from `md-latency-ewma` — the per-rdev
+randread on RHEL 9) comes from `read-balance` — the per-rdev
 exponentially-weighted moving average of read latency that biases
 the read balancer.
 

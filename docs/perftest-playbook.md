@@ -8,8 +8,8 @@ Two comparison tools live in `bin/`:
 
 - **`perf-compare`** — feature-branch comparison: same bitmap mode across
   variants (`--bitmap`, default lockless), different code variants
-  (baseline + per-bucket-arrays + takeover + latency-ewma).
-  Four DKMS rebuilds per run.
+  (baseline + per-bucket-arrays + takeover + read-balance +
+  llbitmap-fixes + meshstor-main). Six DKMS rebuilds per run.
 - **`perf-bitmap-compare`** — bitmap-mode comparison on the same code:
   four modes (md-internal, md-lockless, ms-internal, ms-lockless);
   md-lockless is auto-skipped when the kernel lacks md llbitmap
@@ -196,25 +196,39 @@ sudo ~/linux-meshstor/bin/perf-compare \
 
 #### 3.1.C Run only a subset of variants
 
-Append variant names (`baseline per-bucket-arrays takeover latency-ewma`)
-at the end of any of the above:
+Append variant names (`baseline per-bucket-arrays takeover read-balance
+llbitmap-fixes meshstor-main`) at the end of any of the above:
 
 ```bash
 sudo ~/linux-meshstor/bin/perf-compare \
     --level=raid10 --port=14420 \
     --local=/dev/nvme0n1p4 --local=/dev/nvme1n1p1 \
     --remote=/dev/nvme1n1p2 --remote=/dev/nvme0n1p5 \
-    baseline latency-ewma \
+    baseline read-balance \
     | tee /tmp/perf-run.log
 ```
 
-Wall-clock estimate per full run:
+Defaults are 6 variants × 6 suites (`peak-randread-iops` + 3 SNIA +
+`kp-asym-read` + `kp-resync-overlap-write`).
+
+Wall clock is dominated by two costs — one DKMS rebuild per variant, and one
+fio run per (variant, suite) cell:
+
+```
+minutes ≈ 3 × variants  +  3 × variants × suites     (+ cool-down)
+```
+
+Both coefficients are ~3 min, fitted to three measured runs on the raid10
+cross-disk preset (5×5 → 80–95 min, 1×5 → 16–22 min, 5×1 → ~30 min; the fit
+reproduces all three within their spread). The thermal gate between variants
+is *not* in the formula and can add materially on a hot box — see § 3.3.
 
 | Variants | Suites | Estimate |
 |---|---|---|
-| 5 | 5 (default: peak-randread-iops + 3 SNIA + ewma-asymmetric-read) | ~80–95 min (cool-down may add more) |
-| 1 | 5 | ~16–22 min |
-| 5 | 1 (single suite via `SUITES=name`) | ~30 min |
+| 6 | 6 (both defaults) | ~2 h |
+| 1 | 6 | ~20 min |
+| 6 | 1 (single suite via `SUITES=name`) | ~35 min |
+| 1 | 1 | ~6 min |
 
 ### 3.2 — `perf-bitmap-compare` (bitmap-mode comparison)
 
@@ -241,7 +255,7 @@ sudo ~/linux-meshstor/bin/perf-bitmap-compare \
     | tee /tmp/perf-bitmap-run.log
 ```
 
-#### 3.2.C Run a single suite (default is the same 8 as perf-compare)
+#### 3.2.C Run a single suite (default is the same 6 as perf-compare)
 
 ```bash
 sudo ~/linux-meshstor/bin/perf-bitmap-compare \
@@ -269,11 +283,13 @@ sudo ~/linux-meshstor/bin/perf-bitmap-compare \
     /dev/nvme0n1p4 /dev/nvme0n1p5
 ```
 
-Wall-clock estimate per full run (3 modes):
+Wall-clock estimate per full run (3 modes). Measured figures, not fitted —
+this tool builds once and re-runs the suites per mode, so it does not follow
+`perf-compare`'s per-variant-rebuild cost model above:
 
 | Suites | Estimate |
 |---|---|
-| 8 (default: peak-randread-iops + 3 SNIA + 4 kp-*)  | ~35–50 min (incl. one DKMS build + 2 cool-downs) |
+| 6 (default: peak-randread-iops + 3 SNIA + 2 kp-*)  | ~35–50 min (incl. one DKMS build + 2 cool-downs) |
 | 1 (e.g., kp-asym-read)        | ~5–10 min (~2 min build + 3×~1 min suite + cool-downs) |
 
 ### 3.3 — Tuning the thermal gate (applies to both tools)

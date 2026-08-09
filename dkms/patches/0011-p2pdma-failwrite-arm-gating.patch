@@ -35,7 +35,7 @@ variant.
 Because 0011 is only ever applied to a stage-1 tree, its hunks use ordinary
 context -- EXCEPT the raid10 read-fidelity hunk, which keeps minimal symmetric
 context (leading anchor `} else if (!raid1_should_handle_error(bio)) {`,
-trailing `uptodate = 1;`): in the composed meshstor-main tree the md-latency-ewma
+trailing `uptodate = 1;`): in the composed meshstor-main tree the read-balance
 branch inserts its fold-kick block directly above that anchor (before
 `set_bit(R10BIO_Uptodate ...)`), so diff-default three-line context anchors on
 shape-specific lines and rejects at --fuzz=0 on whichever p2pdma-bearing

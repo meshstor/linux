@@ -21,7 +21,7 @@ upstream/master ── master ──┐
 - **`master`** tracks `upstream/master` 1:1, verbatim. Every commit on
   `master` exists upstream. Never modified locally.
 - **`meshstor-main`** carries our integration commits on top of `master`.
-  Cherry-picked feature commits (per-bucket-arrays, latency-EWMA,
+  Cherry-picked feature commits (per-bucket-arrays, read-balance,
   raid1↔raid10 takeover, llbitmap), DKMS packaging metadata, compat
   shims, this documentation set.
 
@@ -68,15 +68,15 @@ real-world cases.
 
 **Pattern A: upstream renamed a function our integration commits use.**
 
-Symptom: rebase stops in a feature commit (e.g., the latency-EWMA
-commit) with a conflict like:
+Symptom: rebase stops in a feature commit (e.g., the read-balance
+latency-EWMA commit) with a conflict like:
 
 ```
 <<<<<<< HEAD
         old_function_name(arg);
 =======
         ewma_aware_function(arg);
->>>>>>> latency-ewma feature commit
+>>>>>>> read-balance feature commit
 ```
 
 Fix: keep our side's logic but use the new name. If the rename is

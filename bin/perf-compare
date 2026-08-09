@@ -31,7 +31,7 @@ SUITES_BASE="${SUITES_BASE:-/home/$SUDO_USER/csi-perf-test/suites}"
 # so its IOPS reflects per-IO latency rather than peak throughput and shows
 # spurious cross-variant deltas. peak-randread-iops measures past the knee.
 #
-#   kp-asym-read                  latency-ewma headline. 5 ms netem on lo +
+#   kp-asym-read                  read-balance headline. 5 ms netem on lo +
 #                                 qd=8 single-thread randread — the only
 #                                 regime where read-balance choice dominates
 #                                 per-IO latency. Symmetric-leg SNIA suites
@@ -73,12 +73,12 @@ SUITES=()
 for _s in "${_suite_names[@]}"; do SUITES+=("$SUITES_BASE/$_s"); done
 unset _s _suite_names
 
-declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover latency-ewma llbitmap-fixes meshstor-main)
+declare -a VARIANT_LABELS=(baseline per-bucket-arrays takeover read-balance llbitmap-fixes meshstor-main)
 declare -A VARIANT_ARGS=(
     [baseline]=""
     [per-bucket-arrays]="per-bucket-arrays"
     [takeover]="takeover"
-    [latency-ewma]="md-latency-ewma"
+    [read-balance]="read-balance"
     [llbitmap-fixes]="llbitmap-fixes"
     [meshstor-main]="meshstor-main"
 )
@@ -86,8 +86,8 @@ declare -A VARIANT_VER=(
     [baseline]="0.1.0-baseline"
     [per-bucket-arrays]="0.1.0-pba"
     [takeover]="0.1.0-takeover"
-    [latency-ewma]="0.1.0-ewma"
-    [llbitmap-fixes]="0.1.0-llbf"
+    [read-balance]="0.1.0-read"
+    [llbitmap-fixes]="0.1.0-llbitmap"
     [meshstor-main]="0.1.0-main"
 )
 
@@ -106,7 +106,7 @@ Positional form (raid1, default): two partitions = one local + one remote
 Flag form (raid10): N --local + N --remote (>=2 each), interleaved into
 N mirror pairs. Each mirror pair has one local + one nvme-tcp leg.
 
-Variants: baseline per-bucket-arrays takeover latency-ewma llbitmap-fixes
+Variants: baseline per-bucket-arrays takeover read-balance llbitmap-fixes
           meshstor-main
           (default: all 6)
 
@@ -279,7 +279,7 @@ COOL_THRESH_K="${COOL_THRESH_K:-348}"
 
 # ----- summary parsers (fio JSON output) -----
 #
-# Some suites (e.g. ewma-asymmetric-read) append diagnostic text after the
+# Some suites (e.g. kp-asym-read) append diagnostic text after the
 # fio JSON object — passing the whole file to jq causes a parse error on
 # the trailer and jq exits non-zero, so the values get lost. Strip the
 # trailer before piping to jq.
