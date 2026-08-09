@@ -238,6 +238,15 @@ struct md_rdev {
 		unsigned int size;	/* Size in sectors of the PPL space */
 		sector_t sector;	/* First sector of the PPL space */
 	} ppl;
+
+	/*
+	 * First FAILURE observed for this member inside the array's P2P
+	 * window: 0 = none seen, 1 = P2PDMA failure, 2 = other failure.
+	 * Successes are deliberately not recorded (see
+	 * raid1_p2pdma_observe()). Diagnostics only -- never consulted by any
+	 * I/O decision.
+	 */
+	u8 p2pdma_observed;
 };
 enum flag_bits {
 	Faulty,			/* device is known to have a fault */
