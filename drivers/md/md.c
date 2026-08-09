@@ -11019,6 +11019,54 @@ module_param(create_on_open, bool, S_IRUSR|S_IWUSR);
 module_param(legacy_async_del_gendisk, bool, 0600);
 module_param(check_new_feature, bool, 0600);
 
+/*
+ * P2PDMA advertise policy. "auto" (default) advertises only when every
+ * non-faulty member advertises. "always" forces it on: needed where a member's
+ * gendisk hides a P2P-capable path, e.g. an nvme-rdma namespace behind a
+ * multipath head on a kernel with no nvme_core.multipath toggle. "never"
+ * disables P2P for every array on the host.
+ */
+enum {
+	MD_P2PDMA_ADVERTISE_AUTO = 0,
+	MD_P2PDMA_ADVERTISE_ALWAYS = 1,
+	MD_P2PDMA_ADVERTISE_NEVER = 2,
+};
+int p2pdma_advertise = MD_P2PDMA_ADVERTISE_AUTO;
+EXPORT_SYMBOL_GPL(p2pdma_advertise);
+
+static const char * const p2pdma_advertise_names[] = {
+	[MD_P2PDMA_ADVERTISE_AUTO]   = "auto",
+	[MD_P2PDMA_ADVERTISE_ALWAYS] = "always",
+	[MD_P2PDMA_ADVERTISE_NEVER]  = "never",
+};
+
+static int p2pdma_advertise_set(const char *val, const struct kernel_param *kp)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(p2pdma_advertise_names); i++) {
+		if (sysfs_streq(val, p2pdma_advertise_names[i])) {
+			*(int *)kp->arg = i;
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
+static int p2pdma_advertise_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%s\n", p2pdma_advertise_names[*(int *)kp->arg]);
+}
+
+static const struct kernel_param_ops p2pdma_advertise_ops = {
+	.set = p2pdma_advertise_set,
+	.get = p2pdma_advertise_get,
+};
+module_param_cb(p2pdma_advertise, &p2pdma_advertise_ops, &p2pdma_advertise,
+		S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(p2pdma_advertise,
+		 "PCI P2PDMA advertise policy: auto (every member must support it), always, never");
+
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("MD RAID framework");
 MODULE_ALIAS("md");
