@@ -324,6 +324,8 @@ static void call_bio_endio(struct r1bio *r1_bio)
 
 	if (!test_bit(R1BIO_Uptodate, &r1_bio->state))
 		bio->bi_status = BLK_STS_IOERR;
+	if (test_bit(R1BIO_P2PError, &r1_bio->state))
+		bio->bi_status = BLK_STS_INVAL;
 
 	bio_endio(bio);
 }
@@ -402,6 +404,10 @@ static void raid1_end_read_request(struct bio *bio)
 		 * want to retry */
 		;
 	} else if (!raid1_should_handle_error(bio)) {
+		if (test_bit(R1BIO_P2P, &r1_bio->state) &&
+		    (bio->bi_status == BLK_STS_INVAL ||
+		     bio->bi_status == BLK_STS_TARGET))
+			set_bit(R1BIO_P2PError, &r1_bio->state);
 		uptodate = 1;
 	} else {
 		/* If all other devices have failed, we want to return
@@ -482,7 +488,26 @@ static void raid1_end_write_request(struct bio *bio)
 	/*
 	 * 'one mirror IO has finished' event handler:
 	 */
-	if (bio->bi_status && !ignore_error) {
+	if (bio->bi_status && test_bit(R1BIO_P2P, &r1_bio->state) &&
+	    (bio->bi_status == BLK_STS_INVAL ||
+	     bio->bi_status == BLK_STS_TARGET)) {
+		/*
+		 * A P2P bio failing INVAL (>=6.17 dma-map) or TARGET
+		 * (-EREMOTEIO on older kernels / fabrics) means the peer
+		 * device cannot reach this member -- a topology property,
+		 * not a device failure. Fail the whole write loud
+		 * (BLK_STS_INVAL via call_bio_endio), fault nothing,
+		 * record no badblocks; exclude this leg from
+		 * narrow_write_error by nulling it, exactly like the
+		 * success branch.
+		 */
+		set_bit(R1BIO_P2PError, &r1_bio->state);
+		pr_warn_ratelimited("md/raid1:%s: %pg: no P2P path for peer pages (status=%d), failing write; if legs diverged run: echo repair > sync_action\n",
+				    mdname(conf->mddev), rdev->bdev,
+				    blk_status_to_errno(bio->bi_status));
+		r1_bio->bios[mirror] = NULL;
+		to_put = bio;
+	} else if (bio->bi_status && !ignore_error) {
 		set_bit(WriteErrorSeen,	&rdev->flags);
 		if (!test_and_set_bit(WantReplacement, &rdev->flags))
 			set_bit(MD_RECOVERY_NEEDED, &
@@ -1430,6 +1455,8 @@ static void raid1_read_request(struct mddev *mddev, struct bio *bio,
 
 	r1_bio->read_disk = rdisk;
 	if (likely(!md_cloned_bio(mddev, bio))) {
+		if (md_bio_is_p2pdma(bio))
+			set_bit(R1BIO_P2P, &r1_bio->state);
 		md_account_bio(mddev, &bio);
 		r1_bio->master_bio = bio;
 	}
@@ -1647,6 +1674,8 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
 		r1_bio->sectors = max_sectors;
 	}
 
+	if (md_bio_is_p2pdma(bio))
+		set_bit(R1BIO_P2P, &r1_bio->state);
 	md_account_bio(mddev, &bio);
 	r1_bio->master_bio = bio;
 	atomic_set(&r1_bio->remaining, 1);
