@@ -1,0 +1,404 @@
+Synthesise BLK_STS_P2PDMA for member completions on kernels whose block layer
+cannot produce it.
+
+Upstream's v6 series teaches md that an unroutable PCI peer-to-peer transfer is
+a property of the PCIe topology, not of device health: BLK_STS_P2PDMA fences the
+range with a badblock instead of faulting the member or retrying. None of the
+kernels this package ships to can emit that status:
+
+  - 6.12 / 6.14 report BLK_STS_TARGET for an unroutable P2P write;
+  - 6.17 / 7.0 report BLK_STS_INVAL, which md DELIBERATELY swallows since
+    upstream f7b24c7b41f2 ("md/raid1,raid10: don't handle IO error for
+    REQ_RAHEAD and REQ_NOWAIT") -- raid1_should_handle_error() returns false,
+    the write is accounted successful, and the mirror diverges silently: one
+    leg has the data, the other does not, and nothing records the difference.
+
+So on every target kernel the upstream handling is dead code unless md is told
+which completions really mean "no P2P path". This patch supplies that, in five
+parts per personality, all gated on
+`#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)`.
+The second half of the gate matters: on a kernel that DOES define the status,
+translating INVAL or TARGET would be actively wrong -- there INVAL means a
+genuinely invalid request and TARGET means NS_NOT_READY / LBA_RANGE /
+CMD_INTERRUPTED, and mistranslating either would mis-fence a healthy member.
+
+1. TAG (raid1.h / raid10.h enum + raid1.c / raid10.c request functions).
+   A new R1BIO_P2PDMA / R10BIO_P2PDMA state bit, set beside md_account_bio()
+   in raid1_read_request(), raid1_write_request() and the raid10 twins. It has
+   to be a state bit, and it has to be set at submit: md_bio_is_p2pdma() reads
+   the bio's first bvec, and by completion bi_iter.bi_size has been consumed to
+   0 so bio_has_data() is false and the pages are no longer visible. raid10's
+   read-retry path resets r10_bio->state = 0 before re-entering
+   raid10_read_request(), which re-sets the tag, so the reset is covered.
+   The bit is inserted mid-enum (between WriteError and FailFast / FailFast and
+   Discard) deliberately: the enum tail differs between the p2pdma pin and the
+   composed meshstor-main tree, which appends R1BIO_Probe / R10BIO_Probe.
+   r1_bio->state is in-memory only, so renumbering the later bits is harmless.
+
+2. INBOUND TRANSLATION (all four *_end_*_request handlers). On a tagged bio,
+   BLK_STS_INVAL and BLK_STS_TARGET are rewritten to BLK_STS_P2PDMA before any
+   status is inspected, and upstream's own handling then runs unmodified.
+   In the two WRITE endios this cannot simply be prepended: ignore_error is
+   computed in its declaration initializer, and that initializer calls
+   raid1_should_handle_error(), which is exactly the function that swallows
+   INVAL. The declaration is therefore split from its assignment (a
+   behaviour-neutral change on every kernel) and the translation goes between
+   the two. The READ endios compute `int uptodate = !bio->bi_status`, whose
+   truthiness the translation preserves -- all three statuses are nonzero -- so
+   there it only needs to precede the if-chain.
+   The raid10 read-endio hunk deliberately carries minimal symmetric context
+   (two leading, two trailing anchor lines). In composed trees md-latency-ewma
+   inserts a fold-kick block a few lines below, inside the same `uptodate`
+   branch; generous context would anchor on shape-specific lines and reject at
+   --fuzz=0 against whichever composition the patch was not cut against.
+
+3. OUTBOUND CLAMP (call_bio_endio() in raid1, raid_end_bio_io() in raid10).
+   A residual BLK_STS_P2PDMA on the MASTER bio becomes BLK_STS_IOERR. On a
+   kernel that does not define the status, 18 is a zero-filled hole in
+   blk_errors[] that still passes the ARRAY_SIZE bounds check, so
+   blk_status_to_errno(18) returns 0 -- SUCCESS -- for a failed I/O. The value
+   must never reach the O_DIRECT errno conversion.
+
+4. TAG-GATED WRITE DISPATCH (handle_write_finished() / handle_write_completed()).
+   Upstream's direct rdev_set_badblocks() arm is taken whenever the TAG is set,
+   whatever the status, so a tagged bio never reaches narrow_write_error().
+   The IsSync/IsRecover branch and the raid10 replacement-leg arms stay OUTSIDE
+   the gate: replacement writes already go to md_error() at endio and can never
+   reach narrow_write_error(), and the sync branch uses raw status booleans and
+   already badblocks correctly.
+
+5. narrow_write_error() STATUS CHECK. After submit_bio_wait(), a wbio whose
+   bi_status is BLK_STS_P2PDMA is treated as failed rather than trusting the
+   returned errno. This is REQUIRED, not defensive, and part 4 does not subsume
+   it: part 4 only diverts TAGGED bios, and md_bio_is_p2pdma() only inspects
+   bi_io_vec[0]. A bio whose first page is a host page but whose later pages
+   are P2P is never tagged; it fails on the remote leg with a native
+   BLK_STS_P2PDMA (our patched nvme-rdma emits the value directly), which is
+   neither INVAL nor TARGET, so the ordinary error path carries it into
+   narrow_write_error() -- whose retry chunks are then judged by
+   blk_status_to_errno(18) = 0 and recorded as written. No badblock, master bio
+   acked successful, mirror diverged. This part is that case's only guard.
+
+Deliberately NOT changed: the raid1_p2pdma_observe() diagnostics latch still
+gates on whether the array advertises, not on the new tag. Rewiring it here
+would make diagnostics behave differently on kernels that have BLK_STS_P2PDMA
+than on kernels that do not; a consistent approximation is preferable. The
+translation does run ahead of the latch, so a tagged legacy failure is now
+latched as a P2P verdict on every kernel -- which is the consistent answer.
+
+Source-level, not a header shim: it adds preprocessor structure to drivers/md,
+splits two declaration initializers, and introduces a state bit.
+
+Hand-maintained: the `.when` guard (raid1-10.c:raid1_write_error) makes this
+patch composition-specific, and regenerate.sh never re-diffs guarded patches.
+Drift must be fixed by hand, keeping the raid10 read-endio hunk's context
+minimal and symmetric.
+
+--- a/raid1.c
++++ b/raid1.c
+@@ -325,6 +325,18 @@
+ 	if (!test_bit(R1BIO_Uptodate, &r1_bio->state))
+ 		bio->bi_status = BLK_STS_IOERR;
+ 
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	/*
++	 * Never let a status this kernel's block layer does not know reach
++	 * the master bio: blk_errors[] has a zero-filled hole at index 18
++	 * that still passes the ARRAY_SIZE bounds check, so
++	 * blk_status_to_errno() would report the failure as errno 0 --
++	 * success -- to the O_DIRECT submitter.
++	 */
++	if (bio->bi_status == BLK_STS_P2PDMA)
++		bio->bi_status = BLK_STS_IOERR;
++#endif
++
+ 	bio_endio(bio);
+ }
+ 
+@@ -389,6 +401,20 @@
+ 	struct r1conf *conf = r1_bio->mddev->private;
+ 	struct md_rdev *rdev = conf->mirrors[r1_bio->read_disk].rdev;
+ 
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	/*
++	 * This kernel's block layer cannot produce BLK_STS_P2PDMA: an
++	 * unroutable peer-to-peer transfer surfaces as BLK_STS_TARGET
++	 * (<= 6.14) or BLK_STS_INVAL (>= 6.17). Rewrite it here, ahead of
++	 * every status test below, so upstream's handling runs unmodified.
++	 * 'uptodate' above is unaffected -- all three statuses are nonzero.
++	 */
++	if (test_bit(R1BIO_P2PDMA, &r1_bio->state) &&
++	    (bio->bi_status == BLK_STS_INVAL ||
++	     bio->bi_status == BLK_STS_TARGET))
++		bio->bi_status = BLK_STS_P2PDMA;
++#endif
++
+ 	if (bio->bi_status == BLK_STS_P2PDMA ||
+ 	    raid1_p2pdma_is_advertising(conf->mddev))
+ 		raid1_p2pdma_observe(rdev, bio->bi_status);
+@@ -480,7 +506,22 @@
+ 	struct md_rdev *rdev = conf->mirrors[mirror].rdev;
+ 	sector_t lo = r1_bio->sector;
+ 	sector_t hi = r1_bio->sector + r1_bio->sectors - 1;
+-	bool ignore_error = !raid1_should_handle_error(bio) ||
++	bool ignore_error;
++
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	/*
++	 * Must precede the ignore_error computation below:
++	 * raid1_should_handle_error() SWALLOWS BLK_STS_INVAL (upstream
++	 * f7b24c7b41f2), so an untranslated P2P failure on >= 6.17 would be
++	 * recorded as a successful write and the mirror would diverge.
++	 */
++	if (test_bit(R1BIO_P2PDMA, &r1_bio->state) &&
++	    (bio->bi_status == BLK_STS_INVAL ||
++	     bio->bi_status == BLK_STS_TARGET))
++		bio->bi_status = BLK_STS_P2PDMA;
++#endif
++
++	ignore_error = !raid1_should_handle_error(bio) ||
+ 		(bio->bi_status && bio_op(bio) == REQ_OP_DISCARD);
+ 
+ 	if (bio->bi_status == BLK_STS_P2PDMA ||
+@@ -1432,6 +1473,10 @@
+ 		md_account_bio(mddev, &bio);
+ 		r1_bio->master_bio = bio;
+ 	}
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	if (md_bio_is_p2pdma(bio))
++		set_bit(R1BIO_P2PDMA, &r1_bio->state);
++#endif
+ 	read_bio = bio_alloc_clone(mirror->rdev->bdev, bio, gfp,
+ 				   &mddev->bio_set);
+ 	read_bio->bi_opf &= ~REQ_NOWAIT;
+@@ -1651,6 +1696,10 @@
+ 
+ 	md_account_bio(mddev, &bio);
+ 	r1_bio->master_bio = bio;
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	if (md_bio_is_p2pdma(bio))
++		set_bit(R1BIO_P2PDMA, &r1_bio->state);
++#endif
+ 	atomic_set(&r1_bio->remaining, 1);
+ 	atomic_set(&r1_bio->behind_remaining, 0);
+ 
+@@ -2559,6 +2608,8 @@
+ 
+ 	while (sect_to_write) {
+ 		struct bio *wbio;
++		int err;
++
+ 		if (sectors > sect_to_write)
+ 			sectors = sect_to_write;
+ 		/* Write at 'sector' for 'sectors'*/
+@@ -2582,7 +2633,21 @@
+ 		bio_trim(wbio, sector - r1_bio->sector, sectors);
+ 		wbio->bi_iter.bi_sector += rdev->data_offset;
+ 
+-		if (submit_bio_wait(wbio) &&
++		err = submit_bio_wait(wbio);
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++		/*
++		 * A bio whose first bvec is a host page but whose later
++		 * pages are P2P is never tagged, so the tag gate in
++		 * handle_write_finished() does not divert it: the member
++		 * returns BLK_STS_P2PDMA natively (our patched nvme-rdma
++		 * emits it) and submit_bio_wait() maps that to errno 0 --
++		 * blk_errors[18] is a hole here -- so a failed chunk would
++		 * be recorded as written and the range left unfenced.
++		 */
++		if (wbio->bi_status == BLK_STS_P2PDMA)
++			err = -EIO;
++#endif
++		if (err &&
+ 		    !rdev_set_badblocks(rdev, sector, sectors, 0)) {
+ 			/*
+ 			 * Badblocks set failed, disk marked Faulty.
+@@ -2639,7 +2704,20 @@
+ 			struct md_rdev *rdev = conf->mirrors[m].rdev;
+ 
+ 			fail = true;
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++			/*
++			 * Gate on the TAG as well as the status: a tagged bio
++			 * that failed with some other status must still not
++			 * reach narrow_write_error(), whose retry chunks are
++			 * judged by blk_status_to_errno() and would be read
++			 * back as successful. Fence the range directly, exactly
++			 * as upstream does for a native BLK_STS_P2PDMA.
++			 */
++			if (test_bit(R1BIO_P2PDMA, &r1_bio->state) ||
++			    r1_bio->bios[m]->bi_status == BLK_STS_P2PDMA)
++#else
+ 			if (r1_bio->bios[m]->bi_status == BLK_STS_P2PDMA)
++#endif
+ 				rdev_set_badblocks(rdev, r1_bio->sector,
+ 						   r1_bio->sectors, 0);
+ 			else
+--- a/raid1.h
++++ b/raid1.h
+@@ -185,2 +185,10 @@
+ 	R1BIO_WriteError,
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++/* The master bio carries PCI P2PDMA pages. Set at submit, while the bio's
++ * iterator is still whole: by completion bi_iter.bi_size has been consumed
++ * to 0, bio_has_data() is false, and md_bio_is_p2pdma() can no longer see
++ * the pages.
++ */
++	R1BIO_P2PDMA,
++#endif
+ 	R1BIO_FailFast,
+--- a/raid10.c
++++ b/raid10.c
+@@ -325,6 +325,17 @@
+ 	if (!test_and_set_bit(R10BIO_Returned, &r10_bio->state)) {
+ 		if (!test_bit(R10BIO_Uptodate, &r10_bio->state))
+ 			bio->bi_status = BLK_STS_IOERR;
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++		/*
++		 * Never let a status this kernel's block layer does not know
++		 * reach the master bio: blk_errors[] has a zero-filled hole at
++		 * index 18 that still passes the ARRAY_SIZE bounds check, so
++		 * blk_status_to_errno() would report the failure as errno 0 --
++		 * success -- to the O_DIRECT submitter.
++		 */
++		if (bio->bi_status == BLK_STS_P2PDMA)
++			bio->bi_status = BLK_STS_IOERR;
++#endif
+ 		bio_endio(bio);
+ 	}
+ 
+@@ -387,4 +398,18 @@
+ 	rdev = r10_bio->devs[slot].rdev;
+ 
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	/*
++	 * This kernel's block layer cannot produce BLK_STS_P2PDMA: an
++	 * unroutable peer-to-peer transfer surfaces as BLK_STS_TARGET
++	 * (<= 6.14) or BLK_STS_INVAL (>= 6.17). Rewrite it here, ahead of
++	 * every status test below, so upstream's handling runs unmodified.
++	 * 'uptodate' above is unaffected -- all three statuses are nonzero.
++	 */
++	if (test_bit(R10BIO_P2PDMA, &r10_bio->state) &&
++	    (bio->bi_status == BLK_STS_INVAL ||
++	     bio->bi_status == BLK_STS_TARGET))
++		bio->bi_status = BLK_STS_P2PDMA;
++#endif
++
+ 	if (bio->bi_status == BLK_STS_P2PDMA ||
+ 	    raid1_p2pdma_is_advertising(conf->mddev))
+@@ -465,7 +490,22 @@
+ 	int slot, repl;
+ 	struct md_rdev *rdev = NULL;
+ 	struct bio *to_put = NULL;
+-	bool ignore_error = !raid1_should_handle_error(bio) ||
++	bool ignore_error;
++
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	/*
++	 * Must precede the ignore_error computation below:
++	 * raid1_should_handle_error() SWALLOWS BLK_STS_INVAL (upstream
++	 * f7b24c7b41f2), so an untranslated P2P failure on >= 6.17 would be
++	 * recorded as a successful write and the mirror would diverge.
++	 */
++	if (test_bit(R10BIO_P2PDMA, &r10_bio->state) &&
++	    (bio->bi_status == BLK_STS_INVAL ||
++	     bio->bi_status == BLK_STS_TARGET))
++		bio->bi_status = BLK_STS_P2PDMA;
++#endif
++
++	ignore_error = !raid1_should_handle_error(bio) ||
+ 		(bio->bi_status && bio_op(bio) == REQ_OP_DISCARD);
+ 
+ 	dev = find_bio_disk(conf, r10_bio, bio, &slot, &repl);
+@@ -1232,6 +1272,10 @@
+ 		md_account_bio(mddev, &bio);
+ 		r10_bio->master_bio = bio;
+ 	}
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	if (md_bio_is_p2pdma(bio))
++		set_bit(R10BIO_P2PDMA, &r10_bio->state);
++#endif
+ 	read_bio = bio_alloc_clone(rdev->bdev, bio, gfp, &mddev->bio_set);
+ 	read_bio->bi_opf &= ~REQ_NOWAIT;
+ 
+@@ -1507,6 +1551,10 @@
+ 
+ 	md_account_bio(mddev, &bio);
+ 	r10_bio->master_bio = bio;
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++	if (md_bio_is_p2pdma(bio))
++		set_bit(R10BIO_P2PDMA, &r10_bio->state);
++#endif
+ 	atomic_set(&r10_bio->remaining, 1);
+ 
+ 	for (i = 0; i < conf->copies; i++) {
+@@ -2827,6 +2875,8 @@
+ 	while (sect_to_write) {
+ 		struct bio *wbio;
+ 		sector_t wsector;
++		int err;
++
+ 		if (sectors > sect_to_write)
+ 			sectors = sect_to_write;
+ 		/* Write at 'sector' for 'sectors' */
+@@ -2841,7 +2891,21 @@
+ 		if (md_bio_is_p2pdma(wbio))
+ 			wbio->bi_opf |= REQ_NOMERGE;
+ 
+-		if (submit_bio_wait(wbio) &&
++		err = submit_bio_wait(wbio);
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++		/*
++		 * A bio whose first bvec is a host page but whose later
++		 * pages are P2P is never tagged, so the tag gate in
++		 * handle_write_completed() does not divert it: the member
++		 * returns BLK_STS_P2PDMA natively (our patched nvme-rdma
++		 * emits it) and submit_bio_wait() maps that to errno 0 --
++		 * blk_errors[18] is a hole here -- so a failed chunk would
++		 * be recorded as written and the range left unfenced.
++		 */
++		if (wbio->bi_status == BLK_STS_P2PDMA)
++			err = -EIO;
++#endif
++		if (err &&
+ 		    !rdev_set_badblocks(rdev, wsector, sectors, 0)) {
+ 			/*
+ 			 * Badblocks set failed, disk marked Faulty.
+@@ -2955,7 +3019,23 @@
+ 				rdev_dec_pending(rdev, conf->mddev);
+ 			} else if (bio != NULL && bio->bi_status) {
+ 				fail = true;
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++				/*
++				 * Gate on the TAG as well as the
++				 * status: a tagged bio that failed
++				 * with some other status must still
++				 * not reach narrow_write_error(),
++				 * whose retry chunks are judged by
++				 * blk_status_to_errno() and would
++				 * read back as successful. Fence the
++				 * range directly, as upstream does
++				 * for a native BLK_STS_P2PDMA.
++				 */
++				if (test_bit(R10BIO_P2PDMA, &r10_bio->state) ||
++				    bio->bi_status == BLK_STS_P2PDMA)
++#else
+ 				if (bio->bi_status == BLK_STS_P2PDMA)
++#endif
+ 					rdev_set_badblocks(rdev,
+ 							   r10_bio->devs[m].addr,
+ 							   r10_bio->sectors, 0);
+--- a/raid10.h
++++ b/raid10.h
+@@ -176,2 +176,10 @@
+ 	R10BIO_FailFast,
++#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
++/* The master bio carries PCI P2PDMA pages. Set at submit, while the bio's
++ * iterator is still whole: by completion bi_iter.bi_size has been consumed
++ * to 0, bio_has_data() is false, and md_bio_is_p2pdma() can no longer see
++ * the pages.
++ */
++	R10BIO_P2PDMA,
++#endif
+ 	R10BIO_Discard,

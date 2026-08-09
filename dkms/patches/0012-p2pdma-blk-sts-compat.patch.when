@@ -1,0 +1,10 @@
+# Guard for build-tarball's conditional patch application.
+# Format: [!]<relpath-in-tarball>:<grep -E regex>   (ALL lines must hold)
+# A leading '!' negates (the pattern must NOT be present).
+#
+# 0012 synthesises BLK_STS_P2PDMA for member completions on kernels whose
+# block layer cannot produce it. It only makes sense on a tree that carries
+# upstream's v6 completion handling, i.e. where raid1_write_error() exists.
+# On the bare upstream `master` baseline that helper is absent and the whole
+# patch would reject.
+raid1-10.c:raid1_write_error
