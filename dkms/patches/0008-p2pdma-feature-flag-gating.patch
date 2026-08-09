@@ -1,37 +1,107 @@
 P2PDMA advertise feature-flag gating -- compile the P2P advertise out on
 pre-6.11 kernels.
 
-The P2P advertise machinery lives in drivers/md (feature branch p2pdma-fixes)
-and is present in BOTH featured variants the kit builds: the member-AND
-advertise via raid1_can_advertise_p2pdma(), the md_bio_is_p2pdma() detector,
-and the add-path re-gate helper raid1_p2pdma_clear_on_add(). On kernels without
-BLK_FEAT_PCI_P2PDMA (pre-6.11, e.g. RHEL9/5.14, which also lack the
-FOLL_PCI_P2PDMA O_DIRECT path) the whole advertise must compile out. Gate every
-site on HAVE_BLK_FEAT_PCI_P2PDMA (dkms/Makefile.in feature_flags probe): the
-helpers and both advertise sites (raid1_set_limits, raid10_set_queue_limits)
-#ifdef out entirely; md_bio_is_p2pdma() folds to a constant false so its callers
-(REQ_NOMERGE preserve, write-behind skip) still build;
-raid1_p2pdma_clear_on_add() folds to an empty inline stub so the four call sites
-become no-ops with no per-call gating.
+The P2P advertise machinery lives in drivers/md (feature branch p2pdma) and is
+present in every p2pdma-bearing tree: the md_bio_is_p2pdma() detector (md.h),
+the member-AND policy raid1_can_advertise_p2pdma(), the per-bio diagnostic
+latch raid1_p2pdma_observe(), its gate raid1_p2pdma_is_advertising(), and the
+member-change re-evaluation raid1_p2pdma_reeval_on_change() (all four in
+raid1-10.c, shared by both personalities), plus the p2pdma_advertise
+auto|always|never module parameter and the read-only p2pdma_status sysfs
+attribute (both in md.c). On kernels without BLK_FEAT_PCI_P2PDMA (pre-6.11,
+e.g. RHEL9/5.14, which also lack the FOLL_PCI_P2PDMA O_DIRECT path) neither the
+queue_limits feature bit nor the blk_queue_pci_p2pdma() accessor exist, so the
+whole advertise must compile out. Gate every site on HAVE_BLK_FEAT_PCI_P2PDMA
+(dkms/Makefile.in feature_flags probe):
 
-The stage-1 fail-the-write COMPLETION arms (feature branch p2pdma: the
-R1BIO_P2PError / R10BIO_P2PError end_write_request arms, the call_bio_endio /
-raid_end_bio_io master-status overrides, the end_read_request read-fidelity
-blocks) are gated separately in 0011-p2pdma-failwrite-arm-gating.patch, because
-that arm code exists ONLY in the full stage-1 tree. This advertise-gating patch
-applies to every p2pdma-bearing tree; 0011 self-selects to the stage-1 tree via
-its raid10.c:R10BIO_P2PError .when guard. This patch's own .when guard keys on
-raid1_can_advertise_p2pdma (present in both featured variants); on bare upstream
-`master` the helper is absent and 0009 handles upstream's raw P2PDMA assignment
-instead.
+  - md_bio_is_p2pdma() folds to a constant false so its callers (REQ_NOMERGE
+    preserve, write-behind skip, narrow_write_error() clones) still build.
+  - raid1_can_advertise_p2pdma() #ifdef's out entirely, along with both
+    advertise call sites (raid1_set_limits, raid10_set_queue_limits).
+  - raid1_p2pdma_is_advertising() and raid1_p2pdma_reeval_on_change() fold to a
+    constant-false / empty-inline stub respectively, so their call sites (the
+    four *_end_*_request completion latches, and the six add/remove-path
+    reeval calls) need no per-call gating.
+  - raid1_p2pdma_observe() and rdev->p2pdma_observed stay UNGATED: neither
+    touches BLK_FEAT_PCI_P2PDMA or blk_queue_pci_p2pdma(), so they compile
+    everywhere and simply go unread on kernels where the status attribute
+    below is compiled out.
+  - the p2pdma_advertise module parameter (enum, EXPORT_SYMBOL_GPL, its
+    kernel_param_ops, module_param_cb, MODULE_PARM_DESC, and md.h's matching
+    `extern int p2pdma_advertise;`) and the p2pdma_status attribute
+    (p2pdma_status_show(), its md_sysfs_entry, and the md_redundancy_attrs[]
+    registration) #ifdef out entirely: there is no advertise policy to steer,
+    or capability to report, once raid1_can_advertise_p2pdma() itself does not
+    exist.
+
+0011-p2pdma-failwrite-arm-gating.patch, which used to gate a separate set of
+stage-1 fail-the-write completion arms (R1BIO_P2PError / R10BIO_P2PError), is
+retired: that arm code no longer exists in any tree (superseded by upstream's
+badblock-and-continue semantics), so 0011 is dead weight, not a companion.
+
+This patch's own .when guard keys on raid1_can_advertise_p2pdma (present in
+every meshstor-composed tree that carries the p2pdma feature); on bare
+upstream `master` the helper is absent and 0009/0010 handle upstream's raw
+P2PDMA assignment instead.
 
 Source-level, not a header shim: it adds preprocessor structure to drivers/md.
 
+diff --git a/md.c b/md.c
+index 50f9aa7..c988fac 100644
+--- a/md.c
++++ b/md.c
+@@ -5473,6 +5473,7 @@ degraded_show(struct mddev *mddev, char *page)
+ }
+ static struct md_sysfs_entry md_degraded = __ATTR_RO(degraded);
+
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ /*
+  * Report, per member, the static P2PDMA advertise capability and the first
+  * observed P2P completion verdict. Read-only and purely observational: it
+@@ -5506,6 +5507,7 @@ p2pdma_status_show(struct mddev *mddev, char *page)
+ }
+ static struct md_sysfs_entry md_p2pdma_status =
+ __ATTR(p2pdma_status, S_IRUGO, p2pdma_status_show, NULL);
++#endif
+
+ static ssize_t
+ sync_force_parallel_show(struct mddev *mddev, char *page)
+@@ -6122,7 +6124,9 @@ static struct attribute *md_redundancy_attrs[] = {
+ 	&md_suspend_hi.attr,
+ 	&md_bitmap.attr,
+ 	&md_degraded.attr,
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ 	&md_p2pdma_status.attr,
++#endif
+ 	NULL,
+ };
+ static const struct attribute_group md_redundancy_group = {
+@@ -11068,7 +11072,12 @@ module_param(check_new_feature, bool, 0600);
+  * gendisk hides a P2P-capable path, e.g. an nvme-rdma namespace behind a
+  * multipath head on a kernel with no nvme_core.multipath toggle. "never"
+  * disables P2P for every array on the host.
++ *
++ * The whole knob compiles out on kernels without BLK_FEAT_PCI_P2PDMA
++ * (pre-6.11, e.g. RHEL9/5.14): there is no advertise policy to steer when
++ * raid1_can_advertise_p2pdma() itself does not exist there.
+  */
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ enum {
+ 	MD_P2PDMA_ADVERTISE_AUTO = 0,
+ 	MD_P2PDMA_ADVERTISE_ALWAYS = 1,
+@@ -11109,6 +11118,7 @@ module_param_cb(p2pdma_advertise, &p2pdma_advertise_ops, &p2pdma_advertise,
+ 		S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(p2pdma_advertise,
+ 		 "PCI P2PDMA advertise policy: auto (every member must support it), always, never");
++#endif
+
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("MD RAID framework");
 diff --git a/md.h b/md.h
-index bee2420..4daf5a1 100644
+index 50a5fac..3410f01 100644
 --- a/md.h
 +++ b/md.h
-@@ -39,8 +39,12 @@
+@@ -33,8 +33,12 @@
   */
  static inline bool md_bio_is_p2pdma(struct bio *bio)
  {
@@ -42,33 +112,47 @@ index bee2420..4daf5a1 100644
 +	return false;
 +#endif
  }
+
  /*
-  * Number of guaranteed raid bios in case of extreme VM load:
+@@ -1054,7 +1058,9 @@ struct mdu_array_info_s;
+ struct mdu_disk_info_s;
+
+ extern int mdp_major;
++#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
+ extern int p2pdma_advertise;
++#endif
+ void md_autostart_arrays(int part);
+ int md_set_array_info(struct mddev *mddev, struct mdu_array_info_s *info);
+ int md_add_new_disk(struct mddev *mddev, struct mdu_disk_info_s *info);
 diff --git a/raid1-10.c b/raid1-10.c
-index 9113e8d..f6e2fb4 100644
+index dbfe63c..c647c04 100644
 --- a/raid1-10.c
 +++ b/raid1-10.c
-@@ -304,6 +304,7 @@ static inline bool raid1_should_handle_error(struct bio *bio)
- 		bio->bi_status != BLK_STS_INVAL;
+@@ -342,6 +342,7 @@ static inline void raid1_p2pdma_observe(struct md_rdev *rdev, blk_status_t sts)
+ 	rdev->p2pdma_observed = v;
  }
- 
+
 +#ifdef HAVE_BLK_FEAT_PCI_P2PDMA
  /*
-  * Advertise PCI P2PDMA only when every non-faulty member can do it.
-  * BLK_FEAT_PCI_P2PDMA is excluded from BLK_FEAT_INHERIT_MASK, so md sets it
-@@ -353,3 +354,7 @@ static void raid1_p2pdma_clear_on_add(struct mddev *mddev, struct md_rdev *rdev)
- 	lim.features &= ~BLK_FEAT_PCI_P2PDMA;
- 	queue_limits_commit_update(mddev->gendisk->queue, &lim);
+  * Whether the array is currently advertising PCI P2PDMA, for gating the
+  * latch above. This deliberately reads the live queue feature bit rather
+@@ -424,3 +425,11 @@ static void raid1_p2pdma_reeval_on_change(struct mddev *mddev)
+ 		lim.features &= ~BLK_FEAT_PCI_P2PDMA;
+ 	queue_limits_commit_update(q, &lim);
  }
 +#else
-+static inline void raid1_p2pdma_clear_on_add(struct mddev *mddev,
-+					     struct md_rdev *rdev) { }
++static inline bool raid1_p2pdma_is_advertising(struct mddev *mddev)
++{
++	return false;
++}
++
++static inline void raid1_p2pdma_reeval_on_change(struct mddev *mddev) { }
 +#endif
 diff --git a/raid1.c b/raid1.c
-index 0db5753..a3b3baf 100644
+index 2a248a5..69e649e 100644
 --- a/raid1.c
 +++ b/raid1.c
-@@ -3267,8 +3274,10 @@ static int raid1_set_limits(struct mddev *mddev)
+@@ -3254,8 +3254,10 @@ static int raid1_set_limits(struct mddev *mddev)
  	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
  	if (err)
  		return err;
@@ -78,12 +162,12 @@ index 0db5753..a3b3baf 100644
 +#endif
  	return queue_limits_set(mddev->gendisk->queue, &lim);
  }
- 
+
 diff --git a/raid10.c b/raid10.c
-index c142ee9..6c9e180 100644
+index 11e4adb..f874003 100644
 --- a/raid10.c
 +++ b/raid10.c
-@@ -3999,8 +4006,10 @@ static int raid10_set_queue_limits(struct mddev *mddev)
+@@ -3980,8 +3980,10 @@ static int raid10_set_queue_limits(struct mddev *mddev)
  	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
  	if (err)
  		return err;
@@ -93,4 +177,4 @@ index c142ee9..6c9e180 100644
 +#endif
  	return queue_limits_set(mddev->gendisk->queue, &lim);
  }
- 
+
