@@ -332,6 +332,11 @@ static bool raid1_can_advertise_p2pdma(struct mddev *mddev)
 	struct md_rdev *rdev;
 	bool any = false;
 
+	if (p2pdma_advertise == 1)		/* always */
+		return true;
+	if (p2pdma_advertise == 2)		/* never */
+		return false;
+
 	rdev_for_each(rdev, mddev) {
 		if (test_bit(Faulty, &rdev->flags))
 			continue;
