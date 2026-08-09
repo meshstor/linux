@@ -81,11 +81,20 @@ p2p_last_result() {
 
 # Submit one p2p I/O via the test module. Usage:
 #   p2p_io <op> <target-dev> <provider-bdf>   -> echoes errno (0 = success)
+# Runs in command substitution, so on failure it returns 1 (never exits)
+# and echoes nothing, printing a FAIL line to stderr instead.
 p2p_io() {
-	local op="$1" tgt="$2" prov="$3"
+	local op="$1" tgt="$2" prov="$3" before after
+	[ -e "$MODULES_DIR/md_p2p_test.ko" ] || p2p_fail "md_p2p_test.ko not built (run make in modules/)"
 	rmmod md_p2p_test 2>/dev/null || true
+	before=$(dmesg | grep -c 'md_p2p_test: result')
 	insmod "$MODULES_DIR/md_p2p_test.ko" \
 		provider="$prov" target="$tgt" op="$op" >/dev/null 2>&1 || true
+	after=$(dmesg | grep -c 'md_p2p_test: result')
+	if [ "$after" -le "$before" ]; then
+		echo "FAIL: p2p_io: no new result line (insmod failed before I/O?)" >&2
+		return 1
+	fi
 	p2p_last_result
 }
 

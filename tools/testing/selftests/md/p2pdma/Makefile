@@ -7,6 +7,6 @@
 TEST_PROGS := \
 	test_rig_cmb_provider.sh
 
-TEST_FILES := lib.sh run_vm.sh
+TEST_FILES := lib.sh run_vm.sh modules
 
 include ../../lib.mk

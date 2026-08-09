@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+# kbuild outputs (this tree has no top-level .gitignore)
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+.module-common.o
+modules.order
+Module.symvers
