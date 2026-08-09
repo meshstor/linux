@@ -167,6 +167,17 @@ enum r10bio_state {
  */
 	R10BIO_MadeGood,
 	R10BIO_WriteError,
+/* The master bio carries PCI P2PDMA (peer device) pages. Set at submit
+ * time, while the bio's iterator is still whole: by completion
+ * bi_iter.bi_size has been consumed to 0, so bio_has_data() is false
+ * and md_bio_is_p2pdma() can no longer detect the pages.
+ */
+	R10BIO_P2P,
+/* A leg failed BLK_STS_INVAL/BLK_STS_TARGET on a P2P bio: this GPU
+ * cannot reach that member (no P2P path), not a device failure. The
+ * master bio is failed with BLK_STS_INVAL; the member is not faulted.
+ */
+	R10BIO_P2PError,
 /* During a reshape we might be performing IO on the
  * 'previous' part of the array, in which case this
  * flag is set

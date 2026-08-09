@@ -325,6 +325,8 @@ static void raid_end_bio_io(struct r10bio *r10_bio)
 	if (!test_and_set_bit(R10BIO_Returned, &r10_bio->state)) {
 		if (!test_bit(R10BIO_Uptodate, &r10_bio->state))
 			bio->bi_status = BLK_STS_IOERR;
+		if (test_bit(R10BIO_P2PError, &r10_bio->state))
+			bio->bi_status = BLK_STS_INVAL;
 		bio_endio(bio);
 	}
 
@@ -402,6 +404,10 @@ static void raid10_end_read_request(struct bio *bio)
 		 */
 		set_bit(R10BIO_Uptodate, &r10_bio->state);
 	} else if (!raid1_should_handle_error(bio)) {
+		if (test_bit(R10BIO_P2P, &r10_bio->state) &&
+		    (bio->bi_status == BLK_STS_INVAL ||
+		     bio->bi_status == BLK_STS_TARGET))
+			set_bit(R10BIO_P2PError, &r10_bio->state);
 		uptodate = 1;
 	} else {
 		/* If all other devices that store this block have
@@ -475,7 +481,28 @@ static void raid10_end_write_request(struct bio *bio)
 	/*
 	 * this branch is our 'one mirror IO has finished' event handler:
 	 */
-	if (bio->bi_status && !ignore_error) {
+	if (bio->bi_status && test_bit(R10BIO_P2P, &r10_bio->state) &&
+	    (bio->bi_status == BLK_STS_INVAL ||
+	     bio->bi_status == BLK_STS_TARGET)) {
+		/*
+		 * See raid1_end_write_request(): a P2P bio failing
+		 * INVAL/TARGET means the peer device cannot reach this
+		 * member -- a topology property, not a device failure.
+		 * Fail the master loud (BLK_STS_INVAL via
+		 * raid_end_bio_io), fault nothing, record no badblocks;
+		 * keep this leg out of handle_write_completed's
+		 * narrow_write_error/badblocks by nulling it.
+		 */
+		set_bit(R10BIO_P2PError, &r10_bio->state);
+		pr_warn_ratelimited("md/raid10:%s: %pg: no P2P path for peer pages (status=%d), failing write; if legs diverged run: echo repair > sync_action\n",
+				    mdname(rdev->mddev), rdev->bdev,
+				    blk_status_to_errno(bio->bi_status));
+		if (repl)
+			r10_bio->devs[slot].repl_bio = NULL;
+		else
+			r10_bio->devs[slot].bio = NULL;
+		to_put = bio;
+	} else if (bio->bi_status && !ignore_error) {
 		if (repl)
 			/* Never record new bad blocks to replacement,
 			 * just fail it.
@@ -1553,6 +1580,9 @@ static bool __make_request(struct mddev *mddev, struct bio *bio, int sectors)
 	r10_bio->read_slot = -1;
 	memset(r10_bio->devs, 0, sizeof(r10_bio->devs[0]) *
 			conf->geo.raid_disks);
+
+	if (md_bio_is_p2pdma(bio))
+		set_bit(R10BIO_P2P, &r10_bio->state);
 
 	ret = true;
 	if (bio_data_dir(bio) == READ)
