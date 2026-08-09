@@ -389,6 +389,10 @@ static void raid1_end_read_request(struct bio *bio)
 	struct r1conf *conf = r1_bio->mddev->private;
 	struct md_rdev *rdev = conf->mirrors[r1_bio->read_disk].rdev;
 
+	if (bio->bi_status == BLK_STS_P2PDMA ||
+	    raid1_p2pdma_is_advertising(conf->mddev))
+		raid1_p2pdma_observe(rdev, bio->bi_status);
+
 	/*
 	 * this branch is our 'one mirror IO has finished' event handler:
 	 */
@@ -478,6 +482,10 @@ static void raid1_end_write_request(struct bio *bio)
 	sector_t hi = r1_bio->sector + r1_bio->sectors - 1;
 	bool ignore_error = !raid1_should_handle_error(bio) ||
 		(bio->bi_status && bio_op(bio) == REQ_OP_DISCARD);
+
+	if (bio->bi_status == BLK_STS_P2PDMA ||
+	    raid1_p2pdma_is_advertising(conf->mddev))
+		raid1_p2pdma_observe(rdev, bio->bi_status);
 
 	/*
 	 * 'one mirror IO has finished' event handler:

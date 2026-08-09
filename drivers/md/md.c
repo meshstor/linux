@@ -3806,6 +3806,7 @@ int md_rdev_init(struct md_rdev *rdev)
 	rdev->last_read_error = 0;
 	rdev->sb_loaded = 0;
 	rdev->bb_page = NULL;
+	rdev->p2pdma_observed = 0;
 	atomic_set(&rdev->nr_pending, 0);
 	atomic_set(&rdev->read_errors, 0);
 	atomic_set(&rdev->corrected_errors, 0);
@@ -5472,6 +5473,68 @@ degraded_show(struct mddev *mddev, char *page)
 }
 static struct md_sysfs_entry md_degraded = __ATTR_RO(degraded);
 
+/*
+ * Report, per member, the static P2PDMA advertise capability and the first
+ * observed P2P completion verdict. Read-only and purely observational: it
+ * never influences an I/O decision. This is how an operator tells apart the
+ * two failure modes that look identical from GPUDirect's side (bounce-buffer
+ * fallback): the array never advertised P2P for this member, versus it
+ * advertised and P2P writes are being fenced.
+ *
+ * "observed=" is a FAILURE latch, not a completion latch: none (no P2P
+ * failure seen for this member), p2pdma (a real or translated
+ * BLK_STS_P2PDMA), or other (any other failure observed while the array was
+ * advertising P2P). There is no "ok" -- see raid1_p2pdma_observe() in
+ * raid1-10.c for why recording success would make the latch useless. The
+ * obs[] indices below must stay in step with the values that function
+ * stores, and with the one-shot pr_info it emits on the same transition.
+ *
+ * A leading array-level line ("array advertise=... policy=...") reports the
+ * array's OWN gendisk queue's BLK_FEAT_PCI_P2PDMA bit -- the same bit
+ * raid1_p2pdma_is_advertising() (see raid1-10.c) reads from the I/O
+ * completion path -- not a re-derivation of the policy. dm-raid arrays never
+ * set up this queue feature at all (see raid1_run()/raid10_run() and
+ * raid1_p2pdma_reeval_on_change()), so they always read "no" here regardless
+ * of policy. Its "policy=" duplicates the p2pdma_advertise_names[] strings
+ * from the module_param_cb wiring further down this file (kept local rather
+ * than shared, so as not to disturb that block's position -- it is a hunk
+ * boundary for dkms/patches/0008-p2pdma-feature-flag-gating.patch on the
+ * harness branch; the first three lines of THIS comment are also such a
+ * boundary and must stay verbatim).
+ */
+static ssize_t
+p2pdma_status_show(struct mddev *mddev, char *page)
+{
+	static const char * const obs[] = { "none", "p2pdma", "other" };
+	static const char * const policy[] = { "auto", "always", "never" };
+	struct md_rdev *rdev;
+	ssize_t len = 0;
+	bool array_advertise = !mddev_is_dm(mddev) && mddev->gendisk &&
+			       blk_queue_pci_p2pdma(mddev->gendisk->queue);
+
+	len += sysfs_emit_at(page, len, "array advertise=%s policy=%s\n",
+			     array_advertise ? "yes" : "no",
+			     policy[p2pdma_advertise]);
+
+	/*
+	 * md_attr_show() only pins mddev via mddev_get()/mddev_put(); it does
+	 * not hold reconfig_mutex around ->show(), so a plain rdev_for_each()
+	 * here would race a concurrent hot_remove_disk()'s
+	 * list_del_rcu()+synchronize_rcu()+kfree(). Use the RCU-safe walk.
+	 */
+	rcu_read_lock();
+	rdev_for_each_rcu(rdev, mddev)
+		len += sysfs_emit_at(page, len, "%pg advertise=%s observed=%s\n",
+				     rdev->bdev,
+				     blk_queue_pci_p2pdma(bdev_get_queue(rdev->bdev))
+					     ? "yes" : "no",
+				     obs[rdev->p2pdma_observed]);
+	rcu_read_unlock();
+	return len;
+}
+static struct md_sysfs_entry md_p2pdma_status =
+__ATTR(p2pdma_status, S_IRUGO, p2pdma_status_show, NULL);
+
 static ssize_t
 sync_force_parallel_show(struct mddev *mddev, char *page)
 {
@@ -6087,6 +6150,7 @@ static struct attribute *md_redundancy_attrs[] = {
 	&md_suspend_hi.attr,
 	&md_bitmap.attr,
 	&md_degraded.attr,
+	&md_p2pdma_status.attr,
 	NULL,
 };
 static const struct attribute_group md_redundancy_group = {
@@ -7182,9 +7246,16 @@ static int do_md_stop(struct mddev *mddev, int mode)
 		/* tell userspace to handle 'inactive' */
 		sysfs_notify_dirent_safe(mddev->sysfs_state);
 
-		rdev_for_each(rdev, mddev)
+		rdev_for_each(rdev, mddev) {
 			if (rdev->raid_disk >= 0)
 				sysfs_unlink_rdev(mddev, rdev);
+			/*
+			 * Re-arm the P2PDMA diagnostic latch: a bound rdev
+			 * survives mode==2 (stop but keep disks), and the
+			 * next run() may see a different P2P picture.
+			 */
+			rdev->p2pdma_observed = 0;
+		}
 
 		set_capacity_and_notify(disk, 0);
 		mddev->changed = 1;

@@ -321,6 +321,59 @@ static inline void raid1_write_error(struct mddev *mddev, struct md_rdev *rdev,
 }
 
 /*
+ * Record the first P2P-window FAILURE verdict per member, for
+ * /sys/block/mdX/md/p2pdma_status, and log it once per member so a failure
+ * is greppable in dmesg without polling sysfs.
+ *
+ * FAILURES ONLY -- there is deliberately no "ok" verdict. The callers gate
+ * this on "the completion carries BLK_STS_P2PDMA, or the array is currently
+ * advertising P2P". Once an array advertises, the first completion of ANY
+ * kind latches, and in production that is essentially always an ordinary
+ * host-page write (mkfs, journal, metadata). A first-write-wins latch with
+ * an "ok" state would therefore pin to "ok" immediately and never record
+ * the later P2P failure -- destroying exactly the discrimination this
+ * report exists to provide. Dropping "ok" makes observed=none mean "no P2P
+ * failure seen", which is both honest and useful, and needs no submit-time
+ * P2P tag to stay that way.
+ *
+ * Diagnostics only: this must never influence an I/O decision, so it is a
+ * plain unlocked store of a one-shot value -- a race between two first
+ * failures can only pick one of two truthful answers, and at worst logs the
+ * line twice. The pr_info deliberately precedes the store so the tail of
+ * this function stays a stable context anchor for
+ * dkms/patches/0008-p2pdma-feature-flag-gating.patch.
+ */
+static inline void raid1_p2pdma_observe(struct md_rdev *rdev, blk_status_t sts)
+{
+	u8 v;
+
+	if (!sts || rdev->p2pdma_observed)
+		return;
+	v = (sts == BLK_STS_P2PDMA) ? 1 : 2;
+	pr_info("md/%s: %pg: %s (status=%u); see p2pdma_status\n",
+		mdname(rdev->mddev), rdev->bdev,
+		v == 1 ? "no P2P path for peer pages" :
+			 "I/O error while the array advertises P2P",
+		(unsigned int)(__force u8)sts);
+	rdev->p2pdma_observed = v;
+}
+
+/*
+ * Whether the array is currently advertising PCI P2PDMA, for gating the
+ * latch above. This deliberately reads the live queue feature bit rather
+ * than recomputing the policy via raid1_can_advertise_p2pdma(): the latter
+ * walks the full rdev list, which is safe only under reconfig_mutex (see its
+ * callers), not from this unlocked bio completion path. mddev->gendisk is
+ * NULL under dm-raid, which never sets up P2PDMA queue limits (see
+ * raid1_p2pdma_reeval_on_change()).
+ */
+static inline bool raid1_p2pdma_is_advertising(struct mddev *mddev)
+{
+	return !mddev_is_dm(mddev) &&
+	       blk_queue_pci_p2pdma(mddev->gendisk->queue);
+}
+
+/*
  * Advertise PCI P2PDMA only when every non-faulty member can do it, unless
  * overridden by the p2pdma_advertise=always|never module parameter.
  * BLK_FEAT_PCI_P2PDMA is excluded from BLK_FEAT_INHERIT_MASK, so md sets it

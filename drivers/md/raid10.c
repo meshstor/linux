@@ -385,6 +385,11 @@ static void raid10_end_read_request(struct bio *bio)
 
 	slot = r10_bio->read_slot;
 	rdev = r10_bio->devs[slot].rdev;
+
+	if (bio->bi_status == BLK_STS_P2PDMA ||
+	    raid1_p2pdma_is_advertising(conf->mddev))
+		raid1_p2pdma_observe(rdev, bio->bi_status);
+
 	/*
 	 * this branch is our 'one mirror IO has finished' event handler:
 	 */
@@ -472,6 +477,11 @@ static void raid10_end_write_request(struct bio *bio)
 		repl = 0;
 		rdev = conf->mirrors[dev].rdev;
 	}
+
+	if (bio->bi_status == BLK_STS_P2PDMA ||
+	    raid1_p2pdma_is_advertising(conf->mddev))
+		raid1_p2pdma_observe(rdev, bio->bi_status);
+
 	/*
 	 * this branch is our 'one mirror IO has finished' event handler:
 	 */
