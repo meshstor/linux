@@ -319,3 +319,25 @@ static inline void raid1_write_error(struct mddev *mddev, struct md_rdev *rdev,
 	    (bio->bi_opf & MD_FAILFAST))
 		md_error(mddev, rdev);
 }
+
+/*
+ * Advertise PCI P2PDMA only when every non-faulty member can do it.
+ * BLK_FEAT_PCI_P2PDMA is excluded from BLK_FEAT_INHERIT_MASK, so md sets it
+ * explicitly, and only when every member can DMA-map P2P (GPU) source pages:
+ * md is a pure router that never touches the pages, but each member maps them,
+ * so a member without P2P support must not be handed P2P I/O.
+ */
+static bool raid1_can_advertise_p2pdma(struct mddev *mddev)
+{
+	struct md_rdev *rdev;
+	bool any = false;
+
+	rdev_for_each(rdev, mddev) {
+		if (test_bit(Faulty, &rdev->flags))
+			continue;
+		if (!blk_queue_pci_p2pdma(bdev_get_queue(rdev->bdev)))
+			return false;
+		any = true;
+	}
+	return any;
+}

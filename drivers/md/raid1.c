@@ -3239,10 +3239,11 @@ static int raid1_set_limits(struct mddev *mddev)
 	lim.max_hw_wzeroes_unmap_sectors = 0;
 	lim.logical_block_size = mddev->logical_block_size;
 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
-	lim.features |= BLK_FEAT_PCI_P2PDMA;
 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
 	if (err)
 		return err;
+	if (raid1_can_advertise_p2pdma(mddev))
+		lim.features |= BLK_FEAT_PCI_P2PDMA;
 	return queue_limits_set(mddev->gendisk->queue, &lim);
 }
 
