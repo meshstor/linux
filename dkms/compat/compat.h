@@ -604,4 +604,27 @@ static inline void bh_submit(struct buffer_head *bh, blk_opf_t opf,
 }
 #endif /* HAVE_BH_SUBMIT */
 
+/*
+ * BLK_STS_P2PDMA
+ *
+ * Upstream v6 patch 1 ("block: add BLK_STS_P2PDMA for unsupported
+ * peer-to-peer transfers") adds this status. Every kernel we ship to predates
+ * it, but v6 patches 7 and 8 reference the constant in ordinary C — without a
+ * definition the packaged sources do not compile at all.
+ *
+ * Value 18 is upstream's, and is unused on every kernel from 6.12 through
+ * 7.2-rc5, so it cannot collide with the host block layer and our patched
+ * nvme-rdma (which emits it) and md (which consumes it) agree on the number.
+ *
+ * DANGER: on a kernel that does not know this status, blk_errors[] has a
+ * zero-filled hole at index 18 that still passes the ARRAY_SIZE bounds check,
+ * so blk_status_to_errno(18) returns 0 — SUCCESS — for a failed I/O. The value
+ * must therefore never escape md. dkms/patches/0012 enforces that with an
+ * outbound clamp on the master bio, a tag-gated write-completion dispatch, and
+ * a status check after narrow_write_error()'s submit_bio_wait().
+ */
+#ifndef HAVE_BLK_STS_P2PDMA
+#define BLK_STS_P2PDMA ((__force blk_status_t)18)
+#endif
+
 #endif /* MESHSTOR_MD_COMPAT_H */
