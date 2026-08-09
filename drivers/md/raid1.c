@@ -1984,6 +1984,7 @@ static int raid1_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 			if (err)
 				return err;
 
+			raid1_p2pdma_clear_on_add(mddev, rdev);
 			raid1_add_conf(conf, rdev, mirror, false);
 			/* As all devices are equivalent, we don't need a full recovery
 			 * if this was recently any drive of the array
@@ -2001,6 +2002,7 @@ static int raid1_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		/* Add this device as a replacement */
 		clear_bit(In_sync, &rdev->flags);
 		set_bit(Replacement, &rdev->flags);
+		raid1_p2pdma_clear_on_add(mddev, rdev);
 		raid1_add_conf(conf, rdev, repl_slot, true);
 		err = 0;
 		conf->fullsync = 1;

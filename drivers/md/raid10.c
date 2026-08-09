@@ -2166,6 +2166,7 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		err = 0;
 		if (rdev->saved_raid_disk != mirror)
 			conf->fullsync = 1;
+		raid1_p2pdma_clear_on_add(mddev, rdev);
 		WRITE_ONCE(p->rdev, rdev);
 		break;
 	}
@@ -2179,6 +2180,7 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		if (err)
 			return err;
 		conf->fullsync = 1;
+		raid1_p2pdma_clear_on_add(mddev, rdev);
 		WRITE_ONCE(p->replacement, rdev);
 	}
 
