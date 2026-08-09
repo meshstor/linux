@@ -645,4 +645,213 @@ static inline void bh_submit(struct buffer_head *bh, blk_opf_t opf,
 #define BLK_STS_P2PDMA ((__force blk_status_t)18)
 #endif
 
+/*
+ * el10 P2P route fence — see docs (route-fence design, 2026-07-30).
+ *
+ * Every el10_2 kernel (verified 6.12.0-211.28.1 and the newest
+ * 6.12.0-211.40.1) grafts the provider-era p2pdma/DMA core onto old
+ * sg-based block/nvme, and the graft maps PCI_P2PDMA_MAP_THRU_HOST_BRIDGE
+ * segments to dma_address=0 WITH a success return: the device then DMAs
+ * guest/host phys page 0 — silent corruption no status can report.
+ * Same-switch BUS_ADDR pairs map correctly.
+ *
+ * The graft's own signature gates the fence (never a version check):
+ * new-era p2pdma (struct p2pdma_provider in pci-p2pdma.h) WITHOUT the
+ * new-era block DMA iterator (blk-mq-dma.h). Upstream trees have both or
+ * neither.
+ *
+ * The kernel exports no per-pair classifier (pci_p2pdma_map_type and
+ * __pci_p2pdma_update_state are not exported; pci_p2pdma_distance_many
+ * collapses BUS_ADDR/THRU_HOST_BRIDGE), so ms proves BUS_ADDR itself,
+ * conservatively: misclassification can only FENCE a workable pair
+ * (degrading to the ordinary unroutable path), never allow a corrupting
+ * one.
+ */
+/* The last two conditions make this gate a strict subset of 0012's:
+ * the fence consumes the R1BIO_P2PDMA/R10BIO_P2PDMA tag, which only
+ * exists inside 0012's compat regions. On the el10 line all four
+ * conditions hold. */
+#if defined(HAVE_P2PDMA_PROVIDER) && !defined(HAVE_BLK_MQ_DMA_H) && \
+    defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)
+#define MS_P2P_ROUTE_FENCE_KERNEL 1
+
+#include <linux/pci.h>
+
+/* ACS bits that make the kernel classify a shared-switch pair as
+ * THRU_HOST_BRIDGE anyway (TLPs redirected upward). */
+#define MS_P2P_ACS_REDIR (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_UF)
+
+static inline bool ms_p2p_bridge_acs_redirects(struct pci_dev *bridge)
+{
+	int pos;
+	u16 ctrl;
+
+	pos = pci_find_ext_capability(bridge, PCI_EXT_CAP_ID_ACS);
+	if (!pos)
+		return false;
+	pci_read_config_word(bridge, pos + PCI_ACS_CTRL, &ctrl);
+	return ctrl & MS_P2P_ACS_REDIR;
+}
+
+/* Depth of dev's upstream chain; fills path[] root-first if non-NULL. */
+#define MS_P2P_MAX_DEPTH 16
+static inline int ms_p2p_upstream_path(struct pci_dev *dev,
+				       struct pci_dev **path)
+{
+	struct pci_dev *chain[MS_P2P_MAX_DEPTH];
+	int n = 0, i;
+
+	while (dev && n < MS_P2P_MAX_DEPTH) {
+		chain[n++] = dev;
+		dev = pci_upstream_bridge(dev);
+	}
+	if (dev)		/* deeper than MS_P2P_MAX_DEPTH: refuse */
+		return -1;
+	if (path)
+		for (i = 0; i < n; i++)
+			path[i] = chain[n - 1 - i];
+	return n;
+}
+
+/*
+ * TRUE only when the provider<->client pair provably maps BUS_ADDR:
+ * a common PCIe *switch* ancestor (not the root bus / host bridge), with
+ * no ACS redirection on any bridge between either device and it.
+ */
+static inline bool ms_p2p_pair_is_bus_addr(struct pci_dev *provider,
+					   struct pci_dev *client)
+{
+	struct pci_dev *pa[MS_P2P_MAX_DEPTH], *pb[MS_P2P_MAX_DEPTH];
+	int na, nb, common, i;
+
+	if (!provider || !client)
+		return false;
+	na = ms_p2p_upstream_path(provider, pa);
+	nb = ms_p2p_upstream_path(client, pb);
+	if (na < 2 || nb < 2)	/* root-bus device: no switch above it */
+		return false;
+
+	common = -1;
+	for (i = 0; i < na && i < nb; i++) {
+		if (pa[i] != pb[i])
+			break;
+		common = i;
+	}
+	if (common < 0)
+		return false;
+	/*
+	 * pa[0] is each device's root port (both chains stop at the root
+	 * bus, whose devices have no upstream bridge). Sharing only the
+	 * root port is not enough: peer TLPs between its subordinates
+	 * still route through it, but a shared root PORT alone means the
+	 * path crosses no host bridge — however the graft's breakage is
+	 * keyed on the kernel's own classification, and upstream
+	 * calc_map_type_and_dist() treats any path that reaches a root
+	 * port WITHOUT a common switch below it as host-bridge traversal.
+	 * So require a common ancestor STRICTLY BELOW the root port: a
+	 * downstream/upstream switch port.
+	 */
+	if (common < 1)
+		return false;
+	if (pci_pcie_type(pa[common]) != PCI_EXP_TYPE_DOWNSTREAM &&
+	    pci_pcie_type(pa[common]) != PCI_EXP_TYPE_UPSTREAM)
+		return false;
+
+	/* every bridge above each device, up to and incl. the common
+	 * ancestor, must not redirect peer TLPs */
+	for (i = common; i < na - 1; i++)
+		if (ms_p2p_bridge_acs_redirects(pa[i]))
+			return false;
+	for (i = common; i < nb - 1; i++)
+		if (ms_p2p_bridge_acs_redirects(pb[i]))
+			return false;
+	return true;
+}
+
+/* First PCI ancestor of a block device's disk, or NULL. */
+static inline struct pci_dev *ms_p2p_bdev_pci_dev(struct block_device *bdev)
+{
+	struct device *dev = disk_to_dev(bdev->bd_disk);
+
+	while (dev && !dev_is_pci(dev))
+		dev = dev->parent;
+	return dev ? to_pci_dev(dev) : NULL;
+}
+
+/* PCI device whose BAR contains phys, or NULL. Walks the PCI device
+ * list. Returns with a reference held (for_each_pci_dev semantics);
+ * the caller drops it once classification is done. */
+static inline struct pci_dev *ms_p2p_provider_by_phys(phys_addr_t phys)
+{
+	struct pci_dev *pdev = NULL;
+	int bar;
+
+	for_each_pci_dev(pdev) {
+		for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+			if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM))
+				continue;
+			if (phys >= pci_resource_start(pdev, bar) &&
+			    phys <= pci_resource_end(pdev, bar))
+				return pdev;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Cached verdict for (provider-page-phys-page, member) pairs. Racy by
+ * design: entries are idempotent (the verdict is a pure function of PCI
+ * topology), so a lost update only costs a re-classification.
+ */
+struct ms_p2p_route_ent {
+	phys_addr_t prov_base;	/* phys >> 28 covers a BAR comfortably */
+	struct pci_dev *member;
+	bool ok;
+};
+
+static inline bool ms_p2p_route_ok(struct bio *bio,
+				   struct block_device *member_bdev)
+{
+	static struct ms_p2p_route_ent cache[4];
+	static unsigned int cache_next;
+	phys_addr_t phys, base;
+	struct pci_dev *member, *provider;
+	unsigned int i, slot;
+	bool ok;
+
+	member = ms_p2p_bdev_pci_dev(member_bdev);
+	/*
+	 * No PCI ancestor: brd (CPU copy, no DMA — safe), loop, or a dm
+	 * stack that hides the bottom device. Do NOT fence these — the
+	 * member-AND advertise gate already keeps such members from
+	 * inviting P2P, and fencing them would break every rig that
+	 * builds arrays over brd/dm (this suite included) for a hazard
+	 * that only materialises via a DMA-mapping driver. Residual risk,
+	 * documented with the other package-pairing hazards: an operator
+	 * forcing p2pdma_advertise=always over a dm-STACKED nvme leg on a
+	 * graft kernel bypasses this fence.
+	 */
+	if (!member)
+		return true;
+	phys = page_to_phys(bio->bi_io_vec[0].bv_page);
+	base = phys >> 28;
+	for (i = 0; i < ARRAY_SIZE(cache); i++) {
+		/* member is the last field written on fill; reading it
+		 * first (READ_ONCE) makes a torn entry read as a miss */
+		if (READ_ONCE(cache[i].member) == member &&
+		    cache[i].prov_base == base)
+			return cache[i].ok;
+	}
+	provider = ms_p2p_provider_by_phys(phys);
+	ok = ms_p2p_pair_is_bus_addr(provider, member);
+	pci_dev_put(provider);
+	slot = cache_next++ & (ARRAY_SIZE(cache) - 1);
+	WRITE_ONCE(cache[slot].member, NULL);	/* invalidate before refill */
+	cache[slot].prov_base = base;
+	cache[slot].ok = ok;
+	WRITE_ONCE(cache[slot].member, member);
+	return ok;
+}
+#endif /* HAVE_P2PDMA_PROVIDER && !HAVE_BLK_MQ_DMA_H */
+
 #endif /* MESHSTOR_MD_COMPAT_H */

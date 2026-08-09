@@ -1,0 +1,153 @@
+el10 P2P route fence: never submit P2P payloads a broken DMA graft corrupts
+
+Every RHEL/Rocky 10 el10_2 kernel (verified 6.12.0-211.28.1 through the
+newest 6.12.0-211.40.1) maps PCI_P2PDMA_MAP_THRU_HOST_BRIDGE sg segments
+to dma_address=0 while returning success: the member device then DMAs
+guest/host phys page 0 -- a WRITE puts that garbage on media, a READ
+DMAs INTO page 0 -- and no status anywhere records it. Same-switch
+BUS_ADDR pairs map correctly. The graft (provider-era p2pdma core on
+old sg-based block/nvme) exports no per-pair classifier, so compat.h
+carries a conservative one (ms_p2p_route_ok): it can only wrongly FENCE
+a workable pair, never allow a corrupting one.
+
+At the R1BIO_P2PDMA/R10BIO_P2PDMA tag sites (0012), a leg whose pairing
+is not provably BUS_ADDR gets its clone completed with BLK_STS_P2PDMA
+instead of submitted. Everything downstream is 0012's validated
+machinery: writes badblock the range without faulting the member and the
+master succeeds off surviving legs; reads mark the mirror IO_BLOCKED and
+retry another leg; when nothing survives, the failure is honest.
+Runtime master switch: p2pdma_route_fence (default on; operators clear
+it once the distro kernel is fixed within the same header shape).
+
+Gated on MS_P2P_ROUTE_FENCE_KERNEL = HAVE_P2PDMA_PROVIDER &&
+!HAVE_BLK_MQ_DMA_H -- the graft's own signature, never a version check.
+Upstream trees have both headers or neither, so this compiles away
+everywhere but the grafted el10 line.
+
+NOTE the two READ hunks carry deliberately MINIMAL symmetric context
+(one leading + one trailing anchor line): md-latency-ewma inserts its
+sampling block between mddev_trace_remap() and submit_bio_noacct() in
+composed trees, so wider trailing context would hard-reject there at
+--fuzz=0 (same technique and rationale as 0002). raid10's other
+bi_private site (reshape read) cannot match: its next line is
+bi_end_io = end_reshape_read, not mddev_trace_remap.
+
+--- a/raid1.c
++++ b/raid1.c
+@@ -1491,2 +1491,19 @@
+ 	read_bio->bi_private = r1_bio;
++#ifdef MS_P2P_ROUTE_FENCE_KERNEL
++	/*
++	 * el10 route fence: this pair would be mapped THRU_HOST_BRIDGE by
++	 * the broken DMA graft (dma_address=0 reported as success; a READ
++	 * then DMAs INTO phys page 0). Complete the clone as an unroutable
++	 * P2P failure instead of submitting: the v6 retry machinery marks
++	 * this mirror IO_BLOCKED and reads from a surviving leg, or fails
++	 * honestly when none remains.
++	 */
++	if (p2pdma_route_fence &&
++	    test_bit(R1BIO_P2PDMA, &r1_bio->state) &&
++	    !ms_p2p_route_ok(bio, mirror->rdev->bdev)) {
++		read_bio->bi_status = BLK_STS_P2PDMA;
++		bio_endio(read_bio);
++		return;
++	}
++#endif
+ 	mddev_trace_remap(mddev, read_bio, r1_bio->sector);
+@@ -1748,6 +1765,23 @@
+ 			mbio->bi_opf |= MD_FAILFAST;
+ 		mbio->bi_private = r1_bio;
+ 
++#ifdef MS_P2P_ROUTE_FENCE_KERNEL
++		/*
++		 * el10 route fence (see raid1_read_request): never hand a
++		 * P2P payload to a leg the broken graft would corrupt. The
++		 * 0012 dispatch arm badblocks the fenced range, the member
++		 * is NOT faulted, and the master succeeds off surviving
++		 * legs; all legs fenced => honest failure.
++		 */
++		if (p2pdma_route_fence &&
++		    test_bit(R1BIO_P2PDMA, &r1_bio->state) &&
++		    !ms_p2p_route_ok(bio, rdev->bdev)) {
++			atomic_inc(&r1_bio->remaining);
++			mbio->bi_status = BLK_STS_P2PDMA;
++			bio_endio(mbio);
++			continue;
++		}
++#endif
+ 		atomic_inc(&r1_bio->remaining);
+ 		mddev_trace_remap(mddev, mbio, sector);
+ 		/* flush_pending_writes() needs access to the rdev so...*/
+--- a/raid10.c
++++ b/raid10.c
+@@ -1291,2 +1291,12 @@
+ 	read_bio->bi_private = r10_bio;
++#ifdef MS_P2P_ROUTE_FENCE_KERNEL
++	/* el10 route fence: see raid1_read_request. */
++	if (p2pdma_route_fence &&
++	    test_bit(R10BIO_P2PDMA, &r10_bio->state) &&
++	    !ms_p2p_route_ok(bio, rdev->bdev)) {
++		read_bio->bi_status = BLK_STS_P2PDMA;
++		bio_endio(read_bio);
++		return;
++	}
++#endif
+ 	mddev_trace_remap(mddev, read_bio, r10_bio->sector);
+@@ -1325,6 +1335,21 @@
+ 			 && enough(conf, devnum))
+ 		mbio->bi_opf |= MD_FAILFAST;
+ 	mbio->bi_private = r10_bio;
++#ifdef MS_P2P_ROUTE_FENCE_KERNEL
++	/*
++	 * el10 route fence: see raid1_write_request. Replacement legs are
++	 * fenced too — their error path is the ordinary one (loud, may
++	 * drop the replacement), which still beats silent corruption.
++	 */
++	if (p2pdma_route_fence &&
++	    test_bit(R10BIO_P2PDMA, &r10_bio->state) &&
++	    !ms_p2p_route_ok(bio, rdev->bdev)) {
++		atomic_inc(&r10_bio->remaining);
++		mbio->bi_status = BLK_STS_P2PDMA;
++		bio_endio(mbio);
++		return;
++	}
++#endif
+ 	mddev_trace_remap(mddev, mbio, r10_bio->sector);
+ 	/* flush_pending_writes() needs access to the rdev so...*/
+ 	mbio->bi_bdev = (void *)rdev;
+--- a/md.c
++++ b/md.c
+@@ -11143,6 +11143,20 @@
+ int p2pdma_advertise = MD_P2PDMA_ADVERTISE_AUTO;
+ EXPORT_SYMBOL_GPL(p2pdma_advertise);
+ 
++#ifdef MS_P2P_ROUTE_FENCE_KERNEL
++/*
++ * el10 route fence master switch (mechanism and kernel-bug rationale in
++ * compat.h): default ON wherever the broken DMA graft is detected. An
++ * operator may clear it once the distro kernel is fixed within the same
++ * header shape.
++ */
++bool p2pdma_route_fence = true;
++EXPORT_SYMBOL_GPL(p2pdma_route_fence);
++module_param(p2pdma_route_fence, bool, 0644);
++MODULE_PARM_DESC(p2pdma_route_fence,
++	"fence P2P I/O to members this kernel would corrupt via a thru-host-bridge mapping (default 1)");
++#endif
++
+ static const char * const p2pdma_advertise_names[] = {
+ 	[MD_P2PDMA_ADVERTISE_AUTO]   = "auto",
+ 	[MD_P2PDMA_ADVERTISE_ALWAYS] = "always",
+--- a/md.h
++++ b/md.h
+@@ -31,6 +31,10 @@
+  * WARNs on the split clones md handles, and data-less bios have no
+  * bi_io_vec.  Not valid after the bio's iterator is consumed.
+  */
++#ifdef MS_P2P_ROUTE_FENCE_KERNEL
++extern bool p2pdma_route_fence;
++#endif
++
+ static inline bool md_bio_is_p2pdma(struct bio *bio)
+ {
+ #ifdef HAVE_BLK_FEAT_PCI_P2PDMA

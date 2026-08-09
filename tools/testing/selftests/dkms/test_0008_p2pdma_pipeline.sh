@@ -174,13 +174,17 @@ assert_file_not_matches "$OUT/raid1_ms.c" 'BLK_FEAT_PCI_P2PDMA.*MS_\|HAVE_BLK_FE
 	"the P2PDMA capability tokens must not be corrupted by the md_*->ms_* rename"
 
 # assert_gated FILE EXTENDED_REGEX MESSAGE -- the pattern must appear in FILE
-# and EVERY non-preprocessor occurrence must sit inside an
-# #ifdef HAVE_BLK_FEAT_PCI_P2PDMA span (its #else or matching #endif ends the
-# span; nested #if levels are tracked). Same scoped-awk style as the
-# raid1_write_request ordering check above.
+# and EVERY non-preprocessor occurrence must sit inside a
+# `#if defined(HAVE_BLK_FEAT_PCI_P2PDMA) && !defined(HAVE_BLK_STS_P2PDMA)`
+# span OR a `#ifdef MS_P2P_ROUTE_FENCE_KERNEL` span -- compat.h defines
+# that macro under the same two conditions plus the graft signature, so
+# it is a strict subset of 0012's gate (0013's fence hooks live there).
+# A span's #else or matching #endif ends it; nested #if levels are
+# tracked.
 assert_gated() {
 	awk -v rx="$2" '
-		/^[ \t]*#[ \t]*if/    { st[++sp] = /#[ \t]*ifdef[ \t]+HAVE_BLK_FEAT_PCI_P2PDMA/ }
+		/^[ \t]*#[ \t]*if/    { st[++sp] = /#[ \t]*if[ \t]+defined\(HAVE_BLK_FEAT_PCI_P2PDMA\)[ \t]*&&[ \t]*![ \t]*defined\(HAVE_BLK_STS_P2PDMA\)/ \
+		                                 || /#[ \t]*ifdef[ \t]+MS_P2P_ROUTE_FENCE_KERNEL/ }
 		/^[ \t]*#[ \t]*else/  { if (sp) st[sp] = 0 }
 		/^[ \t]*#[ \t]*endif/ { if (sp) sp-- }
 		$0 ~ rx && $0 !~ /^[ \t]*#/ {

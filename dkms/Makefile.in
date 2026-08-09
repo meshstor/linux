@@ -80,6 +80,7 @@ feature_flags:
 	        queue_limits_stack_bdev:linux/blkdev.h \
 	        BLK_FEAT_PCI_P2PDMA:linux/blkdev.h \
 	        BLK_STS_P2PDMA:linux/blk_types.h \
+	        p2pdma_provider:linux/pci-p2pdma.h \
 	        queue_limits_stack_integrity_bdev:linux/blk-integrity.h \
 	        queue_limits_stack_integrity_bdev:linux/blkdev.h \
 	        bdev_file_open_by_dev:linux/blkdev.h \
@@ -126,6 +127,9 @@ feature_flags:
 	    if grep -qE "\\bBLK_FEAT_ATOMIC_WRITES\\b" \
 	        "$(KDIR)/include/linux/blkdev.h" 2>/dev/null; then \
 	        echo "#define HAVE_BLK_FEAT_ATOMIC_WRITES 1"; \
+	    fi; \
+	    if [ -f "$(KDIR)/include/linux/blk-mq-dma.h" ]; then \
+	        echo "#define HAVE_BLK_MQ_DMA_H 1"; \
 	    fi; \
 	    echo ''; \
 	    echo '#endif /* MESHSTOR_MS_FEATURE_FLAGS_H */'; \

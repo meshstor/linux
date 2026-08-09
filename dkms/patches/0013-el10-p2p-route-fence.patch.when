@@ -1,0 +1,13 @@
+# Guard for build-tarball's conditional patch application.
+# Format: [!]<relpath-in-tarball>:<grep -E regex>   (ALL lines must hold)
+# A leading '!' negates (the pattern must NOT be present).
+#
+# 0013 hooks the R1BIO_P2PDMA/R10BIO_P2PDMA tag sites that 0012 adds and
+# fences legs through the meshstor advertise/observe machinery, so it needs
+# exactly the tree shapes 0012 needs -- the same two predicates, for the
+# same reasons (see 0012's guard for the full rationale). The el10-only
+# activation is NOT the guard's job: that is compile-time, via
+# MS_P2P_ROUTE_FENCE_KERNEL (HAVE_P2PDMA_PROVIDER && !HAVE_BLK_MQ_DMA_H)
+# from compat/feature_flags.h, so one tarball still serves every kernel.
+raid1-10.c:raid1_write_error
+raid1-10.c:raid1_can_advertise_p2pdma
