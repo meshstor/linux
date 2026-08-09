@@ -10,11 +10,16 @@
 # feature branch, in order. The result is ready to force-push.
 #
 # Feature branches = every refs/remotes/origin/* EXCEPT the non-feature refs
-# in EXCLUDE below (master, the composition target, and harness-based tooling
+# in EXCLUDE below (master, the composition target, harness-based tooling
 # branches such as meshstor-harness and gds-campaign, which do not descend
-# from origin/master). Order: llbitmap-fixes first (if present), then the rest
-# alphabetically. Each branch must be based on the current origin/master
-# (validated up front) or the run aborts.
+# from origin/master, and superseded `*-old` snapshots kept for reference —
+# those DO descend from origin/master and would otherwise be replayed on top
+# of the live branch that replaced them). Order: llbitmap-fixes first (if
+# present), then the rest alphabetically. Each branch must be based on the
+# current origin/master (validated up front) or the run aborts.
+#
+# EXCLUDE is matched exactly (see is_excluded), so a new retired branch must be
+# listed by name here — retiring one as `<name>-old` does not auto-exclude it.
 #
 # meshstor-harness is normally excluded (meshstor-main stays kernel-tree-only),
 # but --include-harness bakes it in as a single SQUASHED commit AFTER every
@@ -37,7 +42,8 @@ REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 REMOTE="origin"
 BASE_REF="$REMOTE/master"
 TARGET_BRANCH="meshstor-main"
-EXCLUDE=(master meshstor-harness meshstor-main HEAD gds-campaign)
+EXCLUDE=(master meshstor-harness meshstor-main HEAD gds-campaign
+         llbitmap-fixes-old p2pdma-old)
 PRIORITY_BRANCH="llbitmap-fixes"   # always cherry-picked first when present
 HARNESS_BRANCH="meshstor-harness"  # optional trailing squashed overlay (--include-harness)
 WORKTREE="$REPO_ROOT/.worktrees/meshstor-main-rebuild"
