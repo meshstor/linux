@@ -22,6 +22,13 @@ has it yet). The sibling `dkms/` package defines the same value and consumes
 it directly — this status crosses the module boundary between the two
 drivers, so the two definitions must never drift apart.
 
+`compat.h` is therefore a **required top-level tarball file**, alongside
+`Makefile`/`README.md`/`COPYING` — `bin/build-nvme-tarball` copies it to the
+tarball root (not per-variant) because every variant's vendored `rdma.c`
+`#include`s it from there. A future edit to that script's file list must not
+drop it, or every variant fails to build with `rdma.c: fatal error:
+compat.h: No such file or directory`.
+
 Supported kernel families (see `BUILD_EXCLUSIVE_KERNEL` in dkms.conf):
 
 | Variant     | Family            | Source of vendored files            |

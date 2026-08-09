@@ -15,9 +15,17 @@
 #     b8764f3 BLK_FEAT_PCI_P2PDMA) are wrapped TOGETHER in one
 #     #ifdef HAVE_QUEUE_LIMITS_FEATURES block before the stack call, so they compile
 #     out cleanly on kernels without queue_limits.features (pre-6.11);
-#   * NONE of the meshstor p2pdma-fixes feature (member-AND helper, ms_bio_is_p2pdma)
-#     leaks into the baseline;
+#   * NONE of the meshstor-only p2pdma value-add (member-AND helper,
+#     p2pdma_advertise knob, p2pdma_status report) leaks into the baseline;
 #   * ms_mod/raid1_ms/raid10_ms link from the bare-upstream source.
+#
+# Re-keyed 2026-07-29 (v6 rework): 0009/0010's `.patch.when` guards already key
+# on `raid1_can_advertise_p2pdma` (verified, not md_bio_is_p2pdma), so they
+# needed no change here. This file's own leak-check did key on
+# md_bio_is_p2pdma (as ms_bio_is_p2pdma post-rename) and DID need re-keying --
+# upstream's v6 P2PDMA series upstreams that exact helper, so once v6 merges
+# even a genuine bare-upstream tree carries it and the old assertion would
+# break. See step 3 below for the fix.
 #
 # Needs a kernel tree carrying bare-upstream drivers/md (raw P2PDMA, NO member-AND
 # helper). Discovery: $KERNEL_TREE -> build/linux-meshstor-rebuilt -> a temp
@@ -98,11 +106,22 @@ case "$tb_out" in
 	*) dkms_fail "0010 (upstream raid variant) must be APPLIED on bare upstream" ;;
 esac
 
-# --- 3. no meshstor p2pdma-fixes feature leaked into the baseline ----------
+# --- 3. no meshstor-only p2pdma feature leaked into the baseline ----------
+# Re-keyed 2026-07-29 (v6 rework): this used to also assert that ms.h lacked
+# ms_bio_is_p2pdma (md_bio_is_p2pdma pre-rename), on the theory that helper
+# was meshstor-only. It is not, any more: upstream's v6 P2PDMA series
+# upstreams md_bio_is_p2pdma itself, so once v6 merges, even a genuine bare-
+# upstream `master` carries it (renamed to ms_bio_is_p2pdma same as anywhere
+# else) and that assertion would break the discriminator it was meant to
+# protect. raid1_can_advertise_p2pdma(), the p2pdma_advertise knob, and the
+# p2pdma_status report are meshstor value-adds with NO upstream counterpart
+# (see docs/superpowers/specs/2026-07-29-p2pdma-v6-rework-design.md §3.4) --
+# tokens that stay meshstor-only permanently, unlike md_bio_is_p2pdma. Keying
+# on those instead means this assertion survives v6 merging upstream.
 assert_file_not_matches "$OUT/raid1-10_ms.c" 'raid1_can_advertise_p2pdma' \
 	"baseline must NOT carry the member-AND helper"
-assert_file_not_matches "$OUT/ms.h" 'ms_bio_is_p2pdma' \
-	"baseline must NOT carry the md_bio_is_p2pdma feature helper"
+assert_file_not_matches "$OUT/ms.c" 'p2pdma_status_show|p2pdma_advertise' \
+	"baseline must NOT carry the meshstor-only p2pdma_advertise knob or p2pdma_status report (no upstream counterpart)"
 
 # --- 4. both upstream lim.features touches are gated together, pre-stack ----
 for f in raid1_ms.c raid10_ms.c; do

@@ -5,5 +5,6 @@
 # 0008 gates the meshstor p2pdma-fixes feature (member-AND advertise). It only
 # applies when that feature is composed into the tree (meshstor-main), i.e. when
 # the raid1_can_advertise_p2pdma() helper is present. On bare upstream `master`
-# the helper is absent and 0009 handles upstream's raw P2PDMA assignment instead.
+# the helper is absent and 0009/0010 handle the queue-limits-features gating
+# for that shape instead (0009 = helper present, 0010 = helper absent).
 raid1-10.c:raid1_can_advertise_p2pdma
