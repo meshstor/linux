@@ -87,10 +87,10 @@ p2p_io() {
 	local op="$1" tgt="$2" prov="$3" before after
 	[ -e "$MODULES_DIR/md_p2p_test.ko" ] || p2p_fail "md_p2p_test.ko not built (run make in modules/)"
 	rmmod md_p2p_test 2>/dev/null || true
-	before=$(dmesg | grep -c 'md_p2p_test: result')
+	before=$(dmesg | grep -c 'md_p2p_test: result' || true)
 	insmod "$MODULES_DIR/md_p2p_test.ko" \
 		provider="$prov" target="$tgt" op="$op" >/dev/null 2>&1 || true
-	after=$(dmesg | grep -c 'md_p2p_test: result')
+	after=$(dmesg | grep -c 'md_p2p_test: result' || true)
 	if [ "$after" -le "$before" ]; then
 		echo "FAIL: p2p_io: no new result line (insmod failed before I/O?)" >&2
 		return 1
