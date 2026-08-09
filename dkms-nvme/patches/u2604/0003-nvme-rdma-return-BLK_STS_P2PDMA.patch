@@ -1,0 +1,98 @@
+Return BLK_STS_P2PDMA for an unroutable PCI peer-to-peer transfer.
+
+Backport of upstream v6 patch 10 ("nvme-rdma: return BLK_STS_P2PDMA
+for unsupported P2P transfers"). ib_dma_map_sg() used to fold every
+mapping error into a bare zero, so nvme-rdma reported an unroutable
+P2P transfer as -EIO -- a retryable host-path error that multipath
+requeues forever, burning a whole path's retry budget on I/O that
+cannot succeed. With the real errno preserved by patch 0002, this
+propagates it and translates -EREMOTEIO to the non-retryable
+BLK_STS_P2PDMA (as in nvme-pci: -ENOMEM still requeues via
+BLK_STS_RESOURCE, -EINVAL still fails via BLK_STS_IOERR, and -EIO
+stays a retryable host-path error).
+
+Also moves nvme_start_request() to after the mapping succeeds, as
+nvme-pci and nvme-tcp already do: a hard status from ->queue_rq is
+completed by blk-mq itself, which skips nvme_mpath_end_request(), so
+starting the request before a possible mapping failure leaks the
+multipath I/O accounting -- today for -EINVAL, and now for
+BLK_STS_P2PDMA too.
+
+Pulls in compat.h for BLK_STS_P2PDMA itself: this package has no
+feature_flags probe infrastructure, so the guard in compat.h tests the
+macro directly rather than a HAVE_* flag (see compat.h and README.md).
+The include is added after the existing system includes, alongside the
+other quoted local headers; rdma.c already includes <linux/blk-mq.h>
+above (which pulls blk_types.h) before this header is reached.
+
+Value 18 matches upstream and is unused on every supported kernel; the
+sibling dkms/ package's compat.h defines it identically, since this
+status now crosses the module boundary between the two drivers.
+
+Applies to the u2604 vendored rdma.c (after 0001 and any earlier
+patches in this series). Applied by bin/build-nvme-tarball: patch -p1
+--fuzz=0 -d <variant dir>.
+Regeneration after re-vendoring: dkms-nvme/README.md, 'Refreshing'.
+
+--- a/rdma.c
++++ b/rdma.c
+@@ -24,6 +24,7 @@
+ #include <rdma/rdma_cm.h>
+ #include <linux/nvme-rdma.h>
+ 
++#include "compat.h"
+ #include "nvme.h"
+ #include "fabrics.h"
+ 
+@@ -1484,10 +1485,8 @@
+ 		.orig_nents	= req->data_sgl.nents,
+ 	};
+ 	ret = ib_dma_map_sgtable_attrs(ibdev, &sgt, rq_dma_dir(rq), 0);
+-	if (unlikely(ret)) {
+-		ret = -EIO;
++	if (unlikely(ret))
+ 		goto out_free_table;
+-	}
+ 	*count = sgt.nents;
+ 
+ 	if (blk_integrity_rq(rq)) {
+@@ -1509,10 +1508,8 @@
+ 			.orig_nents	= req->metadata_sgl->nents,
+ 		};
+ 		ret = ib_dma_map_sgtable_attrs(ibdev, &sgt, rq_dma_dir(rq), 0);
+-		if (unlikely(ret)) {
+-			ret = -EIO;
++		if (unlikely(ret))
+ 			goto out_free_pi_table;
+-		}
+ 		*pi_count = sgt.nents;
+ 	}
+ 
+@@ -2031,8 +2028,6 @@
+ 	if (ret)
+ 		goto unmap_qe;
+ 
+-	nvme_start_request(rq);
+-
+ 	if (IS_ENABLED(CONFIG_BLK_DEV_INTEGRITY) &&
+ 	    queue->pi_support &&
+ 	    (c->common.opcode == nvme_cmd_write ||
+@@ -2049,6 +2044,8 @@
+ 		goto err;
+ 	}
+ 
++	nvme_start_request(rq);
++
+ 	sqe->cqe.done = nvme_rdma_send_done;
+ 
+ 	ib_dma_sync_single_for_device(dev, sqe->dma,
+@@ -2068,6 +2065,9 @@
+ 		ret = nvme_host_path_error(rq);
+ 	else if (err == -ENOMEM || err == -EAGAIN)
+ 		ret = BLK_STS_RESOURCE;
++	/* Peer memory unreachable from this device: don't retry. */
++	else if (err == -EREMOTEIO)
++		ret = BLK_STS_P2PDMA;
+ 	else
+ 		ret = BLK_STS_IOERR;
+ 	nvme_cleanup_cmd(rq);

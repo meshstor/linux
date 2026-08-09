@@ -1,0 +1,70 @@
+Use ib_dma_map_sgtable_attrs() so a DMA mapping failure preserves its
+real error code instead of being folded into a bare zero return.
+
+Backport of upstream v6 patch 9 ("nvme-rdma: use
+ib_dma_map_sgtable_attrs()"), part of the BLK_STS_P2PDMA series (see
+the sibling dkms/ package, which consumes status 18). A local sg_table
+is needed: dma_map_sgtable() maps orig_nents entries, and the embedded
+table's orig_nents is the allocated count, not the count
+blk_rq_map_sg() produced -- rdma_rw_ctx_init() does the same.
+
+No behavior change on its own: failures are still reported as -EIO
+here. Patch 0003 acts on the preserved error code.
+
+Applies to the u2404-hwe vendored rdma.c (after 0001 and any earlier
+patches in this series). Applied by bin/build-nvme-tarball: patch -p1
+--fuzz=0 -d <variant dir>.
+Regeneration after re-vendoring: dkms-nvme/README.md, 'Refreshing'.
+
+--- a/rdma.c
++++ b/rdma.c
+@@ -1467,6 +1467,7 @@
+ 		int *count, int *pi_count)
+ {
+ 	struct nvme_rdma_request *req = blk_mq_rq_to_pdu(rq);
++	struct sg_table sgt;
+ 	int ret;
+ 
+ 	req->data_sgl.sg_table.sgl = (struct scatterlist *)(req + 1);
+@@ -1478,12 +1479,16 @@
+ 
+ 	req->data_sgl.nents = blk_rq_map_sg(rq, req->data_sgl.sg_table.sgl);
+ 
+-	*count = ib_dma_map_sg(ibdev, req->data_sgl.sg_table.sgl,
+-			       req->data_sgl.nents, rq_dma_dir(rq));
+-	if (unlikely(*count <= 0)) {
++	sgt = (struct sg_table) {
++		.sgl		= req->data_sgl.sg_table.sgl,
++		.orig_nents	= req->data_sgl.nents,
++	};
++	ret = ib_dma_map_sgtable_attrs(ibdev, &sgt, rq_dma_dir(rq), 0);
++	if (unlikely(ret)) {
+ 		ret = -EIO;
+ 		goto out_free_table;
+ 	}
++	*count = sgt.nents;
+ 
+ 	if (blk_integrity_rq(rq)) {
+ 		req->metadata_sgl->sg_table.sgl =
+@@ -1499,14 +1504,16 @@
+ 
+ 		req->metadata_sgl->nents = blk_rq_map_integrity_sg(rq,
+ 				req->metadata_sgl->sg_table.sgl);
+-		*pi_count = ib_dma_map_sg(ibdev,
+-					  req->metadata_sgl->sg_table.sgl,
+-					  req->metadata_sgl->nents,
+-					  rq_dma_dir(rq));
+-		if (unlikely(*pi_count <= 0)) {
++		sgt = (struct sg_table) {
++			.sgl		= req->metadata_sgl->sg_table.sgl,
++			.orig_nents	= req->metadata_sgl->nents,
++		};
++		ret = ib_dma_map_sgtable_attrs(ibdev, &sgt, rq_dma_dir(rq), 0);
++		if (unlikely(ret)) {
+ 			ret = -EIO;
+ 			goto out_free_pi_table;
+ 		}
++		*pi_count = sgt.nents;
+ 	}
+ 
+ 	return 0;

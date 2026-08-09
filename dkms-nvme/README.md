@@ -11,6 +11,17 @@ In-tree `nvme-core`/`nvme-fabrics` are used unchanged: the
 `supports_pci_p2pdma` ctrl op they consult has been in-tree since v6.0
 (`2f8594412b4b`); only the RDMA transport never wired it up before 7.1.
 
+Beyond advertising P2P support, the backport also fixes how a failed P2P
+transfer is *reported*: `ib_dma_map_sg()` folded every mapping error into a
+bare zero, so an unroutable transfer surfaced as `-EIO` — a retryable
+host-path error that multipath requeues forever. Patches 0002-0004 (upstream
+v6 patches 9-11) switch to `ib_dma_map_sgtable_attrs()`, which preserves the
+real errno, and translate `-EREMOTEIO` into the non-retryable
+`BLK_STS_P2PDMA` (status 18, defined in `compat.h` since no shipped kernel
+has it yet). The sibling `dkms/` package defines the same value and consumes
+it directly — this status crosses the module boundary between the two
+drivers, so the two definitions must never drift apart.
+
 Supported kernel families (see `BUILD_EXCLUSIVE_KERNEL` in dkms.conf):
 
 | Variant     | Family            | Source of vendored files            |
@@ -35,10 +46,23 @@ package cannot.
 
 ## Refreshing after a distro kernel update
 
+Each variant now carries **four** patches applied in order, not one:
+
+| Patch | Upstream | Does |
+|-------|----------|------|
+| `0001-nvme-rdma-enable-pci-p2pdma.patch` | `23528aa3320a` (pre-v6, already upstream) | Advertise P2P support (`supports_pci_p2pdma` ctrl op) |
+| `0002-nvme-rdma-use-ib_dma_map_sgtable_attrs.patch` | v6 p9 | Preserve the DMA mapping errno instead of folding it into a bare zero |
+| `0003-nvme-rdma-return-BLK_STS_P2PDMA.patch` | v6 p10 | Translate `-EREMOTEIO` to `BLK_STS_P2PDMA`; adds `#include "compat.h"` |
+| `0004-nvme-rdma-ratelimit-map-failure-message.patch` | v6 p11 | Ratelimit the per-request map-failure log line |
+
+`bin/vendor-nvme-sources` exit 3 (files changed) means **re-checking all
+four** patches for that variant, not just 0001 — a distro rebase can shift
+context anywhere in `rdma.c`, including the regions 0002-0004 touch.
+
 1. `bin/vendor-nvme-sources [--u2404 TAG] [--u2604 TAG] [--rhel10 NVR]`
    (defaults to latest; exit 3 = files changed).
 2. For each variant `V` whose vendored `rdma.c` changed, regenerate that
-   variant's patch:
+   variant's patches, in order:
 
    ```bash
    V=rhel10   # or u2404-hwe / u2604
@@ -73,6 +97,43 @@ package cannot.
    patch -p1 --dry-run --fuzz=0 -d dkms-nvme/vendor/$V \
        < "dkms-nvme/patches/$V/0001-nvme-rdma-enable-pci-p2pdma.patch"
    bash tools/testing/selftests/dkms/test_nvme_tarball_assembles.sh
+   ```
+
+   Then regenerate 0002-0004 on top of the (possibly just-changed) 0001, by
+   replaying the local patch stack and re-applying the three upstream v6
+   patches (9, 10, 11 — the map-failure-reporting series; **skip v6 p12**, a
+   pure refactor with no runtime effect) against a scratch copy, then
+   re-diffing each step. The upstream patches live wherever the v6 series was
+   staged for review (e.g. `build/p2pdma-upstream-aux/final-v2/v6/send/`):
+
+   ```bash
+   V6=/path/to/v6/send   # wherever v6-0009..v6-0011 are staged
+   S="$(mktemp -d)"
+   for V in rhel10 u2404-hwe u2604; do
+       mkdir -p "$S/$V"; cp "dkms-nvme/vendor/$V/rdma.c" "$S/$V/"
+       patch -p1 --fuzz=0 -d "$S/$V" \
+           < "dkms-nvme/patches/$V/0001-nvme-rdma-enable-pci-p2pdma.patch"
+       for p in "$V6"/v6-0009*.patch "$V6"/v6-0010*.patch "$V6"/v6-0011*.patch; do
+           cp "$S/$V/rdma.c" "$S/$V/rdma.c.orig"
+           patch -p4 --fuzz=0 -d "$S/$V" < "$p"    # -p4: a/drivers/nvme/host/rdma.c -> rdma.c
+           # patch 10 (-> our 0003) additionally needs:
+           #   #include "compat.h"   added after the system includes, alongside
+           #   the other quoted local headers ("nvme.h" / "fabrics.h") — do this
+           #   by hand on $S/$V/rdma.c before diffing that step.
+           diff -u --label a/rdma.c --label b/rdma.c \
+               "$S/$V/rdma.c.orig" "$S/$V/rdma.c"
+           # prepend a description block (see the existing 000{2,3,4} patches
+           # for the convention), then save as the next NNNN- file for $V.
+       done
+   done
+   ```
+
+   Verify **all four** patches for every changed variant apply clean and
+   together still produce a working driver:
+
+   ```bash
+   bash tools/testing/selftests/dkms/test_nvme_tarball_assembles.sh
+   bash tools/testing/selftests/dkms/test_nvme_build_smoke.sh
    ```
 3. Rebuild + redeploy the package.
 

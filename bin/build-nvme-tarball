@@ -43,6 +43,10 @@ sed "s/@VERSION@/$VER/g" dkms-nvme/dkms.conf.in > "$OUT/dkms.conf"
 sed "s/@VERSION@/$VER/g" dkms-nvme/Makefile.in  > "$OUT/Makefile"
 cp dkms-nvme/README.md "$OUT/README.md"
 cp dkms/COPYING "$OUT/COPYING"
+# compat.h is shared across variants (unlike FILES above), so it lives at
+# the tarball root beside Makefile; copy-src places each variant's rdma.c
+# in the same directory, where its "#include \"compat.h\"" resolves.
+cp dkms-nvme/compat.h "$OUT/compat.h"
 
 cd "$REPO_ROOT/build"
 tar czf "meshstor-nvme-rdma-$VER.dkms.tar.gz" "meshstor-nvme-rdma-$VER/"

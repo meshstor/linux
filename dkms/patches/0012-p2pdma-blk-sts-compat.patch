@@ -86,10 +86,10 @@ retry a transfer that cannot route and diverge the mirror silently.
    native BLK_STS_P2PDMA; blk_status_to_errno(18) is 0 here (blk_errors[18] is
    a zero-filled hole), so without this check the chunk is recorded as written
    and the range is never fenced. The emitter is the sibling
-   meshstor-nvme-rdma package, once it carries upstream v6 p9-p11 ("nvme-rdma:
-   return BLK_STS_P2PDMA for unsupported P2P transfers" and its siblings);
-   until that lands nothing in the shipped stack produces the status and this
-   check is inert but harmless.
+   meshstor-nvme-rdma package, which carries upstream v6 p9-p11 ("nvme-rdma:
+   return BLK_STS_P2PDMA for unsupported P2P transfers" and its siblings) and
+   produces the status for a real unroutable P2P transfer, so this check is
+   live, not merely defensive.
 
    KNOWN RESIDUAL, deliberately NOT closed by this part: an UNTAGGED
    mixed-pgmap bio -- host page in bi_io_vec[0], P2P pages after, which
@@ -225,9 +225,9 @@ minimal and symmetric.
 +		 * kernel, so blk_status_to_errno() maps a native
 +		 * BLK_STS_P2PDMA to 0 and a failed retry chunk would be
 +		 * recorded as written, leaving the range unfenced. The
-+		 * emitter is the sibling meshstor-nvme-rdma package, once
-+		 * it carries upstream v6 p9-p11; before that no shipped
-+		 * component produces the status and this check is inert.
++		 * emitter is the sibling meshstor-nvme-rdma package: it
++		 * carries upstream v6 p9-p11 and produces the status, so
++		 * this check is live, not merely defensive scaffolding.
 +		 *
 +		 * It does NOT close the untagged mixed-pgmap case (host page
 +		 * in bi_io_vec[0], P2P pages after), which md_bio_is_p2pdma()
@@ -386,9 +386,9 @@ minimal and symmetric.
 +		 * kernel, so blk_status_to_errno() maps a native
 +		 * BLK_STS_P2PDMA to 0 and a failed retry chunk would be
 +		 * recorded as written, leaving the range unfenced. The
-+		 * emitter is the sibling meshstor-nvme-rdma package, once
-+		 * it carries upstream v6 p9-p11; before that no shipped
-+		 * component produces the status and this check is inert.
++		 * emitter is the sibling meshstor-nvme-rdma package: it
++		 * carries upstream v6 p9-p11 and produces the status, so
++		 * this check is live, not merely defensive scaffolding.
 +		 *
 +		 * It does NOT close the untagged mixed-pgmap case (host page
 +		 * in bi_io_vec[0], P2P pages after), which md_bio_is_p2pdma()

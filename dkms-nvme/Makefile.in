@@ -14,6 +14,7 @@ KDIR ?= /lib/modules/$(KVER)/build
 # kbuild section — read when kbuild recurses with M=$(CURDIR).
 obj-m := nvme-rdma.o
 nvme-rdma-y := rdma.o
+ccflags-y += -I$(src)
 
 ifneq ($(findstring .el10,$(KVER)),)
 VARIANT := rhel10
