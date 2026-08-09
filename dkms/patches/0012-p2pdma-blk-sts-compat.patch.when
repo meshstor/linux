@@ -3,8 +3,21 @@
 # A leading '!' negates (the pattern must NOT be present).
 #
 # 0012 synthesises BLK_STS_P2PDMA for member completions on kernels whose
-# block layer cannot produce it. It only makes sense on a tree that carries
-# upstream's v6 completion handling, i.e. where raid1_write_error() exists.
-# On the bare upstream `master` baseline that helper is absent and the whole
-# patch would reject.
+# block layer cannot produce it. Both predicates below must hold, because the
+# patch needs BOTH shapes present in the tree:
+#
+#  * raid1_write_error() -- upstream's v6 completion handling, which is what
+#    0012's early-return/dispatch hunks are written against. It is absent on
+#    the bare upstream `master` baseline TODAY, but v6 p5 introduces it, so
+#    once the series merges a plain upstream tree satisfies this line alone.
+#
+#  * raid1_can_advertise_p2pdma() -- the meshstor member-AND advertise helper.
+#    Permanently meshstor-only: upstream has no member-AND policy and no plan
+#    for one, so this is the predicate that keeps 0012 off a bare-upstream
+#    baseline for good. It is not decoration: hunk #2 of raid1.c anchors its
+#    trailing context on raid1_p2pdma_is_advertising(), which only exists
+#    alongside that helper, so on an upstream+v6 tree the hunk would hard
+#    reject and fail bin/build-tarball. 0008/0009/0010 and the dkms selftests
+#    key on the same helper for the same reason.
 raid1-10.c:raid1_write_error
+raid1-10.c:raid1_can_advertise_p2pdma
