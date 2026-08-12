@@ -452,7 +452,12 @@ gds_injector_load() {  # QUALIFIED_SYM DISK PARTNO [EXTRA...]
 	GDS_INJ_LOADED=1
 }
 gds_injector_arm()      { echo "$1" > /sys/module/inval_inject/parameters/remaining; }
-gds_injector_disarm()   { echo 0 > /sys/module/inval_inject/parameters/remaining 2>/dev/null || true; }
+# Guard the redirect on path existence: bash opens the `>` target BEFORE
+# applying `2>/dev/null`, so a bare `echo 0 > .../remaining 2>/dev/null` still
+# leaks a "No such file or directory" to the original stderr when the module is
+# absent -- which is every passing test, since gds_teardown unloads on EXIT.
+gds_injector_disarm()   { [ -e /sys/module/inval_inject/parameters/remaining ] \
+	&& echo 0 > /sys/module/inval_inject/parameters/remaining 2>/dev/null || true; }
 gds_injector_injected() { cat /sys/module/inval_inject/parameters/injected; }
 gds_injector_remaining(){ cat /sys/module/inval_inject/parameters/remaining; }
 gds_injector_unload() {

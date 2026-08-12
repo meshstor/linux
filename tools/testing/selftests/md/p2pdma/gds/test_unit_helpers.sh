@@ -112,6 +112,10 @@ GDS_SYS_BLOCK="$STUB/sysblock" gds_assert_no_badblocks /dev/ms7 \
 echo "16 8" > "$STUB/sysblock/ms7/ms/rd1/bad_blocks"
 GDS_SYS_BLOCK="$STUB/sysblock" gds_assert_no_badblocks /dev/ms7 2>/dev/null \
     && fail "gds_assert_no_badblocks: non-empty content must fail"
+# Absent path (no ms/rd*/bad_blocks at all) must FAIL, not read as a pass: a
+# missing sysfs file means the array isn't running, not that it is clean.
+GDS_SYS_BLOCK="$STUB/sysblock" gds_assert_no_badblocks /dev/ms_absent 2>/dev/null \
+    && fail "gds_assert_no_badblocks: absent bad_blocks path must fail (missing != clean)"
 
 # breadcrumb helpers against a stub dmesg
 cat > "$STUB/dmesg1" <<'EOF'
@@ -135,16 +139,23 @@ gds_assert_no_breadcrumb || fail "gds_assert_no_breadcrumb: clean delta must pas
 gds_assert_breadcrumb 2>/dev/null && fail "gds_assert_breadcrumb: must fail on clean delta"
 unset GDS_DMESG_CMD
 
-# gds_kallsyms_check against a fixture
+# gds_kallsyms_check against a fixture. raid_end_bio_io appears TWICE inside the
+# same [raid10_ms] bracket -- the helper counts on ($3==sym && $NF==[mod]), so
+# that is one target with n=2, exercising the n>1 "not uniquely resolvable"
+# branch (a real static shared via raid1-10_ms.c could surface this way).
 cat > "$STUB/kallsyms" <<'EOF'
 ffffffffc0100000 t raid1_end_write_request	[raid1]
 ffffffffc0200000 t raid1_end_write_request	[raid1_ms]
 ffffffffc0200100 t raid10_end_write_request	[raid10_ms]
+ffffffffc0200200 t raid_end_bio_io	[raid10_ms]
+ffffffffc0200300 t raid_end_bio_io	[raid10_ms]
 EOF
 GDS_KALLSYMS="$STUB/kallsyms" gds_kallsyms_check raid1_end_write_request raid1_ms \
     || fail "gds_kallsyms_check: exactly-one-in-module must pass"
 GDS_KALLSYMS="$STUB/kallsyms" gds_kallsyms_check raid1_end_write_request raid5_ms 2>/dev/null \
     && fail "gds_kallsyms_check: zero-in-module must fail"
+GDS_KALLSYMS="$STUB/kallsyms" gds_kallsyms_check raid_end_bio_io raid10_ms 2>/dev/null \
+    && fail "gds_kallsyms_check: two-in-same-module (ambiguous) must fail"
 
 [ "$FAILED" = 0 ] && echo "PASS: unit helpers" && exit 0
 exit 1
