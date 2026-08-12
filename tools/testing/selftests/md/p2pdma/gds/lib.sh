@@ -143,6 +143,10 @@ gds_nvmet_disarm_incremental() {
 # gds_nvmet_export TRANSPORT DEV...  (TRANSPORT: tcp|rdma)
 gds_nvmet_export() {
 	local tr=$1; shift
+	if [ -n "$GDS_NVMET_NQN" ]; then
+		echo "gds_nvmet_export: prior export ($GDS_NVMET_NQN) still active -- call gds_nvmet_teardown first" >&2
+		return 1
+	fi
 	local addr port i=1 dev
 	modprobe nvmet "nvmet-$tr" nvme-fabrics "nvme-$tr" 2>/dev/null || true
 	[ -d /sys/kernel/config/nvmet ] || { echo "SKIP: nvmet configfs unavailable" >&2; exit 4; }
