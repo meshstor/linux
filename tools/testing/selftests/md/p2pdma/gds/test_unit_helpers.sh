@@ -72,5 +72,20 @@ exp="MDADM_ARGS: --create /dev/ms9 --level=1 --raid-devices=2 --metadata=1.2 --h
 off=$(gds_data_offset_sectors /dev/fake)
 [ "$off" = 264192 ] || fail "data offset parse: got '$off' want 264192"
 
+# --- inval_inject: byte-lock the default matrix + refuse rule ----------------
+INJ_SRC="$REPO_ROOT/dkms/inval-inject/inval_inject.c"
+if [ -e "$INJ_SRC" ]; then
+    grep -q 'static int p2p_only = -1;' "$INJ_SRC" \
+        || fail "inval_inject: p2p_only must default to -1 (auto matrix)"
+    grep -q 'p2p_only = strcmp(match, "ioerr") == 0 ? 0 : 1;' "$INJ_SRC" \
+        || fail "inval_inject: default matrix must be 0 for match=ioerr, 1 otherwise"
+    grep -q "strchr(symbol, ':')" "$INJ_SRC" \
+        || fail "inval_inject: module-qualified refuse rule (strchr colon) missing"
+    grep -q 'static char to_status_str\[16\] = "";' "$INJ_SRC" \
+        || fail "inval_inject: to_status must default EMPTY (so 'set' is detectable)"
+    grep -q 'is_pci_p2pdma_page(bio->bi_io_vec->bv_page)' "$INJ_SRC" \
+        || fail "inval_inject: p2p filter must test bi_io_vec->bv_page directly (not bio_has_data)"
+fi
+
 [ "$FAILED" = 0 ] && echo "PASS: unit helpers" && exit 0
 exit 1
