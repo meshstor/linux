@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# gds-make-kit — assemble the scp-able campaign kit for the L40S window.
+# Builds BOTH DKMS tarballs (featured = master+p2pdma with the member-AND;
+# baseline = verbatim master with upstream's unconditional advertise) and
+# stages tools, selftests, the injector, udev rule, runbook and installer.
+#
+# Usage: gds-make-kit <version> [--skip-tarballs]
+set -eu
+VER=${1:?usage: gds-make-kit <version> [--skip-tarballs]}
+SKIP_TB=${2:-}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+KIT="$ROOT/build/gds-kit-$VER"
+MDADM_BIN="${MDADM_BIN:-/home/${SUDO_USER:-$USER}/mdadm/mdadm}"
+
+if [ "$SKIP_TB" != --skip-tarballs ]; then
+	echo "== baseline tree (verbatim master) =="
+	"$ROOT/bin/rebuild-main"
+	KERNEL_TREE="$ROOT/build/linux-meshstor-rebuilt" "$ROOT/bin/build-tarball" "$VER.gds0"
+	echo "== featured tree (master + p2pdma) =="
+	"$ROOT/bin/rebuild-main" --no-fetch p2pdma
+	KERNEL_TREE="$ROOT/build/linux-meshstor-rebuilt" "$ROOT/bin/build-tarball" "$VER.gds1"
+fi
+for t in gds0 gds1; do
+	ls "$ROOT/build/meshstor-ms-$VER.$t.dkms.tar.gz" >/dev/null \
+		|| { echo "missing tarball for $t — run without --skip-tarballs" >&2; exit 1; }
+done
+
+rm -rf "$KIT"; mkdir -p "$KIT"/{bin,tarballs,udev,docs}
+cp "$ROOT/build/meshstor-ms-$VER".gds{0,1}.dkms.tar.gz "$KIT/tarballs/"
+for b in gds-campaign ms-queue-features gds-p2p-witness probe-cufile-recognition perf-make-test-partitions; do
+	cp "$ROOT/bin/$b" "$KIT/bin/"
+done
+mkdir -p "$KIT/selftests"
+cp -r "$ROOT/tools/testing/selftests/md/p2pdma" "$KIT/selftests/"
+cp -r "$ROOT/dkms/inval-inject" "$KIT/inval-inject"
+cp "$ROOT/dkms/udev/63-ms-raid-arrays.rules" "$KIT/udev/"
+cp "$ROOT/docs/gds-l40s-runbook.md" "$KIT/docs/"
+if [ -x "$MDADM_BIN" ]; then cp "$MDADM_BIN" "$KIT/bin/mdadm-ms"
+else echo "WARN: patched mdadm not at $MDADM_BIN — kit ships without it (set MDADM= on the box)"; fi
+
+cat > "$KIT/install.sh" <<'EOF'
+#!/usr/bin/env bash
+# Run as root on the target box. Installs the FEATURED package and prints the
+# environment to use. Requires: dkms, kernel headers, bpftrace, nvme-cli, fio.
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+TB=$(ls "$HERE"/tarballs/*gds1*.dkms.tar.gz | head -1)
+TMP=$(mktemp -d); tar xzf "$TB" -C "$TMP"
+VER=$(ls "$TMP" | sed -n 's/^meshstor-ms-//p' | head -1)
+rm -rf "/usr/src/meshstor-ms-$VER"; cp -r "$TMP/meshstor-ms-$VER" /usr/src/; rm -rf "$TMP"
+dkms add "meshstor-ms/$VER" || true
+dkms install "meshstor-ms/$VER"
+modprobe ms_mod raid1_ms raid10_ms
+install -m0644 "$HERE/udev/63-ms-raid-arrays.rules" /usr/lib/udev/rules.d/
+udevadm control --reload
+grep -q 'Personalities' /proc/msstat && echo "OK: /proc/msstat live"
+cat <<ENV
+Run the campaign:
+  sudo MDADM=$HERE/bin/mdadm-ms GDS_KIT_DIR=$HERE $HERE/bin/gds-campaign --results /root/gds-results
+ENV
+EOF
+chmod +x "$KIT/install.sh" "$KIT"/bin/*
+
+tar czf "$ROOT/build/gds-kit-$VER.tar.gz" -C "$ROOT/build" "gds-kit-$VER"
+echo "Built: $ROOT/build/gds-kit-$VER.tar.gz"
