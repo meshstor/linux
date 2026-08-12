@@ -62,7 +62,17 @@ cat /proc/driver/nvidia/version               # want: >= 595 on a >= 6.15 kernel
 command -v bpftrace nvme fio gdsio gdscheck   # all must resolve (gds tools: CUDA 12.8+ package)
 nvidia-smi topo -m                            # note which GPU has PIX/PXB (not SYS) to the test NVMe
                                               # (all-NODE is OK: host-bridge P2P confirmed working on SPR + iommu=pt)
+grep -o 'iommu=pt' /proc/cmdline              # want: iommu=pt — else IOMMU translates DMA and native GDS FAILS (step 0c)
+cat /sys/module/nvme_core/parameters/multipath  # want: N  (Y masks rdma-leg advertise + gates P7g/h)
+TESTBDF=$(readlink -f /sys/block/nvme1n1/device | grep -o '0000:[0-9a-f:.]*' | tail -1)
+cat /sys/bus/pci/devices/$TESTBDF/iommu_group/type  # want: identity (DMA/DMA-FQ = translation = native GDS blocked)
 ```
+
+**Boot prerequisites (BOTH required — bake into the boot BEFORE the window; each is a
+reboot):** `iommu=pt` (identity DMA domains — the NVIDIA GDS P2P path needs them on
+**every** platform, AMD included; see step 0c) **and** `nvme_core.multipath=N` (else the
+nvmet CMIC head-split hides the rdma leg's P2P advertise and P7g/h SKIP). Stage both in
+one reboot — recipe in step 0c.
 
 - Secure Boot **enabled** → enroll the DKMS MOK + reboot (`mokutil --import
   /var/lib/dkms/mok.pub`, or `bin/mok-enroll` from a git checkout), or disable SB.
@@ -115,6 +125,47 @@ On **≥7.1** the nvme-rdma override's `BUILD_EXCLUSIVE` refusal from install.sh
 **expected and harmless** — stock nvme-rdma already carries the P2PDMA wiring
 (`23528aa`), so the campaign runs on the stock module with rdma-leg P2P intact. Do
 not chase that WARNING.
+
+### Step 0c: IOMMU passthrough is a HARD prerequisite for native GDS (found live on shadecloud, 2026-07-07)
+
+**`iommu=pt` is required on EVERY platform — including AMD EPYC — not just SPR.** The
+kernel's `cpu_supports_p2pdma()` gate (Zen ≥ 0x17 passes unconditionally) is a *separate
+layer* from the NVIDIA driver's DMA setup: even when the kernel would permit the P2P, if
+the IOMMU is in **full-translation mode** the GDS path can't build the peer IOVA mapping
+and native GDS fails. A box with no `iommu=pt` (default on this EPYC 9354) boots its
+devices into **`DMA-FQ`** domains, and the whole GPU-native chain (P1/P2 + P7a/b/d/e)
+FAILs while every GPU-independent phase still passes.
+
+**The exact signature (so you recognize it in 30 seconds, not after a failed P1):**
+- `cat /sys/bus/pci/devices/<nvme-or-gpu-bdf>/iommu_group/type` → **`DMA-FQ`** (want `identity`);
+- dmesg floods with `NVRM: GPUn nvAssertFailedNoLog: Assertion failed: pIOVAS != NULL @ io_vaspace.c`;
+- cufile.log shows GPUs `PCIP2PDMACapable:1` **statically** but at runtime
+  `gpu attribute pci_p2pdma support: False` → `GPUDirect Storage not supported on current file`;
+- `gdscheck -p` reports `NVMe/NVMeOF/NVMesh : compat` (want `Supported`);
+- P1 FAILs `map_hits=0 cmd_rc=1`.
+
+This is **not a tooling bug and not fixable at run time** — cuFile picks the P2P GPU by
+*storage proximity* (the DMA faults on whichever GPU BAR is nearest the NVMe, regardless of
+gdsio `-d`), all GPUs share the DMA-FQ default domain, and bound nvme/nvidia devices can't
+be re-homed to identity domains live. The only fix is a reboot.
+
+**Stage both boot params in one reboot (GRUB; verify BEFORE rebooting):**
+```bash
+sudo cp -a /etc/default/grub /etc/default/grub.bak-gds-$(date +%F-%H%M%S)
+sudo sed -i 's/^GRUB_CMDLINE_LINUX=""$/GRUB_CMDLINE_LINUX="iommu=pt nvme_core.multipath=N"/' /etc/default/grub
+echo 'options nvme_core multipath=N' | sudo tee /etc/modprobe.d/nvme-multipath.conf   # root-on-nvme: nvme_core loads from initramfs
+sudo update-initramfs -u && sudo update-grub
+# all three must hit:
+sudo grep -c "vmlinuz-$(uname -r).*iommu=pt" /boot/grub/grub.cfg
+sudo grep -c "vmlinuz-$(uname -r).*nvme_core.multipath=N" /boot/grub/grub.cfg
+sudo lsinitramfs /boot/initrd.img-$(uname -r) | grep -c modprobe.d/nvme-multipath
+# then: sudo reboot
+# after reboot confirm the flip: /proc/cmdline has iommu=pt; iommu_group/type -> identity;
+#   /sys/module/nvme_core/parameters/multipath -> N; gdscheck -p -> NVMe: Supported
+```
+(If `GRUB_CMDLINE_LINUX` is already non-empty, append inside the quotes instead of the
+empty-string sed.) The regkey `p2pmem` is lazy — run `gdscheck -p` once post-reboot to
+re-create it before P1.
 
 ## Step 1: install + partitions
 
@@ -550,14 +601,31 @@ meshstor **gdsM** 3-variant kit built + installed. Every hard gate green:
 no root-on-md. **p2pmem `= 64 GiB` on all 8 GPUs** (BAR1 registered — the gate the
 580-driver Manassas box failed). meshstor **and** nvidia-open both compile on 7.1.3;
 `/proc/msstat = [raid1] [raid10]`; P0 all PASS incl. `ms_module_identity` (loaded
-`raid1_ms` srcversion == gdsM manifest row). **Zen 4 passes the platform P2P gate
-unconditionally** — no `iommu=pt`/host-bridge whitelist dependency (the robust CPU
-of §3.2). Two ≥7.1-specific banks: the witness needs no change (§7 briefing), and the
-P5/gds0 baseline false-advertise does **not** reproduce because 7.1 upstream self-ANDs
-P2PDMA in `blk_stack_limits` (§5/§6 briefing). Still gated on hardware: cross-RC P7f
-(single-disk test partitions — no root-complex-spanning pair) and cabled-RoCE P7g/h
-(`nvme_core.multipath=Y`, no cabled HCA). cuFile 1.18 makes the `p7c_userspace` SKIP
-the vendor-acknowledged Known-Issue path, not a version artifact.
+`raid1_ms` srcversion == gdsM manifest row). **Zen 4 passes the *kernel* platform P2P
+gate unconditionally** — but that is NOT sufficient (see the full-run correction below).
+The witness's `folio→pgmap` cast + enum resolve unchanged on 7.1 (§7 briefing);
+full P1 calibration (native `map>0`) pends the `iommu=pt` reboot. Still gated on
+hardware: cross-RC P7f (single-disk test partitions — no root-complex-spanning pair)
+and cabled-RoCE P7g/h (`nvme_core.multipath=Y`, no cabled HCA). cuFile 1.18 makes the
+`p7c_userspace` SKIP the vendor-acknowledged Known-Issue path, not a version artifact.
+
+**First full-run results (shadecloud 2026-07-07): 26 PASS / 8 SKIP / 13 FAIL — no
+shipped-feature regression; native GDS blocked by the IOMMU boot config.** Every
+GPU-independent shipped-feature assertion is green — the **P6 stage-1 narrowness proof**
+(`injected=64, [UU], leg stale, no breadcrumb`), P3 fabric on a *real cabled mlx5 HCA*
+(advertise-consistency `array=0==AND`, Finding-E `local=1 remote=0`, compat fallback +
+leg integrity), P4b clear-on-add (raid1+raid10), and **P4c/P5**. Two corrections to the
+provisioning-bank predictions above:
+- **`iommu=pt` IS required on this EPYC.** The box booted without it (devices in `DMA-FQ`
+  translation domains); native GDS (P1/P2 + P7a/b/d/e) FAILED with `NVRM ... pIOVAS != NULL`,
+  cuFile `pci_p2pdma support: False`, `gdscheck -p` = `compat`. The kernel `cpu_supports_p2pdma`
+  gate is a *separate layer* from the NVIDIA driver's IOVA requirement (§3.2 IOMMU gate, step 0c).
+  The P7 FAILs are downstream of P1 (`p2p_bios=0`, arm never exercised) — **not** stage-1 regressions.
+- **The P5/gds0 baseline false-advertise DOES reproduce on 7.1.** Live P5: the baseline array
+  advertised `BLK_FEAT_PCI_P2PDMA` (bit 12, `features=0x5090`) with a tcp leg present, so 7.1's
+  `blk_stack_limits` did **not** self-AND it away — the fork's member-AND is still doing real
+  work here, contrary to the logic-only prediction. (Re-run p0..p7 after `iommu=pt`+`multipath=N`
+  to bank the native-GDS + rdma-leg-positive evidence.)
 
 ## Post-cabling procedure — the gated P7g/P7h window (first actions when the RoCE ports go live)
 

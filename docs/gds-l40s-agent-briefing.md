@@ -245,8 +245,10 @@ when `cpu_supports_p2pdma()` (AMD Zen, family ≥ 0x17 — always true) OR `host
 mainstream *desktop* Intel is NOT listed → P2P refused with `MAP_NOT_SUPPORTED`).** Verified from
 source 2026-07-06 — this is a platform gate *below* the GPU, independent of the NVIDIA driver
 gates. For the two candidate L40S CPUs:
-- **AMD EPYC 9334 (Zen 4)** — passes unconditionally via `cpu_supports_p2pdma()`; the robust
-  choice, no whitelist/topology dependency.
+- **AMD EPYC 9334 / 9354 (Zen 4)** — passes the *kernel* gate unconditionally via
+  `cpu_supports_p2pdma()`; no whitelist/topology dependency. **But that gate is NOT
+  sufficient — the NVIDIA driver still needs `iommu=pt` (see below); an EPYC box booted
+  without it fails native GDS exactly like any other.**
 - **Intel Xeon 8468 (Sapphire Rapids)** — whitelisted, but relies on the whitelist match AND
   needs `iommu=pt` (VT-d on, not `iommu=off`); confirmed working on the dev L40S
   (P1 map_hits=512). Slightly more fragile than the EPYC. **Empirically confirmed
@@ -259,6 +261,19 @@ gates. For the two candidate L40S CPUs:
 If P1 reads `map_hits=0` on a Zen/whitelisted-server platform with every NVIDIA gate satisfied,
 the member NVMe's DMA-map is hitting `MAP_NOT_SUPPORTED` — see §8. (A consumer platform — desktop
 Intel/AMD-APU — refuses this P2P outright regardless of GPU class or BAR1 size.)
+
+**IOMMU passthrough is a fourth, platform-independent gate (shadecloud 2026-07-07, EPYC 9354).**
+Distinct from the kernel `cpu_supports_p2pdma`/whitelist gate above: the NVIDIA GDS path builds a
+peer **IOVA** mapping for the GPU BAR, and if the IOMMU runs in **full-translation mode** that
+mapping can't be established, so native GDS fails *even though the kernel platform gate passes*.
+A box booted without `iommu=pt` puts its devices in **`DMA-FQ`** default domains
+(`cat /sys/bus/pci/devices/<bdf>/iommu_group/type`); the failure signature is dmesg
+`NVRM: GPUn ... pIOVAS != NULL @ io_vaspace.c`, cufile.log `gpu attribute pci_p2pdma support:
+False` despite static `PCIP2PDMACapable:1`, `gdscheck -p` = `NVMe: compat`, and P1
+`map_hits=0 cmd_rc=1`. Not run-time fixable (cuFile selects the P2P GPU by storage proximity, so
+`-d` can't dodge it; bound devices can't be re-homed to `identity` domains live) — **boot
+`iommu=pt`** (want `iommu_group/type` = `identity`). This bit shadecloud's whole GPU-native chain
+while every GPU-independent phase still passed. Runbook step 0c has the staging recipe.
 
 ---
 
@@ -380,7 +395,11 @@ evaluates them (each was hit, root-caused, and either fixed or worked around liv
    array fails `RAID level not supported by cuFile for RAID group : /dev/ms0 RAID : raid1`.
    Controls: `libcufile.so.1.15.1` contains exactly one level string (`raid0`), and an
    **in-tree kernel md raid1** control array is rejected with the identical error — this blocks
-   cuFile-native GDS on raid1/raid10 for stock md too; it is NOT an ms issue. Consequence:
+   cuFile-native GDS on raid1/raid10 for stock md too; it is NOT an ms issue. **Still present
+   in cuFile 1.18.1 (shadecloud 2026-07-07): `libcufile.so.1.18.1` (and 1.13.1) carry the same
+   lone `raid0` string — the raid0-only policy is unchanged 1.15→1.18, so the test-only level
+   spoof is still required for kernel-path P2 evidence and the product escalation stands on the
+   current release.** Consequence:
    MeshStor-CSI raid1/raid10 volumes cannot do cuFile-native GDS on this cuFile release without
    an NVIDIA-side change or a level-presentation shim.
    **Test-only workaround** used to produce the P2 kernel-path evidence: a `/run` udev override
@@ -594,7 +613,7 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 | gdsio errors on flags / unexpected `-x`/`-V` behavior | the wrappers' gdsio flags (`-d 0 -w 4 -s 256M -i 1M -x {0,1} -I {0,1} -V`) were written from docs, **never run against a real gdsio** | `gdsio -h` FIRST; if mode numbering or verify semantics differ, fix ONLY the two wrappers `gds_gdsio_write`/`gds_gdsio_readverify` in `gds/lib.sh` (they isolate this exact risk), re-run unit gate + P1. |
 | cuFile refuses the file on an ms array (`Unsupported block device` / `RAID level not supported` / `RAID member not supported`) despite witness proving raw-partition native | one of cuFile's **three userspace gates** (§4.6a): missing `MD_*` props (msadm/rule), the **raid0-only level policy**, or a non-PCIe member transport | Walk the §4.6a ladder in order: `udevadm info --query=property /dev/msN | grep MD_` (empty → install `/usr/sbin/msadm` + trigger); `RAID level not supported` → expected on raid1/raid10, use the test-only level-spoof for kernel-path evidence + escalate as product finding; `unknown NVMe transport` → cuFile's own member AND, working as designed. |
 | `ms-queue-features` always rc=4 | bpftrace can't attach; no BTF; probe symbol missing | `bpftrace -l 'kprobe:submit_bio*'`; check `CONFIG_DEBUG_INFO_BTF=y`; check `/sys/kernel/tracing/available_filter_functions`. Fix probe name if the submit path differs on this kernel. |
-| P1 native `map_hits=0` (control also 0) | **First suspect: the NVIDIA driver gates (§3.2)** — regkeys missing (cufile errornum **801**) or 580.x-vs-≥6.15 UVM refcount bug (errornum **1** + driver-open 5001); then ACS/IOMMU; then topology; **then the kernel pci_p2pdma platform gate (§3.2 topology note)** | Check `/sys/bus/pci/devices/<gpu>/p2pmem/` exists; grep cufile.log for `errornum: 801` (→ regkeys) vs `errornum: 1` (→ driver < 595); `gdscheck -p`; `nvidia-smi topo -m` (all-NODE is fine on SPR+`iommu=pt` — confirmed). **If `p2pmem/` exists but map_hits still 0: the member NVMe's DMA-map is likely `MAP_NOT_SUPPORTED` — the GPU↔NVMe path crosses the root complex and the platform isn't P2P-trusted. Confirm the platform passes the kernel gate: AMD Zen (`grep -q AMD /proc/cpuinfo` + family ≥ 0x17) OR a whitelisted Intel-server host bridge (`lspci -nns 00:00.0`; SPR ok, desktop Intel e.g. `0xa740` NOT). Neither ⇒ no GPU fixes it; need a Zen/server platform or a common PCIe switch.** If the box genuinely can't do native GDS, P1 is a legitimate FAIL — record it, fall back to advertise-only mode for P2–P4. |
+| P1 native `map_hits=0` (control also 0) | **First suspect: the NVIDIA driver gates (§3.2)** — regkeys missing (cufile errornum **801**) or 580.x-vs-≥6.15 UVM refcount bug (errornum **1** + driver-open 5001); then ACS/IOMMU; then topology; **then the kernel pci_p2pdma platform gate (§3.2 topology note)** | Check `/sys/bus/pci/devices/<gpu>/p2pmem/` exists; grep cufile.log for `errornum: 801` (→ regkeys) vs `errornum: 1` (→ driver < 595); `gdscheck -p`; `nvidia-smi topo -m` (all-NODE is fine on SPR+`iommu=pt` — confirmed). **If `p2pmem/` exists but map_hits still 0: FIRST check `cat /sys/bus/pci/devices/<bdf>/iommu_group/type` — `DMA-FQ`/`DMA` = IOMMU in translation mode ⇒ the NVIDIA GDS path can't build the peer IOVA (dmesg `pIOVAS != NULL @ io_vaspace.c`, cufile.log `pci_p2pdma support: False` despite static `PCIP2PDMACapable:1`, `gdscheck -p` = `compat`) ⇒ boot `iommu=pt` (want `identity`; §3.2 IOMMU gate + runbook step 0c). This bites AMD EPYC too. If `identity` already, the member NVMe's DMA-map is likely `MAP_NOT_SUPPORTED` — the GPU↔NVMe path crosses the root complex and the platform isn't P2P-trusted. Confirm the platform passes the kernel gate: AMD Zen (`grep -q AMD /proc/cpuinfo` + family ≥ 0x17) OR a whitelisted Intel-server host bridge (`lspci -nns 00:00.0`; SPR ok, desktop Intel e.g. `0xa740` NOT). Neither ⇒ no GPU fixes it; need a Zen/server platform or a common PCIe switch.** If the box genuinely can't do native GDS, P1 is a legitimate FAIL — record it, fall back to advertise-only mode for P2–P4. |
 | P2 witness `p2p_bios=0` but cuFile says native | cuFile bounced silently; or witness attach failed | Check witness `-o` dump: if `host_bios>0` the probe fired and cuFile really bounced (real FAIL — investigate cuFile/topology). If witness rc=4, it's a SKIP not FAIL. |
 | P2/P3 witness `p2p_bios>0` on a **CPU** run (false positive) | pgmap union misread on wrong kernel (§7) | Recalibrate on P1 (control must be 0). If control ≠ 0, fix the folio/enum in `gds-p2p-witness` and re-verify. |
 | P2 `advertise FAIL` intermittently | probe flake (rc=4 folded) — should already SKIP | Confirm you're on the post-fix tests (three-way rc). Re-run; a genuine `advertise FAIL` on an all-NVMe array = real member-AND regression (investigate the feature, not the test). |
@@ -603,6 +622,7 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 | P6/P7 FAIL "injector never fired" | module-qualified kprobe didn't bind; wrong module loaded; module build failed | check the test's `gds_kallsyms_check` output (`raid1_ms:raid1_end_write_request` must resolve exactly once); `dmesg` for insmod errors; rebuild `make -C dkms/inval-inject`; verify the variant srcversion against the manifest. |
 | P6 shows the "no P2P path" breadcrumb | the stage-1 arm fired for a NON-P2P bio | **kernel bug — escalate, do not loosen the test.** |
 | P7a fails with gdsio rc=0 | the arm did not fire → wrong module variant loaded (gds1/gds0 left behind), or injector mis-aimed | `cat /sys/module/raid1_ms/srcversion` vs the gdsM row of `kit-manifest.tsv`; re-run `sudo ./install.sh`; check `injected` count in the `.out`. |
+| P7a/b/d/e all FAIL with `p2p_bios=0 ... cmd_rc=1` (gdsio rc≠0) | **downstream of a P1 FAIL — NOT a stage-1 regression.** No native P2P write existed, so the arm was never exercised (it needs a real `R1BIO_P2P`/`R10BIO_P2P` bio). Whole-box native GDS is broken, not the fix. | Confirm it's downstream, not a real arm defect: the `.out` shows the injector resolved (`raid1_end_write_request in [raid1_ms]: 1 copies`) and `.dmesg` has **no `no P2P path` breadcrumb, no leg-fault, no badblocks** (arm didn't run). Fix P1 (usually the `iommu=pt` IOMMU gate, §3.2) and re-run — do **not** escalate as a stage-1 regression. A real arm defect instead shows `p2p_bios>0` with the wrong completion behavior. |
 | Campaign exit 5 (INCOMPLETE) | a P7 subtest SKIPped for a reason outside the expected gates/hatches on a GPU box | read the `INCOMPLETE:` log lines; fix the named rig condition and re-run `--phases p0,p7` (p0 refreshes env.sh — a p0-less run only inherits a previous run's values). Treat as red, not as a pass. |
 | Node wedged, kthreads in D state | a real deadlock; or you ran with `MD_SUBSYS=md` | **Never set `MD_SUBSYS=md`** — the raid10 recovery-freeze test wedges in-tree kthreads (reboot to clear). Copy `results/` off, reboot, resume with `--phases`. |
 | Array won't create ("device busy"/superblock) | stale superblock or udev grabbed the device | `mdadm --stop`; `mdadm --zero-superblock <dev>` (system mdadm for /dev/mdN, patched for members); `wipefs -a` as last resort on a **test** partition only. |
