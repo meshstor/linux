@@ -43,6 +43,12 @@
 #   COUNT=N        number of partitions to create (default 2)
 set -euo pipefail
 
+# Ubuntu 26.04+ ships the Rust uutils rewrite as /usr/bin/shred, and it refuses
+# every non-regular file ("<dev>: Not a file", exit 1) — it cannot zero a
+# partition at all. Ubuntu keeps the GNU build alongside as /usr/bin/gnushred;
+# prefer it, exactly as bin/gds-campaign prefers /usr/bin/gnudd.
+SHRED="${SHRED:-$( [ -x /usr/bin/gnushred ] && echo /usr/bin/gnushred || echo shred )}"
+
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 log()  { printf '%s\n' "$*"; }
@@ -239,7 +245,7 @@ main() {
     [[ $EUID -eq 0 ]] || die "must run as root (try: sudo $0 $*)"
 
     # ---- tool check ----
-    for t in lsblk blockdev parted partprobe udevadm awk shred; do
+    for t in lsblk blockdev parted partprobe udevadm awk "$SHRED"; do
         command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
     done
 
@@ -438,7 +444,7 @@ EOF
         pdev="${PART_DEVS[i]}"
         [[ -b "$pdev" ]] || die "post-create: $pdev vanished before zeroing"
         log "zeroing $pdev (shred -z) to match driver --assume-clean"
-        shred -f -n 1 -z "$pdev"
+        "$SHRED" -f -n 1 -z "$pdev"
     done
 
     echo

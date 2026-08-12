@@ -70,7 +70,15 @@ run_log() {
 }
 
 # ---- preflight ----
-REQUIRED_TOOLS=(mdadm nvme fio lsblk jq udevadm awk modprobe ss shred)
+# shred/dd for the member zeroing below. Ubuntu 26.04+ ships the Rust uutils
+# rewrite as /usr/bin/{shred,dd}: its shred refuses every non-regular file
+# ("<dev>: Not a file", exit 1) so it cannot zero a block device at all, and its
+# dd fails O_DIRECT on queues GNU dd handles. Ubuntu keeps the GNU builds
+# alongside as /usr/bin/gnu*; prefer them, as bin/gds-campaign already does.
+SHRED="${SHRED:-$( [ -x /usr/bin/gnushred ] && echo /usr/bin/gnushred || echo shred )}"
+DD="${DD:-$( [ -x /usr/bin/gnudd ] && echo /usr/bin/gnudd || echo dd )}"
+
+REQUIRED_TOOLS=(mdadm nvme fio lsblk jq udevadm awk modprobe ss "$SHRED" "$DD")
 REQUIRED_MODULES_BASE=(nvmet nvmet-tcp nvme-tcp)
 REQUIRED_MODULES_MS=(ms-mod)
 
@@ -477,13 +485,22 @@ wipe_array_state() {
 # took: `blkdiscard -z` cannot be trusted by exit code on an nvme-tcp import
 # (see below), so we check the bytes. Window at offset 0 catches a leftover
 # superblock/header; the deep window catches stale data a fabric no-op left in
-# the body. A read past the device end returns nothing and is treated as zero.
+# the body. A read past the device end returns nothing (dd still exits 0) and is
+# treated as zero.
+#
+# Fails CLOSED: a window that cannot be READ is reported as NOT zero. Calling an
+# unread leg zeroed would let --create --assume-clean build an array whose
+# mirrors silently differ — the exact outcome this check exists to prevent.
 member_sample_is_zero() {
-    local dev="$1" off
+    local dev="$1" off out
     for off in 0 64; do
-        if [[ -n "$(dd if="$dev" bs=1M skip="$off" count=4 iflag=direct status=none 2>/dev/null | tr -d '\0')" ]]; then
+        if ! out="$(set -o pipefail
+                    "$DD" if="$dev" bs=1M skip="$off" count=4 iflag=direct status=none 2>/dev/null \
+                        | tr -d '\0')"; then
+            warn "read-back probe failed on $dev at ${off}MiB; treating it as NOT zeroed"
             return 1
         fi
+        [[ -z "$out" ]] || return 1
     done
     return 0
 }
@@ -505,7 +522,7 @@ member_sample_is_zero() {
 # the imported leg would carry the previous bench's data into the array while
 # its zeroed local twin holds zeros — an --assume-clean array with silently
 # diverged mirrors. When the read-back shows non-zero, fall back to an explicit
-# zero-WRITE (shred), which lands as real zero bytes over any transport exactly
+# zero-WRITE ($SHRED), which lands as real zero bytes over any transport exactly
 # as the array's own writes do, then re-verify and fail closed if still not zero.
 #
 # Data safety: acts ONLY on the configured leg devices, each gated by
@@ -529,7 +546,7 @@ zero_array_members() {
             continue
         fi
         warn "blkdiscard -z left $m non-zero (nvme-tcp deallocate no-op?); writing zeros explicitly"
-        shred -f -n 0 -z "$m" || die_setup "failed to zero member $m"
+        "$SHRED" -f -n 0 -z "$m" || die_setup "failed to zero member $m with $SHRED"
         member_sample_is_zero "$m" || die_setup "member $m still non-zero after explicit zero-write"
     done
 }
