@@ -147,6 +147,16 @@ advertises `BLK_FEAT_PCI_P2PDMA` (it has no `supports_pci_p2pdma` ctrl op). Only
   non-advertising by design regardless: `ib_uses_virt_dma()` ⇒
   `ib_dma_pci_p2p_dma_supported()` = false. The P4c gate + its expectations table encode all
   of this (§4.5, §5, §8).
+  **ANSWERED POSITIVE (shadecloud 2026-07-07, real cabled mlx5 HCA + `nvme_core.multipath=N`
+  + kernel 7.1.3): the nvme-rdma loopback leg DOES advertise — `local=1 remote=1`.** With both
+  removable maskers gone (7.1 carries `23528aa3320a` natively, so the override is unnecessary;
+  and `multipath=N` removes the head split so the feature reaches the consumed node), the leg
+  advertises `BLK_FEAT_PCI_P2PDMA` and the array does too: `advertise_consistency array=1 ==
+  AND(members)` — the **positive member-AND** (both members advertise ⇒ array advertises). P7g
+  then did a witnessed **native** GPU write over [local, rdma] legs (`p2p_bios=520`, legs
+  identical). This is the post-cabling headline the earlier windows could not produce (Manassas
+  was rxe-only + `multipath=Y`). NB on **≥7.1** P4c reads `stock driver advertises — override
+  unnecessary` (INFO): the meshstor-nvme-rdma override only matters on `<7.1` kernels.
 
 ---
 
@@ -435,6 +445,23 @@ unfixed in the latest release. Upgrading cuFile does not change this; the only i
 transparent-convergence PASS is the deferred **stage-2 self-heal** (in-driver CPU bounce), not a
 tooling tweak. Ref: `docs.nvidia.com/gpudirect-storage/release-notes` (r1.18 Known Issues).
 
+**5th cuFile finding (2026-07-07, shadecloud) — the cufile.json `block` section must be a
+TOP-LEVEL sibling, not nested under `fs`, or native P2P silently never arms.** cuFile's config
+schema places `block` (with `nvme`/`nvmeof`/`raid` → `use_pci_p2pdma`) at the top level, beside
+`properties` and `fs` (see the stock `/usr/local/cuda/gds/cufile.json`). The harness's
+`gds_cufile_json` originally nested it under `fs`; cuFile **silently ignores the mis-nested
+`fs.block`** and keeps the default `block.nvme.use_pci_p2pdma=false`, so every GDS write falls
+back to compat even with `properties.use_pci_p2pdma=true` on a fully P2P-capable box. The tell is
+a cufile.log where **driver-open confirms P2P** (`cufio-drv:160 ... checkIfAllGPUsSupportP2PDMA():
+1`, `cuFileDriverOpen success`) yet **per-file registration fails** (`cufio-fs:882 p2p flags for
+fs: xfs : 0`, `cufio-fs:891 gpu attribute pci_p2pdma support: False`, `cuFileHandleRegister
+error: GPUDirect Storage not supported on current file`) — and the resolved config prints
+`block.nvme.use_pci_p2pdma : false` despite the strict json. Fixed in `gds/lib.sh` (hoist `block`
+to top level); verified by a manual witnessed write — **mis-nested ⇒ `map_hits=0 cmd_rc=1`;
+top-level ⇒ `map_hits=512 cmd_rc=0`, GPUDirect verified.** This is orthogonal to `iommu=pt`: on
+shadecloud BOTH the IOMMU passthrough boot AND this config fix were required before native GDS
+worked. If a future window edits `gds_cufile_json`, keep `block` top-level.
+
 ---
 
 ## 5. Phase plan and the EXPECTED RESULTS MATRIX
@@ -613,7 +640,7 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 | gdsio errors on flags / unexpected `-x`/`-V` behavior | the wrappers' gdsio flags (`-d 0 -w 4 -s 256M -i 1M -x {0,1} -I {0,1} -V`) were written from docs, **never run against a real gdsio** | `gdsio -h` FIRST; if mode numbering or verify semantics differ, fix ONLY the two wrappers `gds_gdsio_write`/`gds_gdsio_readverify` in `gds/lib.sh` (they isolate this exact risk), re-run unit gate + P1. |
 | cuFile refuses the file on an ms array (`Unsupported block device` / `RAID level not supported` / `RAID member not supported`) despite witness proving raw-partition native | one of cuFile's **three userspace gates** (§4.6a): missing `MD_*` props (msadm/rule), the **raid0-only level policy**, or a non-PCIe member transport | Walk the §4.6a ladder in order: `udevadm info --query=property /dev/msN | grep MD_` (empty → install `/usr/sbin/msadm` + trigger); `RAID level not supported` → expected on raid1/raid10, use the test-only level-spoof for kernel-path evidence + escalate as product finding; `unknown NVMe transport` → cuFile's own member AND, working as designed. |
 | `ms-queue-features` always rc=4 | bpftrace can't attach; no BTF; probe symbol missing | `bpftrace -l 'kprobe:submit_bio*'`; check `CONFIG_DEBUG_INFO_BTF=y`; check `/sys/kernel/tracing/available_filter_functions`. Fix probe name if the submit path differs on this kernel. |
-| P1 native `map_hits=0` (control also 0) | **First suspect: the NVIDIA driver gates (§3.2)** — regkeys missing (cufile errornum **801**) or 580.x-vs-≥6.15 UVM refcount bug (errornum **1** + driver-open 5001); then ACS/IOMMU; then topology; **then the kernel pci_p2pdma platform gate (§3.2 topology note)** | Check `/sys/bus/pci/devices/<gpu>/p2pmem/` exists; grep cufile.log for `errornum: 801` (→ regkeys) vs `errornum: 1` (→ driver < 595); `gdscheck -p`; `nvidia-smi topo -m` (all-NODE is fine on SPR+`iommu=pt` — confirmed). **If `p2pmem/` exists but map_hits still 0: FIRST check `cat /sys/bus/pci/devices/<bdf>/iommu_group/type` — `DMA-FQ`/`DMA` = IOMMU in translation mode ⇒ the NVIDIA GDS path can't build the peer IOVA (dmesg `pIOVAS != NULL @ io_vaspace.c`, cufile.log `pci_p2pdma support: False` despite static `PCIP2PDMACapable:1`, `gdscheck -p` = `compat`) ⇒ boot `iommu=pt` (want `identity`; §3.2 IOMMU gate + runbook step 0c). This bites AMD EPYC too. If `identity` already, the member NVMe's DMA-map is likely `MAP_NOT_SUPPORTED` — the GPU↔NVMe path crosses the root complex and the platform isn't P2P-trusted. Confirm the platform passes the kernel gate: AMD Zen (`grep -q AMD /proc/cpuinfo` + family ≥ 0x17) OR a whitelisted Intel-server host bridge (`lspci -nns 00:00.0`; SPR ok, desktop Intel e.g. `0xa740` NOT). Neither ⇒ no GPU fixes it; need a Zen/server platform or a common PCIe switch.** If the box genuinely can't do native GDS, P1 is a legitimate FAIL — record it, fall back to advertise-only mode for P2–P4. |
+| P1 native `map_hits=0` (control also 0) | **First suspect: the NVIDIA driver gates (§3.2)** — regkeys missing (cufile errornum **801**) or 580.x-vs-≥6.15 UVM refcount bug (errornum **1** + driver-open 5001); then ACS/IOMMU; then topology; **then the kernel pci_p2pdma platform gate (§3.2 topology note)** | Check `/sys/bus/pci/devices/<gpu>/p2pmem/` exists; grep cufile.log for `errornum: 801` (→ regkeys) vs `errornum: 1` (→ driver < 595); `gdscheck -p`; `nvidia-smi topo -m` (all-NODE is fine on SPR+`iommu=pt` — confirmed). **If `p2pmem/` exists but map_hits still 0: FIRST check `cat /sys/bus/pci/devices/<bdf>/iommu_group/type` — `DMA-FQ`/`DMA` = IOMMU in translation mode ⇒ the NVIDIA GDS path can't build the peer IOVA (dmesg `pIOVAS != NULL @ io_vaspace.c`, cufile.log `pci_p2pdma support: False` despite static `PCIP2PDMACapable:1`, `gdscheck -p` = `compat`) ⇒ boot `iommu=pt` (want `identity`; §3.2 IOMMU gate + runbook step 0c). This bites AMD EPYC too. **If `identity` already (e.g. after the `iommu=pt` reboot) but native STILL fails with a CLEAN dmesg (no `pIOVAS`): check the cufile.json `block` nesting (§4.6a 5th finding)** — cufile.log shows `checkIfAllGPUsSupportP2PDMA(): 1` at driver-open yet per-file `gpu attribute pci_p2pdma support: False` and `block.nvme.use_pci_p2pdma : false` despite the strict json; fix = `block` as a TOP-LEVEL section in `gds_cufile_json`, not under `fs`. Only once the config is correct AND the domain is `identity`: the member NVMe's DMA-map is likely `MAP_NOT_SUPPORTED` — the GPU↔NVMe path crosses the root complex and the platform isn't P2P-trusted. Confirm the platform passes the kernel gate: AMD Zen (`grep -q AMD /proc/cpuinfo` + family ≥ 0x17) OR a whitelisted Intel-server host bridge (`lspci -nns 00:00.0`; SPR ok, desktop Intel e.g. `0xa740` NOT). Neither ⇒ no GPU fixes it; need a Zen/server platform or a common PCIe switch.** If the box genuinely can't do native GDS, P1 is a legitimate FAIL — record it, fall back to advertise-only mode for P2–P4. |
 | P2 witness `p2p_bios=0` but cuFile says native | cuFile bounced silently; or witness attach failed | Check witness `-o` dump: if `host_bios>0` the probe fired and cuFile really bounced (real FAIL — investigate cuFile/topology). If witness rc=4, it's a SKIP not FAIL. |
 | P2/P3 witness `p2p_bios>0` on a **CPU** run (false positive) | pgmap union misread on wrong kernel (§7) | Recalibrate on P1 (control must be 0). If control ≠ 0, fix the folio/enum in `gds-p2p-witness` and re-verify. |
 | P2 `advertise FAIL` intermittently | probe flake (rc=4 folded) — should already SKIP | Confirm you're on the post-fix tests (three-way rc). Re-run; a genuine `advertise FAIL` on an all-NVMe array = real member-AND regression (investigate the feature, not the test). |

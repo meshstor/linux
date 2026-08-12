@@ -609,23 +609,40 @@ hardware: cross-RC P7f (single-disk test partitions — no root-complex-spanning
 and cabled-RoCE P7g/h (`nvme_core.multipath=Y`, no cabled HCA). cuFile 1.18 makes the
 `p7c_userspace` SKIP the vendor-acknowledged Known-Issue path, not a version artifact.
 
-**First full-run results (shadecloud 2026-07-07): 26 PASS / 8 SKIP / 13 FAIL — no
-shipped-feature regression; native GDS blocked by the IOMMU boot config.** Every
-GPU-independent shipped-feature assertion is green — the **P6 stage-1 narrowness proof**
-(`injected=64, [UU], leg stale, no breadcrumb`), P3 fabric on a *real cabled mlx5 HCA*
-(advertise-consistency `array=0==AND`, Finding-E `local=1 remote=0`, compat fallback +
-leg integrity), P4b clear-on-add (raid1+raid10), and **P4c/P5**. Two corrections to the
-provisioning-bank predictions above:
-- **`iommu=pt` IS required on this EPYC.** The box booted without it (devices in `DMA-FQ`
-  translation domains); native GDS (P1/P2 + P7a/b/d/e) FAILED with `NVRM ... pIOVAS != NULL`,
-  cuFile `pci_p2pdma support: False`, `gdscheck -p` = `compat`. The kernel `cpu_supports_p2pdma`
-  gate is a *separate layer* from the NVIDIA driver's IOVA requirement (§3.2 IOMMU gate, step 0c).
-  The P7 FAILs are downstream of P1 (`p2p_bios=0`, arm never exercised) — **not** stage-1 regressions.
-- **The P5/gds0 baseline false-advertise DOES reproduce on 7.1.** Live P5: the baseline array
-  advertised `BLK_FEAT_PCI_P2PDMA` (bit 12, `features=0x5090`) with a tcp leg present, so 7.1's
-  `blk_stack_limits` did **not** self-AND it away — the fork's member-AND is still doing real
-  work here, contrary to the logic-only prediction. (Re-run p0..p7 after `iommu=pt`+`multipath=N`
-  to bank the native-GDS + rdma-leg-positive evidence.)
+**Diagnostic run #1 (shadecloud 2026-07-07, PRE-FIX): 26 PASS / 8 SKIP / 13 FAIL — no
+shipped-feature regression; native GDS blocked, root-caused to TWO independent causes.**
+Every GPU-independent shipped-feature assertion was already green (P6 narrowness, P3
+fabric on a *real cabled mlx5 HCA*, P4b, P4c, P5). The GPU-native FAILs (P1/P2 + P7a/b/d/e,
+all `p2p_bios=0`, the arm never exercised — **not** stage-1 regressions) traced to:
+1. **IOMMU translation.** The box booted without `iommu=pt` (devices in `DMA-FQ` domains);
+   `NVRM ... pIOVAS != NULL`. Fixed by the reboot (→ `identity` domains, §3.2 / step 0c).
+2. **A cufile.json schema bug in the harness.** `gds_cufile_json` nested `block` under `fs`,
+   so cuFile ignored `block.nvme.use_pci_p2pdma=true` and bounced through compat
+   (`gpu attribute pci_p2pdma support: False` even though driver-open logs
+   `checkIfAllGPUsSupportP2PDMA=1`). Fixed by hoisting `block` to a top-level sibling
+   (commit; briefing §4.6a + §8). **`iommu=pt` alone was necessary but NOT sufficient — both
+   fixes were required.**
+Plus a correction to the provisioning-bank prediction: **the P5/gds0 baseline false-advertise
+DOES reproduce on 7.1** (baseline array advertised bit 12, `features=0x5090`, with a tcp leg —
+7.1's `blk_stack_limits` did not self-AND it away; the fork's member-AND is still doing real work).
+
+**Definitive run (shadecloud 2026-07-07, POST-FIX = iommu=pt reboot + cufile.json fix):
+48 PASS / 6 SKIP / 9 INFO / 1 FAIL — full green** (the lone FAIL is the documented benign
+`merge_control` fast-NVMe noise, §6). Native GDS proven end-to-end: **P1 calibrated, P2
+headline `p2p_bios=520` legs bit-identical, P3 native on the real RDMA fabric
+(`p2p_bios=518` raid1 / `8192` raid10).** `multipath=N` + the cabled mlx5 HCA delivered the
+firsts Manassas never could:
+- **Finding-E flipped to `remote=1`** (the nvme-rdma loopback leg now advertises) → the
+  **positive member-AND**: `advertise_consistency PASS array=1 == AND(members)`.
+- **P7g PASS** — witnessed **native GPU write over [local, rdma] legs** (`p2p_bios=520`, legs
+  identical): the first cabled-RoCE native P2P through an ms array.
+- **P4c** — stock 7.1 nvme-rdma advertises P2P natively; the **meshstor-nvme-rdma override is
+  unnecessary on ≥7.1** (confirmed live, not just predicted).
+- **Stage-1 arm on real GPU I/O all PASS** — P7a/P7b/P7d (INVAL+TARGET, raid1+raid10 `[UUUU]`:
+  loud EINVAL, no leg fault, no badblocks, breadcrumb), P7e A/B contrast (gds1 silent swallow
+  reproduced, no breadcrumb), P7c/P7h kernel side PASS (userspace pair SKIP = the r1.18 mid-IO
+  compat non-retry Known Issue), P7f cross-RC witnessed native (`p2p_bios=518`, correct SKIP —
+  EPYC whitelists cross-RC). Box left clean on gdsM.
 
 ## Post-cabling procedure — the gated P7g/P7h window (first actions when the RoCE ports go live)
 
