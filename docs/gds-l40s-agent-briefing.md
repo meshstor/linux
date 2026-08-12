@@ -224,8 +224,21 @@ consumed node). This leg-side chain gates only the rdma leg's block-layer advert
 §8's ladder and the runbook's post-cabling procedure.
 
 Topology note: the L40S box has no PIX/PXB GPU↔NVMe pairing (every GPU behind its own root
-port, NVMes on one host bridge) — host-bridge (NODE) P2P **works** on Sapphire Rapids with
-`iommu=pt` (P1 witnessed map_hits=512 on a raw partition).
+port, NVMes on one host bridge), so NVMe↔GPU P2P must traverse the CPU root complex
+(`PCI_P2PDMA_MAP_THRU_HOST_BRIDGE`). **The kernel (`drivers/pci/p2pdma.c`) permits that ONLY
+when `cpu_supports_p2pdma()` (AMD Zen, family ≥ 0x17 — always true) OR `host_bridge_whitelist()`
+(Intel *server* host bridges only: Sandy/Haswell/Sky Lake-E, Ice Lake/SPR, Granite Rapids;
+mainstream *desktop* Intel is NOT listed → P2P refused with `MAP_NOT_SUPPORTED`).** Verified from
+source 2026-07-06 — this is a platform gate *below* the GPU, independent of the NVIDIA driver
+gates. For the two candidate L40S CPUs:
+- **AMD EPYC 9334 (Zen 4)** — passes unconditionally via `cpu_supports_p2pdma()`; the robust
+  choice, no whitelist/topology dependency.
+- **Intel Xeon 8468 (Sapphire Rapids)** — whitelisted, but relies on the whitelist match AND
+  needs `iommu=pt` (VT-d on, not `iommu=off`); confirmed working on the dev L40S
+  (P1 map_hits=512). Slightly more fragile than the EPYC.
+If P1 reads `map_hits=0` on a Zen/whitelisted-server platform with every NVIDIA gate satisfied,
+the member NVMe's DMA-map is hitting `MAP_NOT_SUPPORTED` — see §8. (A consumer platform — desktop
+Intel/AMD-APU — refuses this P2P outright regardless of GPU class or BAR1 size.)
 
 ---
 
@@ -525,7 +538,7 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 | gdsio errors on flags / unexpected `-x`/`-V` behavior | the wrappers' gdsio flags (`-d 0 -w 4 -s 256M -i 1M -x {0,1} -I {0,1} -V`) were written from docs, **never run against a real gdsio** | `gdsio -h` FIRST; if mode numbering or verify semantics differ, fix ONLY the two wrappers `gds_gdsio_write`/`gds_gdsio_readverify` in `gds/lib.sh` (they isolate this exact risk), re-run unit gate + P1. |
 | cuFile refuses the file on an ms array (`Unsupported block device` / `RAID level not supported` / `RAID member not supported`) despite witness proving raw-partition native | one of cuFile's **three userspace gates** (§4.6a): missing `MD_*` props (msadm/rule), the **raid0-only level policy**, or a non-PCIe member transport | Walk the §4.6a ladder in order: `udevadm info --query=property /dev/msN | grep MD_` (empty → install `/usr/sbin/msadm` + trigger); `RAID level not supported` → expected on raid1/raid10, use the test-only level-spoof for kernel-path evidence + escalate as product finding; `unknown NVMe transport` → cuFile's own member AND, working as designed. |
 | `ms-queue-features` always rc=4 | bpftrace can't attach; no BTF; probe symbol missing | `bpftrace -l 'kprobe:submit_bio*'`; check `CONFIG_DEBUG_INFO_BTF=y`; check `/sys/kernel/tracing/available_filter_functions`. Fix probe name if the submit path differs on this kernel. |
-| P1 native `map_hits=0` (control also 0) | **First suspect: the NVIDIA driver gates (§3.2)** — regkeys missing (cufile errornum **801**) or 580.x-vs-≥6.15 UVM refcount bug (errornum **1** + driver-open 5001); then ACS/IOMMU; then topology | Check `/sys/bus/pci/devices/<gpu>/p2pmem/` exists; grep cufile.log for `errornum: 801` (→ regkeys) vs `errornum: 1` (→ driver < 595); `gdscheck -p`; `nvidia-smi topo -m` (all-NODE is fine on SPR+`iommu=pt` — confirmed). If the box genuinely can't do native GDS, P1 is a legitimate FAIL — record it, fall back to advertise-only mode for P2–P4. |
+| P1 native `map_hits=0` (control also 0) | **First suspect: the NVIDIA driver gates (§3.2)** — regkeys missing (cufile errornum **801**) or 580.x-vs-≥6.15 UVM refcount bug (errornum **1** + driver-open 5001); then ACS/IOMMU; then topology; **then the kernel pci_p2pdma platform gate (§3.2 topology note)** | Check `/sys/bus/pci/devices/<gpu>/p2pmem/` exists; grep cufile.log for `errornum: 801` (→ regkeys) vs `errornum: 1` (→ driver < 595); `gdscheck -p`; `nvidia-smi topo -m` (all-NODE is fine on SPR+`iommu=pt` — confirmed). **If `p2pmem/` exists but map_hits still 0: the member NVMe's DMA-map is likely `MAP_NOT_SUPPORTED` — the GPU↔NVMe path crosses the root complex and the platform isn't P2P-trusted. Confirm the platform passes the kernel gate: AMD Zen (`grep -q AMD /proc/cpuinfo` + family ≥ 0x17) OR a whitelisted Intel-server host bridge (`lspci -nns 00:00.0`; SPR ok, desktop Intel e.g. `0xa740` NOT). Neither ⇒ no GPU fixes it; need a Zen/server platform or a common PCIe switch.** If the box genuinely can't do native GDS, P1 is a legitimate FAIL — record it, fall back to advertise-only mode for P2–P4. |
 | P2 witness `p2p_bios=0` but cuFile says native | cuFile bounced silently; or witness attach failed | Check witness `-o` dump: if `host_bios>0` the probe fired and cuFile really bounced (real FAIL — investigate cuFile/topology). If witness rc=4, it's a SKIP not FAIL. |
 | P2/P3 witness `p2p_bios>0` on a **CPU** run (false positive) | pgmap union misread on wrong kernel (§7) | Recalibrate on P1 (control must be 0). If control ≠ 0, fix the folio/enum in `gds-p2p-witness` and re-verify. |
 | P2 `advertise FAIL` intermittently | probe flake (rc=4 folded) — should already SKIP | Confirm you're on the post-fix tests (three-way rc). Re-run; a genuine `advertise FAIL` on an all-NVMe array = real member-AND regression (investigate the feature, not the test). |
