@@ -12,7 +12,7 @@ Every block below is paste-able as-is; run everything **from the kit root**
 bash tools/testing/selftests/md/p2pdma/gds/test_unit_helpers.sh   # want: PASS: unit helpers
 sudo bash tools/testing/selftests/md/p2pdma/gds/test_injector_smoke.sh  # resolver+filter smoke
 bin/gds-make-kit 0.2.0                       # -> build/gds-kit-0.2.0.tar.gz (3 variants + manifest)
-sudo bin/gds-campaign --rehearsal --kit build/gds-kit-0.2.0   # P0-P6 green, P7a-e live, P7g/h/f SKIP
+sudo bin/gds-campaign --rehearsal --kit build/gds-kit-0.2.0   # P0-P6 green; P7a-e SKIP (no gdsio) — the injector smoke above is the GPU-free P7 check; P7g/h/f SKIP
 scp build/gds-kit-0.2.0.tar.gz l40s:/opt/
 ```
 
@@ -238,8 +238,9 @@ describes that invocation only) — the earlier full table survives in
 
 ## Step 5b: p7 — stage-1 fail-the-write on real GPU I/O (runs inside the main invocation)
 
-What to expect in `verdict.tsv` (all on gdsM, CSI array shape, spoof managed
-by the phase itself):
+What to expect in `verdict.tsv` (all on gdsM except P7e, which swaps to the
+pre-fix gds1 for the A/B contrast and restores gdsM; CSI array shape, spoof
+managed by the phase itself):
 
 ```
 p7  spoof        PASS  behavioral: scratch ms array reports MD_LEVEL=raid0
