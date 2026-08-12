@@ -102,5 +102,49 @@ if [ -e "$WIT" ]; then
     fi
 fi
 
+# --- Task-3 helpers: rootless coverage ---------------------------------------
+# gds_assert_no_badblocks against a fake sysfs tree
+mkdir -p "$STUB/sysblock/ms7/ms/rd0" "$STUB/sysblock/ms7/ms/rd1"
+: > "$STUB/sysblock/ms7/ms/rd0/bad_blocks"
+: > "$STUB/sysblock/ms7/ms/rd1/bad_blocks"
+GDS_SYS_BLOCK="$STUB/sysblock" gds_assert_no_badblocks /dev/ms7 \
+    || fail "gds_assert_no_badblocks: empty files must pass"
+echo "16 8" > "$STUB/sysblock/ms7/ms/rd1/bad_blocks"
+GDS_SYS_BLOCK="$STUB/sysblock" gds_assert_no_badblocks /dev/ms7 2>/dev/null \
+    && fail "gds_assert_no_badblocks: non-empty content must fail"
+
+# breadcrumb helpers against a stub dmesg
+cat > "$STUB/dmesg1" <<'EOF'
+line one
+line two
+EOF
+cat > "$STUB/fake-dmesg" <<EOF
+#!/bin/bash
+cat "$STUB/dmesg1"
+EOF
+chmod +x "$STUB/fake-dmesg"
+export GDS_DMESG_CMD="$STUB/fake-dmesg"
+gds_dmesg_mark
+cat >> "$STUB/dmesg1" <<'EOF'
+ms/raid1:ms0: nvme0n1p5: no P2P path for peer pages (status=-22), failing write; if legs diverged run: echo repair > sync_action
+EOF
+gds_assert_breadcrumb || fail "gds_assert_breadcrumb: must see the breadcrumb in the delta"
+gds_assert_no_breadcrumb 2>/dev/null && fail "gds_assert_no_breadcrumb: must fail when breadcrumb present"
+gds_dmesg_mark   # re-mark past the breadcrumb
+gds_assert_no_breadcrumb || fail "gds_assert_no_breadcrumb: clean delta must pass"
+gds_assert_breadcrumb 2>/dev/null && fail "gds_assert_breadcrumb: must fail on clean delta"
+unset GDS_DMESG_CMD
+
+# gds_kallsyms_check against a fixture
+cat > "$STUB/kallsyms" <<'EOF'
+ffffffffc0100000 t raid1_end_write_request	[raid1]
+ffffffffc0200000 t raid1_end_write_request	[raid1_ms]
+ffffffffc0200100 t raid10_end_write_request	[raid10_ms]
+EOF
+GDS_KALLSYMS="$STUB/kallsyms" gds_kallsyms_check raid1_end_write_request raid1_ms \
+    || fail "gds_kallsyms_check: exactly-one-in-module must pass"
+GDS_KALLSYMS="$STUB/kallsyms" gds_kallsyms_check raid1_end_write_request raid5_ms 2>/dev/null \
+    && fail "gds_kallsyms_check: zero-in-module must fail"
+
 [ "$FAILED" = 0 ] && echo "PASS: unit helpers" && exit 0
 exit 1

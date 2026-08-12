@@ -296,6 +296,9 @@ gds_nvmet_teardown() {
 }
 
 gds_teardown() {
+	# disarm+unload FIRST: an armed match=success p2p_only=1 probe must
+	# never survive into teardown I/O (or the operator's recovery I/O).
+	gds_injector_unload
 	mountpoint -q "$GDS_MNT" 2>/dev/null && umount "$GDS_MNT" 2>/dev/null
 	p2pdma_teardown
 	gds_nvmet_teardown
@@ -346,4 +349,114 @@ gds_leg_sha() {
 	sha=$(set -o pipefail; sha256sum "$mnt/$rel" | awk '{print $1}')
 	umount "$mnt"; losetup -d "$lo"; rmdir "$mnt"
 	echo "$sha"
+}
+
+# ---------------------------------------------------------------------------
+# Stage-1 validation helpers (P6 narrowness proof + P7 subtests).
+
+# In-test dmesg delta. The campaign's run_test captures a per-test .dmesg
+# only AFTER the test exits, so tests needing in-flight assertions keep
+# their own mark. GDS_DMESG_CMD overrides `dmesg` for rootless unit tests.
+GDS_DMESG_MARK=0
+gds_dmesg_mark()  { GDS_DMESG_MARK=$(${GDS_DMESG_CMD:-dmesg} | wc -l); }
+gds_dmesg_delta() { ${GDS_DMESG_CMD:-dmesg} | tail -n +"$((GDS_DMESG_MARK + 1))"; }
+
+# Breadcrumb = the stage-1 arm's pr_warn_ratelimited line; grep for the
+# literal "no P2P path" (rename-safe: survives the md->ms rename).
+# Ratelimit note: burst 10 / 5 s -- remaining=1 budgets stay well inside
+# the burst, and inter-subtest rig setup provides the >5 s spacing; do not
+# arm budgets >=10 and then assert per-completion breadcrumb counts.
+gds_assert_breadcrumb() {
+	gds_dmesg_delta | grep -q 'no P2P path' \
+		|| { echo "FAIL: expected 'no P2P path' breadcrumb absent from dmesg delta" >&2; return 1; }
+}
+gds_assert_no_breadcrumb() {
+	if gds_dmesg_delta | grep -q 'no P2P path'; then
+		echo "FAIL: unexpected 'no P2P path' breadcrumb in dmesg delta" >&2
+		return 1
+	fi
+	return 0
+}
+
+# gds_assert_no_badblocks DEV -- every rd*/bad_blocks under the array's ms/
+# dir must have empty CONTENT. NB [ -s ] is meaningless on sysfs (files
+# stat at 4096 regardless); read and compare. GDS_SYS_BLOCK overrides
+# /sys/block for rootless unit tests.
+gds_assert_no_badblocks() {
+	local name f content bad=0 seen=0
+	name=$(basename "$1")
+	for f in "${GDS_SYS_BLOCK:-/sys/block}/$name"/ms/rd*/bad_blocks; do
+		[ -e "$f" ] || continue
+		seen=1
+		content=$(cat "$f" 2>/dev/null || true)
+		[ -z "$content" ] \
+			|| { echo "FAIL: $f not empty: $content" >&2; bad=1; }
+	done
+	[ "$seen" = 1 ] || { echo "FAIL: no rd*/bad_blocks under $name (array not running?)" >&2; return 1; }
+	return $bad
+}
+
+# gds_kallsyms_check SYM MOD -- userspace ambiguity check for the injector:
+# 0 iff /proc/kallsyms shows exactly one SYM inside [MOD]. Prints the
+# multiplicity for the evidence log. GDS_KALLSYMS overrides for unit tests.
+gds_kallsyms_check() {
+	local n
+	n=$(awk -v s="$1" -v m="[$2]" '$3 == s && $NF == m' \
+		"${GDS_KALLSYMS:-/proc/kallsyms}" | wc -l)
+	echo "kallsyms: $1 in [$2]: $n copies"
+	[ "$n" -eq 1 ] || { echo "FAIL: $2:$1 not uniquely resolvable" >&2; return 1; }
+}
+
+# gds_dev_diskpart DEV -- derive the injector's disk=/partno= for DEV.
+# Partition: GDS_INJ_DISK = parent gendisk kname, GDS_INJ_PARTNO from
+# /sys/class/block/<kname>/partition. Whole disk: partno=0. Also records
+# GDS_INJ_MAJMIN (evidence: leg identity at arm time, e.g. the nvme-of
+# initiator namespace in P7h fail-remote).
+GDS_INJ_DISK=""; GDS_INJ_PARTNO=0; GDS_INJ_MAJMIN=""
+gds_dev_diskpart() {
+	local kn pk
+	kn=$(lsblk -dno KNAME "$1" | head -1)
+	pk=$(lsblk -dno PKNAME "$1" | head -1)
+	GDS_INJ_MAJMIN=$(lsblk -dno MAJ:MIN "$1" | tr -d ' ' | head -1)
+	if [ -n "$pk" ]; then
+		GDS_INJ_DISK=$pk
+		GDS_INJ_PARTNO=$(cat "/sys/class/block/$kn/partition" 2>/dev/null || echo 0)
+	else
+		GDS_INJ_DISK=$kn
+		GDS_INJ_PARTNO=0
+	fi
+	[ -n "$GDS_INJ_DISK" ]
+}
+
+# Injector lifecycle. Each subtest owns a full insmod->arm->disarm->rmmod
+# cycle (module unload kills kprobes, KPROBE_FLAG_GONE -- never reuse an
+# instance across a module swap). gds_teardown unloads on EXIT.
+GDS_INJ_KO=""; GDS_INJ_LOADED=0
+gds_injector_require() {  # SYM MOD -> build ko, verify unambiguous target
+	[ -d "/lib/modules/$(uname -r)/build" ] \
+		|| { echo "SKIP: kernel headers missing" >&2; exit 4; }
+	local inj="$GDS_DIR_SELF/../../../../../../dkms/inval-inject"
+	[ -d "$inj" ] || inj="${GDS_INJ_DIR:-}"
+	[ -n "$inj" ] && [ -d "$inj" ] \
+		|| { echo "SKIP: inval-inject source not found (set GDS_INJ_DIR)" >&2; exit 4; }
+	make -C "$inj" >/dev/null 2>&1 \
+		|| { echo "SKIP: inval_inject build failed" >&2; exit 4; }
+	GDS_INJ_KO="$inj/inval_inject.ko"
+	modprobe "$2" 2>/dev/null || true
+	gds_kallsyms_check "$1" "$2" \
+		|| { echo "SKIP: cannot resolve $2:$1 unambiguously (never arm an ambiguous probe)" >&2; exit 4; }
+}
+gds_injector_load() {  # QUALIFIED_SYM DISK PARTNO [EXTRA...]
+	local sym=$1 dsk=$2 pno=$3; shift 3
+	insmod "$GDS_INJ_KO" symbol="$sym" disk="$dsk" partno="$pno" "$@" || return 1
+	GDS_INJ_LOADED=1
+}
+gds_injector_arm()      { echo "$1" > /sys/module/inval_inject/parameters/remaining; }
+gds_injector_disarm()   { echo 0 > /sys/module/inval_inject/parameters/remaining 2>/dev/null || true; }
+gds_injector_injected() { cat /sys/module/inval_inject/parameters/injected; }
+gds_injector_remaining(){ cat /sys/module/inval_inject/parameters/remaining; }
+gds_injector_unload() {
+	gds_injector_disarm
+	rmmod inval_inject 2>/dev/null || true
+	GDS_INJ_LOADED=0
 }
