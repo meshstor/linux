@@ -27,7 +27,10 @@
 #
 # Exit: 0 = vendor tree unchanged, 3 = files were (re)written — re-verify
 # that dkms-nvme/patches/ still applies at --fuzz=0 before committing,
-# 4 = the noble mapping guard tripped (family moved or sources diverged).
+# 4 = the noble mapping guard tripped (family moved or sources diverged),
+# 1 = a fetch could not be completed (see fetch_url: a throttled Launchpad
+# reply is retried, then reported as an error rather than vendored as
+# content — the vendor tree is left untouched, so just retry later).
 # Network-using by design; run manually when a target moves, never from
 # the build pipeline.
 #
@@ -68,6 +71,42 @@ latest_tag() { # $1=repo url  $2=tag glob -> newest matching tag name
         | awk -F/ '{print $NF}' | grep -v '\^{}$' | sort -V | tail -1
 }
 
+# fetch_url URL DEST — fetch one file, insisting on a real 200 with a
+# non-empty body, and only then move it into place.
+#
+# Launchpad's cgit answers a burst-throttled request with an HTTP 302 to a
+# rate-limit page and an EMPTY body. `curl -f` fails only on >= 400, so a 3xx
+# reads as success: the obvious `curl -fsS URL -o DEST` silently wrote a
+# 0-byte "source" file and exited 0. That produced both a false
+# "noble DIVERGES" (exit 4, demanding a noble variant that is not needed) and
+# — via fetch_launchpad — a corrupt vendor tree stamped with the sha256 of an
+# empty file. Do not simplify this back into a bare curl, and do not "fix" it
+# with -L: the redirect target is the throttle page, not the source.
+FETCH_RETRIES="${MESHSTOR_FETCH_RETRIES:-5}"
+FETCH_BACKOFF="${MESHSTOR_FETCH_BACKOFF:-3}"
+fetch_url() {
+    local url="$1" dest="$2" tmp code size attempt
+    tmp="$(mktemp "$TMP/fetch.XXXXXX")"
+    for ((attempt = 1; attempt <= FETCH_RETRIES; attempt++)); do
+        code="$(curl -sS -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null)" || code=000
+        size="$(wc -c < "$tmp")"
+        if [[ "$code" == 200 && "$size" -gt 0 ]]; then
+            mv "$tmp" "$dest"
+            return 0
+        fi
+        echo "  ${url##*/}: HTTP $code, $size bytes — retry $attempt/$FETCH_RETRIES" >&2
+        if ((FETCH_BACKOFF > 0)); then
+            sleep $((attempt * FETCH_BACKOFF))
+        fi
+    done
+    rm -f "$tmp"
+    echo "error: could not fetch $url" >&2
+    echo "       after $FETCH_RETRIES attempts (last: HTTP $code, $size bytes)." >&2
+    echo "       A 3xx with an empty body is Launchpad throttling a burst — the" >&2
+    echo "       vendor tree was left untouched; simply retry in a few minutes." >&2
+    exit 1
+}
+
 write_provenance() { # $1=variant  $2=source line  $3=ref line  $4=reverify line
     local dir="$VENDOR/$1"
     {
@@ -89,8 +128,7 @@ fetch_launchpad() { # $1=variant  $2=repo url  $3=tag  $4=pin flag name
     local variant="$1" repo="$2" tag="$3" flag="$4" f
     mkdir -p "$VENDOR/$variant"
     for f in "${FILES[@]}"; do
-        curl -fsS "$repo/plain/drivers/nvme/host/$f?h=$tag" \
-            -o "$VENDOR/$variant/$f"
+        fetch_url "$repo/plain/drivers/nvme/host/$f?h=$tag" "$VENDOR/$variant/$f"
     done
     if [[ ! -f "$VENDOR/$variant/PROVENANCE" ]] || files_changed "$variant"; then
         write_provenance "$variant" "$repo" "$tag" \
@@ -100,7 +138,7 @@ fetch_launchpad() { # $1=variant  $2=repo url  $3=tag  $4=pin flag name
 }
 
 fetch_rocky() { # $1=NVR like 6.12.0-211.26.1.el10_2, or empty = latest
-    local nvr="$1" srpm f
+    local nvr="$1" srpm f tarball srcdir
     if [[ -z "$nvr" ]]; then
         srpm="$(curl -fsS "$ROCKY_SRC/" \
             | grep -oE 'kernel-6\.12\.0-[0-9.]+\.el10[_0-9]*\.src\.rpm' \
@@ -113,13 +151,33 @@ fetch_rocky() { # $1=NVR like 6.12.0-211.26.1.el10_2, or empty = latest
     mkdir -p "$VENDOR/rhel10"
     echo "downloading $srpm (large; a few hundred MB)"
     curl -fS -o "$TMP/$srpm" "$ROCKY_SRC/$srpm"
-    (cd "$TMP" && rpm2cpio "$srpm" | cpio -id --quiet 'linux-*.tar.xz')
-    tar -xJf "$TMP"/linux-*.tar.xz -C "$TMP" --wildcards \
+    # Match BOTH payload-name flavours: the classic standalone rpm2cpio
+    # stores bare names, while on rpm >= 4.17 rpm2cpio is a symlink to
+    # rpm2archive and stores them as "./name". cpio exits 0 when a pattern
+    # matches nothing, so a mismatch here is silent — it used to surface
+    # only as a baffling "tar: linux-*.tar.xz: Cannot open" on the
+    # unexpanded glob below. Every step is therefore checked explicitly.
+    (cd "$TMP" && rpm2cpio "$srpm" \
+        | cpio -id --quiet 'linux-*.tar.xz' './linux-*.tar.xz')
+    tarball="$(find "$TMP" -maxdepth 1 -name 'linux-*.tar.xz' -print -quit)"
+    if [[ -z "$tarball" ]]; then
+        echo "error: no linux-*.tar.xz unpacked from $srpm." >&2
+        echo "       Its payload holds (first 50 members):" >&2
+        rpm2cpio "$TMP/$srpm" | cpio -t --quiet 2>/dev/null \
+            | head -50 | sed 's/^/         /' >&2
+        exit 1
+    fi
+    tar -xJf "$tarball" -C "$TMP" --wildcards \
         'linux-*/drivers/nvme/host/rdma.c' \
         'linux-*/drivers/nvme/host/nvme.h' \
         'linux-*/drivers/nvme/host/fabrics.h'
+    srcdir="$(find "$TMP" -maxdepth 1 -type d -name 'linux-*' -print -quit)"
+    [[ -n "$srcdir" && -d "$srcdir/drivers/nvme/host" ]] \
+        || { echo "error: ${tarball##*/} has no linux-*/drivers/nvme/host." >&2; exit 1; }
     for f in "${FILES[@]}"; do
-        cp "$TMP"/linux-*/drivers/nvme/host/"$f" "$VENDOR/rhel10/$f"
+        [[ -f "$srcdir/drivers/nvme/host/$f" ]] \
+            || { echo "error: $f missing from ${tarball##*/}." >&2; exit 1; }
+        cp "$srcdir/drivers/nvme/host/$f" "$VENDOR/rhel10/$f"
     done
     if [[ ! -f "$VENDOR/rhel10/PROVENANCE" ]] || files_changed rhel10; then
         write_provenance rhel10 "$ROCKY_SRC/$srpm" "$nvr" \
@@ -158,7 +216,7 @@ noble_hwe_check() {
     fi
     mkdir -p "$TMP/noble"
     for f in "${FILES[@]}"; do
-        curl -fsS "$NOBLE_GIT/plain/drivers/nvme/host/$f?h=$tag" -o "$TMP/noble/$f"
+        fetch_url "$NOBLE_GIT/plain/drivers/nvme/host/$f?h=$tag" "$TMP/noble/$f"
         cmp -s "$TMP/noble/$f" "$VENDOR/u2604/$f" || differs+=" $f"
     done
     if [[ -n "$differs" ]]; then
