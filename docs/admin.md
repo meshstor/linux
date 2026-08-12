@@ -212,8 +212,8 @@ member:
 ```
 $ cat /sys/block/ms0/ms/p2pdma_status
 array advertise=yes policy=auto
-nvme1n1 advertise=yes observed=ok
-nvme2n1 advertise=yes observed=ok
+nvme1n1 advertise=yes observed=none
+nvme2n1 advertise=yes observed=p2pdma
 ```
 
 - The array line's `advertise=` is the array's own gendisk queue feature bit
@@ -221,11 +221,29 @@ nvme2n1 advertise=yes observed=ok
   re-derivation of policy. `policy=` echoes the active `p2pdma_advertise`
   value.
 - Each member line's `advertise=` is that member's own queue capability
-  (what feeds the `auto` policy's member-AND). `observed=` is a latch on the
-  first completion status seen for that member: `none` (no P2P I/O
-  completed yet), `ok`, `p2pdma` (a real or translated P2P-unroutable
-  completion), or `other` (any other error). The latch resets on array
-  stop/start and on member add/remove.
+  (what feeds the `auto` policy's member-AND).
+- `observed=` is a **failure** latch, not a completion latch. There is
+  deliberately no `ok` value:
+  - `none` — no P2P failure has been seen for this member. **This is the
+    healthy reading**, and it is what a member serving P2P traffic
+    successfully reports.
+  - `p2pdma` — a real or translated P2P-unroutable completion.
+  - `other` — some other error, observed while the array was advertising P2P.
+
+  Recording success would make the report useless: the latch is
+  first-write-wins, and once an array advertises, the first completion of
+  *any* kind reaches it — in practice an ordinary host-page write from
+  `mkfs`, a journal, or metadata. An `ok` value would therefore latch almost
+  immediately on every array and mask every later P2P failure. The latch
+  resets on array stop/start and on member add/remove.
+- The first non-`none` transition also emits **one** `dmesg` line per member,
+  naming the array and the member, e.g.
+
+  ```
+  ms/ms0: nvme2n1: no P2P path for peer pages (status=18); see p2pdma_status
+  ```
+
+  It is one-shot: a member that keeps failing does not keep logging.
 - Purely observational — reading it never gates, refuses, or alters I/O.
   Use it to tell apart "never advertised for this member" from "advertised,
   and P2P writes are being fenced" — both otherwise look identical from the
@@ -272,6 +290,56 @@ upstream nvme-multipath quirk, not introduced by this package), so operators
 running an rdma leg behind a RHEL 10 multipath head will see multipath
 accounting oddities for every unroutable P2P I/O. Cosmetic only — it does not
 affect the badblock/degrade behavior above.
+
+### Unsupported: dm-multipath between `ms` and an rdma namespace
+
+**Do not stack `ms` on top of a dm-multipath device that maps an nvme-rdma
+namespace, on a host kernel that does not natively define `BLK_STS_P2PDMA`**
+(i.e. anything before upstream v6 patch 1 lands — every kernel we ship to
+today).
+
+`blk_path_error()`, which dm consults to decide whether a failed I/O is a
+path problem worth retrying, is a `static inline` compiled into its caller.
+The in-tree `dm-multipath` on such a host was therefore built without any
+knowledge of status 18, and it falls through to the "could be a path failure
+→ retry" branch. Since an unroutable P2P transfer is a property of the PCIe
+topology, the retry fails identically every time, and dm **requeues
+forever**: the I/O never completes, and the application hangs rather than
+seeing an error.
+
+`ms` cannot break this cycle — the bio never gets back to md. There is no
+knob; the topology is simply unsupported until the host kernel carries the
+status natively.
+
+**Direct `ms`-on-nvme is unaffected**, and that is the supported (CSI)
+topology: members are the namespace devices themselves, with no dm layer in
+between.
+
+### `RWF_NOWAIT` writes fall outside the no-silent-divergence guarantee
+
+A write submitted with `RWF_NOWAIT` (`REQ_NOWAIT`) that fails on one leg is
+acked as **successful with no badblock recorded**, so the legs can diverge
+silently. `raid1_should_handle_error()` rejects `REQ_NOWAIT` (and
+`REQ_RAHEAD`) *before* it ever looks at the completion status, so the failed
+member is routed into the branch that marks the r1_bio uptodate. This is
+**upstream-inherited behaviour, not something this package introduces or
+fixes** — matching upstream here is deliberate; diverging would put `ms` out
+of step with kernel md on a path unrelated to P2PDMA.
+
+Scope, in practice:
+
+- **Not reachable through GDS.** cuFile / nvidia-fs never sets it: it submits
+  via `init_sync_kiocb()`, which derives `ki_flags` from the file's
+  `f_iocb_flags`, and `iocb_flags()` maps only
+  `O_APPEND`/`O_DIRECT`/`O_DSYNC`/`__O_SYNC` — never `IOCB_NOWAIT`. Re-check
+  on any nvidia-fs major version bump.
+- **Reachable from a plain `io_uring` writer** to `/dev/msN` that sets
+  `RWF_NOWAIT`. If you run such a workload on an `ms` array, do not rely on
+  the mirror-consistency guarantee for those writes; run
+  `echo repair > /sys/block/msN/ms/sync_action` to re-establish it.
+- Reads are not a divergence concern: `REQ_RAHEAD` exists only on reads, and
+  a NOWAIT read failure fails the master with an error rather than silently
+  succeeding.
 
 ## raid1 ↔ raid10 takeover
 
