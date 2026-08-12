@@ -350,7 +350,7 @@ gds_gdsio_readverify() {
 # gds_sha_direct FILE -> sha256 via CPU O_DIRECT read (page cache dropped)
 gds_sha_direct() {
 	sync; echo 3 > /proc/sys/vm/drop_caches
-	( set -o pipefail; dd if="$1" bs=1M iflag=direct status=none | sha256sum | awk '{print $1}' )
+	( set -o pipefail; "${DD:-dd}" if="$1" bs=1M iflag=direct status=none | sha256sum | awk '{print $1}' )
 }
 
 # gds_leg_sha MEMBER RELPATH -> sha256 of RELPATH on that leg's filesystem

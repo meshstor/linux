@@ -39,6 +39,12 @@ RESULTS=${RESULTS:-$REPO_ROOT/results/gds-campaign-$TS}
 mkdir -p "$RESULTS"
 export GDS_RESULTS="$RESULTS"
 export MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
+# dd for O_DIRECT work (leg SHAs, heartbeat probe). Ubuntu 26.04+ ships the Rust
+# uutils rewrite as /usr/bin/dd; its O_DIRECT buffer alignment fails on queues
+# reporting dma_alignment=511 (md/ms default) while working on raw NVMe, which
+# turns a correctness check into a false failure. Prefer a real GNU dd when the
+# distro provides one alongside (Ubuntu ships /usr/bin/gnudd).
+export DD="${DD:-$( [ -x /usr/bin/gnudd ] && echo /usr/bin/gnudd || echo dd )}"
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$RESULTS/campaign.log"; }
 verd() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS/verdict.tsv"; }
@@ -75,7 +81,7 @@ dmesg_delta() {
 }
 heartbeat() {
 	timeout 15 cat /proc/msstat > /dev/null 2>&1 || return 1
-	[ -n "${HB_DEV:-}" ] && ! timeout 15 dd if="$HB_DEV" of=/dev/null bs=4096 count=1 iflag=direct status=none 2>/dev/null && return 1
+	[ -n "${HB_DEV:-}" ] && ! timeout 15 "${DD:-dd}" if="$HB_DEV" of=/dev/null bs=4096 count=1 iflag=direct status=none 2>/dev/null && return 1
 	return 0
 }
 
@@ -117,6 +123,24 @@ p0() {
 		|| { verd $p pci_p2pdma_config FAIL "CONFIG_PCI_P2PDMA not =y — native P2P impossible"; return 1; }
 	command -v bpftrace >/dev/null && verd $p bpftrace PASS "$(bpftrace -V 2>&1)" \
 		|| { verd $p bpftrace FAIL "bpftrace missing"; return 1; }
+
+	# dd flavour: Ubuntu 26.04+ ships the Rust uutils rewrite, whose O_DIRECT
+	# buffer alignment fails on devices reporting dma_alignment=511 (md's
+	# default) while working on raw NVMe (alignment 3).  A native-vs-compat
+	# check that shells out to `dd iflag=direct` then reports a FALSE failure
+	# against /dev/msN.  Detect it and prove O_DIRECT on a real md/ms queue
+	# rather than trusting the tool.
+	dd_impl=$("$DD" --version 2>&1 | head -1)
+	case "$dd_impl" in
+	*uutils*)	verd $p dd_flavour WARN "using $DD: $dd_impl — Rust dd mishandles O_DIRECT on dma_alignment=511 queues (no GNU /usr/bin/gnudd found); direct-I/O checks may false-fail" ;;
+	*coreutils*)	verd $p dd_flavour PASS "using $DD: $dd_impl (GNU)" ;;
+	*)		verd $p dd_flavour INFO "using $DD: ${dd_impl:-unknown implementation}" ;;
+	esac
+	if command -v xfs_io >/dev/null 2>&1; then
+		verd $p direct_io_tool PASS "xfs_io present (authoritative O_DIRECT path)"
+	else
+		verd $p direct_io_tool WARN "xfs_io missing — O_DIRECT assertions would fall back to dd (see dd_flavour)"
+	fi
 	capture $p lspci lspci -tvnn
 	capture $p acs sh -c 'lspci -vvv 2>/dev/null | grep -B40 ACSCtl | grep -E "^[0-9a-f]|ACSCtl" || true'
 	capture $p nvme nvme list
@@ -400,11 +424,25 @@ p6() { run_test p6 divergence "$GDS_TESTS/test_divergence_inval.sh" || true; }
 
 # behavioral spoof verify: file presence alone misses a skipped udev reload
 # (which would surface later as a misleading kernel-shaped P7a FAIL).
+# Returns 0 = verified, 1 = spoof genuinely not in effect, 4 = cannot verify
+# (no safe substrate) -> caller must SKIP, not FAIL.
+#
+# Member selection MUST go through p2pdma_pick_members: a bare glob over
+# *-meshstor-test-* picks whatever carries the label, including a partition that
+# backs a live array or holds real data, and this function goes on to
+# mdadm --create over it and --zero-superblock it.  (A 200 GB backup once sat
+# behind the first such label on the dev box.)
 p7_spoof_verify() {
 	local m0 m1
-	m0=$(ls /dev/disk/by-partlabel/*-meshstor-test-* 2>/dev/null | sed -n 1p)
-	m1=$(ls /dev/disk/by-partlabel/*-meshstor-test-* 2>/dev/null | sed -n 2p)
-	[ -n "$m0" ] && [ -n "$m1" ] || { log "spoof verify: need 2 test partitions"; return 1; }
+	if ! eval "$(
+		. "$GDS_TESTS/lib.sh" 2>/dev/null
+		p2pdma_pick_members raid1 >/dev/null 2>&1 \
+			&& printf 'm0=%q m1=%q sub=%q\n' \
+				"$P2PDMA_M0" "$P2PDMA_M1" "$P2PDMA_SUBSTRATE"
+	)" || [ -z "${m0:-}" ] || [ -z "${m1:-}" ]; then
+		log "spoof verify: no safe test substrate (need 2 free -meshstor-test- partitions)"
+		return 4
+	fi
 	(
 		. "$GDS_TESTS/lib.sh"
 		gds_csi_mdadm_create /dev/ms0 1 "$m0" "$m1" >/dev/null 2>&1 || exit 1
@@ -433,12 +471,14 @@ p7() {
 			> /run/udev/rules.d/64-ms-raid0-spoof.rules
 		udevadm control --reload
 		SPOOF_OWNED=1   # campaign owns (and must remove) this spoof
-		if p7_spoof_verify; then
-			verd $p spoof PASS "behavioral: scratch ms array reports MD_LEVEL=raid0"
-		else
-			verd $p spoof FAIL "spoof installed but scratch array MD_LEVEL != raid0 (udev reload skipped?)"
-			return 1
-		fi
+		p7_spoof_verify; spoof_rc=$?
+		case $spoof_rc in
+		0)	verd $p spoof PASS "behavioral: scratch ms array reports MD_LEVEL=raid0" ;;
+		4)	verd $p spoof SKIP "no safe test substrate to verify the spoof (need 2 free -meshstor-test- partitions)"
+			return 0 ;;
+		*)	verd $p spoof FAIL "spoof installed but scratch array MD_LEVEL != raid0 (udev reload skipped?)"
+			return 1 ;;
+		esac
 	else
 		verd $p spoof INFO "gdsio absent — spoof not installed; GPU subtests will SKIP"
 	fi
