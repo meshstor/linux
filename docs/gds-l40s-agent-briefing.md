@@ -130,7 +130,9 @@ load-bearing ones (kernel ≥ 6.11, CONFIG_PCI_P2PDMA=y, BTF, bpftrace); the res
 | nvme-cli | 2.8 | present (flag caveat above) |
 | ms modules | `ms_mod`,`raid1_ms`,`raid10_ms` loaded; `dkms: meshstor-ms/0.1.0.gds1` | install from kit (below) |
 | `/proc/msstat` | `Personalities : [raid1] [raid10]` | same after modprobe |
+| Secure Boot | off | **check `mokutil --sb-state` FIRST** — with SB enabled, unsigned DKMS modules are rejected at modprobe (`Key was rejected by service`). Enroll the DKMS MOK + reboot (`bin/mok-enroll` in the git checkout — **not shipped in the kit**; on a kit-only box use `mokutil --import /var/lib/dkms/mok.pub` or `…/shim/mok/…` per Ubuntu DKMS docs), or disable SB, **before** anything else — this alone can eat the window |
 | GDS tools | **absent** on dev box | **`gdsio`+`gdscheck` REQUIRED on L40S** (CUDA 12.8+, NVIDIA **open** kernel module / OpenRM 570+) — checked, not installed, by the kit |
+| mdadm | patched build at `/home/mykola/mdadm/mdadm` (kit: `bin/mdadm-ms`) | **required for ms arrays** — the stock/system mdadm **rejects `/dev/msN`** (unknown device names/major). Use the system mdadm only for in-tree `/dev/mdN` cleanup |
 
 ### 3.1 The kit (how to get the software onto the L40S box)
 `build/gds-kit-0.1.0.tar.gz` (~1 MB) is self-contained: featured (`*.gds1`, member-AND) + baseline
@@ -209,6 +211,33 @@ phases (stops on a wedge, exit 3). Campaign exits non-zero iff any row is FAIL (
 | `test_divergence_inval.sh` | P6 | **Reproduces the bug**: injected INVAL is swallowed → write reports success, `[UU]` preserved, leg silently stale; IOERR control correctly faults the leg. PASS = bug present as expected. |
 | `test_unit_helpers.sh` | — | Rootless unit test + `bash -n` gate over every campaign file. Run after any edit. |
 
+Env knobs the tests honor: `MDADM=` (patched mdadm path), `GDSIO=`/`GDSCHECK=` (tool paths;
+default `/usr/local/cuda/gds/tools/…`), `GDS_RESULTS=` (evidence dir), `GDS_MNT=` (mountpoint,
+default `/mnt/gds-test`), `GDS_TRANSPORT=tcp|rdma`, `GDS_RAID10=1`,
+`GDS_PART_LIST="p1 p2 p3 p4"` (explicit members — **required, 4 entries, for the raid10 fabric
+case**), `GDS_KIT_DIR=` (enables P5's A/B swap), `GDS_INJ_DIR=` (injector source override).
+
+### 4.6 `bin/probe-cufile-recognition <mountpoint> [--md <ref-mnt>]` — the cuFile RAID-classification probe (L40S-only, run it!)
+**The kernel queue flag is necessary but NOT sufficient.** cuFile does its own **userspace device
+classification** via udev `MD_*` properties (and possibly by shelling out to mdadm). The
+`md→ms` rename (`/dev/msN`, `/sys/block/msN/ms/`, `/proc/msstat`) can break that classification
+even when the kernel side is perfect — cuFile then reports "cannot verify RAID members" and
+**silently falls back to compat/bounce mode**. This was the single biggest open question motivating
+the campaign, and it is only answerable with real GDS on the box.
+- Run it against a **mounted ms array** (P2's array is ideal): `sudo bin/probe-cufile-recognition /mnt/gds-test`.
+- It checks platform prereqs, the array/fs shape, the **udev DB `MD_LEVEL` property** for
+  `/dev/msN` (installing `dkms/udev/63-ms-raid-arrays.rules` if missing — the rule needs `MSADM=`
+  pointing at the patched mdadm), then drives a gdsio write under strace + TRACE-level cufile.log
+  and greps for the real-P2PDMA vs compat verdict.
+- **Exit 0** = real GDS confirmed; **1** = compat/no-GDS (classification failed — read section 5a
+  of its output: did cuFile exec the SYSTEM mdadm, which rejects `/dev/ms*`? did it probe
+  `/sys/block/msN/md/` instead of `.../ms/`?); **4** = SKIP.
+- If it fails on classification while the witness proves the kernel path works on a raw partition,
+  the fix space is: udev rule installed + triggered (`udevadm trigger --subsystem-match=block
+  --action=change /dev/msN; udevadm settle`), `MSADM` env, or — if cuFile hard-codes `md`-named
+  paths — record it as a **product finding** (escalate; may need a cuFile-side workaround or naming
+  shim, not a test tweak).
+
 ---
 
 ## 5. Phase plan and the EXPECTED RESULTS MATRIX
@@ -229,8 +258,25 @@ Run priority order; highest-value/lowest-risk first. P5/P6 last (they swap packa
 
 **Dev-box confirmed live (banked evidence):** P4a, P4b, P6 all PASS; P1/P2/P3-GDS SKIP (no gdsio);
 P3 advertise-consistency PASS at raid1 + raid10 (tcp: `local=1 remote=0`, array=0). P6 reproduced
-with `injected=64`. So on the L40S the **new** results are P1/P2/P3-native (GPU) and the P3-rdma
-Finding-E answer.
+with `injected=64`. So on the L40S the **new** results are P1/P2/P3-native (GPU), the P3-rdma
+Finding-E answer, and the cuFile-recognition verdict (§4.6).
+
+**Pacing for a few-hours window** (rough budgets): P0 ~10 min, P1 ~15, P2 ~20, P3 ~30, P4 ~30,
+P5 ~20, P6 remainder. Add `probe-cufile-recognition` right after P2 (~10 min) while its array is
+still mounted. Evidence flushes per-phase, so a truncated window still yields conclusions.
+
+**Risk ordering is deliberate:** P5 and P6 are last because they are the phases most likely to
+wedge or crash the node (false-advertise routing, fault injection) — by then all shipped-commit
+evidence is on disk. P5 also has an **optional manual step** (runbook §6): with the baseline
+package installed and a tcp-leg array mounted, drive a **strict** gdsio write under the witness and
+save dmesg — this is the single crash-riskiest action of the window; do it only after p0–p4
+evidence is safely on disk, and expect anything from BLK_STS_INVAL errors to works-but-slow (P2P
+pages have kernel vaddrs, so nvme-tcp's CPU copy may function with degraded performance). Whatever
+happens **is** the finding — record it verbatim. After any P5 activity, verify the box is back on
+the featured package: `dkms status` must show `*.gds1`, and a fresh tcp-leg array must NOT
+advertise (member-AND is featured-only). If the featured re-install fails, the campaign aborts
+loudly with exit 3 and the box is left on baseline — reinstall featured before trusting anything
+that runs afterwards.
 
 ---
 
@@ -310,7 +356,11 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 
 | Symptom | Likely cause | Action |
 |---|---|---|
+| `modprobe ms_mod` → `Key was rejected by service` | **Secure Boot** rejecting the unsigned DKMS module | `mokutil --sb-state`; enroll a MOK (`bin/mok-enroll`) + reboot, or disable SB in firmware. Do this before anything else. |
+| `mdadm: /dev/ms0` rejected / "unknown device" | using the **system** mdadm on an ms array | Use the patched mdadm (`MDADM=` / kit `bin/mdadm-ms`). System mdadm is only for in-tree `/dev/mdN` cleanup. |
 | P0 `pci_p2pdma_config FAIL` | kernel built without `CONFIG_PCI_P2PDMA=y` | **Stop** — native P2P is impossible on this kernel. Report; use a kernel with it =y. Not fixable in tooling. |
+| gdsio errors on flags / unexpected `-x`/`-V` behavior | the wrappers' gdsio flags (`-d 0 -w 4 -s 256M -i 1M -x {0,1} -I {0,1} -V`) were written from docs, **never run against a real gdsio** | `gdsio -h` FIRST; if mode numbering or verify semantics differ, fix ONLY the two wrappers `gds_gdsio_write`/`gds_gdsio_readverify` in `gds/lib.sh` (they isolate this exact risk), re-run unit gate + P1. |
+| cuFile log: `cannot verify RAID members` / compat despite witness proving raw-partition native | cuFile's **userspace** classification failed on the `ms` naming (§4.6) | Run `probe-cufile-recognition`; check udev `MD_LEVEL` on `/dev/msN` (`udevadm info --query=property`), rule installed + triggered, `MSADM=` set. If cuFile hard-codes `md` paths → product finding, escalate. |
 | `ms-queue-features` always rc=4 | bpftrace can't attach; no BTF; probe symbol missing | `bpftrace -l 'kprobe:submit_bio*'`; check `CONFIG_DEBUG_INFO_BTF=y`; check `/sys/kernel/tracing/available_filter_functions`. Fix probe name if the submit path differs on this kernel. |
 | P1 native `map_hits=0` (control also 0) | GDS not actually taking P2P path; cuFile in compat; ACS/IOMMU blocking; wrong GPU-NVMe path | `gdscheck -p`; `nvidia-smi topo -m` (look for PIX/PXB vs SYS between GPU and NVMe); check IOMMU/ACS in P0 `lspci` evidence; confirm cufile.json strict. If the box genuinely can't do native GDS, P1 is a legitimate FAIL — record it, fall back to advertise-only mode for P2–P4. |
 | P2 witness `p2p_bios=0` but cuFile says native | cuFile bounced silently; or witness attach failed | Check witness `-o` dump: if `host_bios>0` the probe fired and cuFile really bounced (real FAIL — investigate cuFile/topology). If witness rc=4, it's a SKIP not FAIL. |
@@ -378,6 +428,8 @@ bin/gds-campaign                                  orchestrator
 bin/ms-queue-features                             advertise-bit reader (bpftrace)
 bin/gds-p2p-witness                               native-path witness (bpftrace)
 bin/gds-make-kit                                  kit builder
+bin/probe-cufile-recognition                      cuFile RAID-classification probe (§4.6)
+bin/mok-enroll                                    MOK enrollment helper (git checkout only, not in kit)
 tools/testing/selftests/md/p2pdma/gds/            the 6 phase tests + lib.sh + unit test
 tools/testing/selftests/md/p2pdma/lib.sh          Layer-B helpers (sourced by gds/lib.sh)
 tools/testing/selftests/md/p2pdma/test_*.sh       Layer-B non-P2P regression suite (run under P4)
@@ -395,12 +447,13 @@ on branch `p2pdma` as `docs/…p2pdma-blk-sts-inval-and-self-heal-followup.md`.
 
 ## 12. First moves on the L40S box (suggested order)
 
-1. **Sanity:** `uname -r`; `grep CONFIG_PCI_P2PDMA /boot/config-$(uname -r)`; `command -v bpftrace gdsio gdscheck`; `nvidia-smi`; `modinfo -F license nvidia` (want `GPL`/OpenRM). If `CONFIG_PCI_P2PDMA` ≠ y or the NVIDIA module is proprietary, **stop and report** — native P2P won't work.
-2. **Install:** kit `sudo ./install.sh`, or use the checkout's already-loaded modules.
-3. **Partitions:** `sudo bin/perf-make-test-partitions /dev/nvmeXnY` (4K-LBA NVMe with trailing free space; make 4 if you want the raid10 fabric case). Confirm `/dev/disk/by-partlabel/*-meshstor-test-*`.
-4. **Kernel check for the witness (§7):** if not a 6.17-class kernel, verify the pgmap/enum offsets and recalibrate on P1 before trusting P2/P3.
-5. **Run in priority order**, reading `verdict.tsv` after each: P0 → P1 → P2 → P3(tcp then rdma) → P4a → P4b → then **P6 in its own invocation** (unload in-tree raid1 first) → P5 last (needs `--kit`, verify featured is restored after).
-6. **Collect evidence** (§10) **before** the window ends.
+1. **Sanity:** `mokutil --sb-state` (**Secure Boot must be off or MOK enrolled — see §3, do this first**); `uname -r`; `grep CONFIG_PCI_P2PDMA /boot/config-$(uname -r)`; `command -v bpftrace gdsio gdscheck`; `nvidia-smi`; `modinfo -F license nvidia` (want `GPL`/OpenRM); `cat /proc/cmdline` (note iommu settings for the evidence). If `CONFIG_PCI_P2PDMA` ≠ y or the NVIDIA module is proprietary, **stop and report** — native P2P won't work.
+2. **Install:** kit `sudo ./install.sh`, or use the checkout's already-loaded modules. Confirm `/proc/msstat` shows `[raid1] [raid10]`.
+3. **Verify gdsio's interface:** `gdsio -h` — cross-check the wrappers' flags (`-x` mode numbering, `-V` verify, `-I` read/write) before P1; fix only the two lib wrappers if they differ (§8 row). Pick the GPU index for `-d`: `nvidia-smi topo -m` — choose the GPU with the tightest path (PIX/PXB, not SYS) to the test NVMe.
+4. **Partitions:** `sudo bin/perf-make-test-partitions /dev/nvmeXnY` (4K-LBA NVMe with trailing free space; make 4 across two drives for the raid10 fabric case, passed via `GDS_PART_LIST`). Confirm `/dev/disk/by-partlabel/*-meshstor-test-*`.
+5. **Kernel check for the witness (§7):** if not a 6.17-class kernel, verify the pgmap/enum offsets and recalibrate on P1 before trusting P2/P3.
+6. **Run in priority order**, reading `verdict.tsv` after each: P0 → P1 → P2 (+ **`probe-cufile-recognition` on P2's mounted array**, §4.6) → P3(tcp then rdma) → P4a → P4b → then **P6 in its own invocation** (unload in-tree raid1 first) → P5 last (needs `--kit`; verify featured restored after; the manual strict-gdsio-on-baseline step only once everything else is on disk).
+7. **Collect evidence** (§10) **before** the window ends.
 
 Work from the git checkout or the kit; keep the operator informed of every FAIL with its `.out` +
 `.dmesg`. Fix tooling, escalate feature regressions, never fake a green.
