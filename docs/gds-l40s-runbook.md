@@ -425,6 +425,36 @@ masker 1 only. On rxe the expected result stays negative regardless
 (virt-DMA refusal — correct; verified live on the dev box 2026-07-03:
 head features=0x10093 vs member 0x11093, bit 12 masked).
 
+**2026-07-04 stage-1 increment rehearsal (dev box — no GPU / no gdsio,
+rxe-only, root-on-md0).** Pre-hardware-window evidence that the campaign
+changes themselves work; this box is NOT the L40S, so the full GPU-path
+(P7a–e) and array-advertise (P3–P5) evidence stays the hardware window's job.
+Rootless unit suite PASS; dkms tooling suite 11 PASS / 1 SKIP
+(`test_patches_apply_clean` = all 11 patches, `--fuzz=0`, no reject;
+`test_0008` P2PDMA pipeline green against a `meshstor-main` tree). Injector
+smoke PASS — module-qualified resolver (`raid1_ms:raid1_end_write_request`)
+fired with the in-tree `raid1` co-loaded, plain-INVAL swallowed `[UU]`,
+`p2p_only=1` filtered to injected=0, bare-symbol `match=success` refused at
+insmod. P6 narrowness PASS **live on the shipping gdsM module** ("non-P2P
+INVAL swallowed … no breadcrumb, injected=64"). Kit 0.2.0 rebuilt clean:
+gds0 / gds1@0fb37cf5 / gdsM@origin/meshstor-main + `kit-manifest.tsv` with
+gds1≠gdsM personality srcversions (raid1_ms 8CAE1CC…≠9FF565A…, the stage-1
+delta). Safe-scope rehearsal `--phases p0,p1,p2,p7` — exit 0, box left on
+gdsM (loaded raid1_ms srcversion == gdsM manifest row): p0 all PASS/INFO
+(`CONFIG_PCI_P2PDMA=y`, bpftrace, nvme-rdma override active, gdsM reinstalled
+over the stale per-bucket variant, `/usr/sbin/msadm` present, transport
+rxe = virt-DMA, `nvme_core.multipath=Y`); p1/p2 and every P7 subtest
+(p7a–h, p7e, p7f) SKIP `gdsio not found` — on a no-gdsio box that one gate
+fires **ahead** of the rxe / fewer-than-4-partitions / cross-RC gates, so
+those per-subtest reasons only surface on a gdsio-equipped box; p7 A/B
+restore PASS; final spoof/injector checks clean. Array-advertise phases
+p3/p4/p5 were logic-verified only (NOT run live): the box's auto-picker
+resolves member #2 to the stale partlabel `nvme1n1-meshstor-test-2`
+→ `/dev/nvme0n1p4`, a LIVE md0 member, and those phases zero-superblock
+their members — the smoke and P6 were instead funneled through a free-member
+guard (`nvme1n1p1` + `nvme2n1p1`, both off the md0 disk). md0 verified
+`[UU]` before and after every step.
+
 ## Post-cabling procedure — the gated P7g/P7h window (first actions when the RoCE ports go live)
 
 1. `sudo rdma link delete rxe0` — the stale soft-RoCE device P0
