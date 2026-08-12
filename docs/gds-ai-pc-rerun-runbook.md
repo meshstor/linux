@@ -5,6 +5,14 @@ GPU-independent check, and root-caused why the GPU-native arm cannot run on the
 current card. **Purpose: let a cold session, with a new GPU installed, re-run
 the complete check list without re-deriving anything.**
 
+**Revised 2026-08-06 (later same day)** after executing §8.0–8.3 a second time,
+still on the A2000. Both suites reproduced their baselines exactly
+(§5). That pass cost far more wall clock than this document implied, almost
+entirely in two avoidable traps — Rocky's GRUB stripping Ubuntu's boot args
+(§2.6) and the suite's output vanishing when redirected (§2.7) — plus vng
+flakiness far worse than §2.4 originally described. Those three sections and
+the §8 time budget are the substantive additions; read them first.
+
 Read this top to bottom before touching the machine. §1 (identity) and §2
 (hazards) are not optional — one of them was learned by destroying data.
 
@@ -18,15 +26,22 @@ X670E-CREATOR WIFI**, BIOS 3902. This is the box previously called
 ALSO the name of a different, Intel box in older notes. Identify this box by CPU
 (Ryzen 7700X), never by hostname.**
 
-Triple boot, GRUB default = Ubuntu:
+Triple boot. **The firmware boots Rocky's GRUB (`BootCurrent: 0000`), and
+Rocky's GRUB is the multiboot menu for all three OSes.** Ubuntu's own GRUB is
+reached only through the chainload entry. Rocky's menu was rebuilt 2026-08-06
+(§2.6) — before that it dropped Ubuntu's boot args, which silently invalidates
+§8.4–8.6.
 
 | OS | Where | Kernel | Role |
 |---|---|---|---|
-| **Ubuntu 26.04 LTS** (default) | `sda2` | `7.0.0-29-generic` | the validation platform |
+| **Ubuntu 26.04 LTS** (Rocky-GRUB default) | `sda2` | `7.0.0-29-generic` | the validation platform |
 | Rocky 10.1 | `sda3`, self-contained `/boot` | `6.12.0-124.8.1.el10_1` | el10 fence work (el10_2 kernels installable via dnf) |
 | Windows | Kingston NVMe | — | **NEVER TOUCH** (see §2.1) |
 
-Boot args already set on Ubuntu: `nvme_core.multipath=N iommu=pt`.
+Boot args required on Ubuntu: `nvme_core.multipath=N iommu=pt`. **Verify them
+in `/proc/cmdline`, never by reading a config file** — they are present in
+Ubuntu's `/etc/default/grub` *and* in Rocky's menu entry, and were still absent
+from the running kernel (§2.6).
 
 ### Disks — resolve by identity, never by `/dev/nvmeXnY`
 
@@ -35,8 +50,12 @@ Boot args already set on Ubuntu: `nvme_core.multipath=N iommu=pt`.
 | **WD_BLACK SN7100 1TB** | `WD_BLACK SN7100 1TB` | 931.5G | **test drive** — all test partitions |
 | **Kingston KC3000** | `KINGSTON SKC3000S1024G` | 953.9G | **WINDOWS** — off limits |
 
-At the time of writing WD = `nvme1n1`, Kingston = `nvme0n1`, **but these flipped
-across a reboot during this session and that flip caused a data-loss incident.**
+The mapping has now flipped **twice**: it was WD=`nvme1n1`/Kingston=`nvme0n1`
+when this runbook was written, and on the 2026-08-06 re-run it came up the
+other way round — WD=`nvme0n1`, Kingston(Windows)=`nvme1n1`. The first flip
+caused a data-loss incident. Treat the names as random on every boot; note the
+partlabels still read `nvme1n1-meshstor-test-*` from when they were created, so
+**the label text does not track the device either** — only the symlink does.
 Confirm before every destructive step:
 
 ```bash
@@ -55,8 +74,15 @@ Test partitions on the WD drive (use the **partlabels**, not device names):
 
 Fabric: ConnectX-4 Lx dual port, **the two ports are cabled to each other**.
 `enp3s0f0np0` = 10.99.0.1/30 (target), `enp3s0f1np1` = 10.99.0.2/30 (initiator);
-both also carry 192.168.100.x. Management network is `eno2` (192.168.200.30) —
-leave it alone.
+both also carry 192.168.100.x. The **10.99 addresses are not persistent** —
+`bin/gds-rig-up` adds them on each run, so they are absent until §8.4; only the
+192.168.100.x ones survive a reboot. Both mlx5 ports come up ACTIVE/LinkUp at
+25 Gb/s.
+
+Management network is **`eno1` = 192.168.200.31** (corrected 2026-08-06; this
+doc previously said `eno2`/192.168.200.30, and there is no `eno2` on the box) —
+leave it alone. **A session working on this machine is normally SSH'd into it,
+so `sudo reboot` kills that session**; plan §2.6 reboots accordingly.
 
 ---
 
@@ -108,18 +134,136 @@ kernel path is correct — the tool is not. Commit `07a06fa5` makes the campaign
 and Layer-B lib prefer `/usr/bin/gnudd` via `$DD`. **Use `gnudd`, `xfs_io`, or
 fio for any direct-I/O check; a bare `dd iflag=direct` produces a false failure.**
 
-### 2.4 vng/QEMU launch flakiness
+### 2.4 vng/QEMU launch flakiness — the dominant source of false FAILs
 
-`vng` intermittently fails to launch (rc=255, empty vout.log) on back-to-back
-boots — roughly half of attempts. `run_vm.sh` retries 5×, but the suite's 300 s
-per-test timeout can kill it mid-retry, producing a **false FAIL**. Re-run a
-failing test solo with `P2P_TEST_TIMEOUT=600` before believing it.
+`vng` intermittently fails to launch (rc=255, empty vout.log). `run_vm.sh`
+retries 5×, but the suite's 300 s per-test timeout kills it mid-retry,
+producing a **false FAIL**.
+
+**Measured on the 2026-08-06 re-run, and much worse than "roughly half":**
+**33 retry events in a single suite pass, and 5 of 19 tests failed — every one
+of them a vng artifact, zero real defects.** Two distinct shapes, don't confuse
+them:
+
+- `rc=255` — all 5 boots failed, guest verdict never arrived, **the test never
+  ran**. No information either way.
+- `rc=124` — timeout. Either retries ate the budget, or the VM booted and then
+  never powered off.
+
+Neither is evidence of a defect. The host is not the problem — 56 GB free,
+load ~1, no KVM errors in dmesg; it is a vng/virtme-ng launch bug.
+
+**Therefore: run the suite at `P2P_TEST_TIMEOUT=600` from the start** (§8.2),
+and re-run every failure solo before believing it. On the re-run all five
+failures passed, including one that needed two solo attempts. A test that
+still fails solo with a *test-authored* message (`FAIL: <assertion>`) is worth
+investigating; a bare `rc=124`/`rc=255` is not.
 
 ### 2.5 Tear down everything you start
 
 Every VM/nvmet/array/loop device must be gone at session end (`no-orphaned-processes`
 rule). `pgrep -f <pattern>` self-matches its own shell — verify with
-`ps -eo pid,comm | awk '$2 ~ /^qemu/'` instead.
+`ps -eo pid,comm | awk '$2 ~ /^qemu/'` instead. (Confirmed the hard way on
+2026-08-06: `pgrep -f 'bash .*run_all.sh'` matched the very shell running the
+`pgrep`, and reading `/proc/<pid>/fd/1` of that self-match printed the
+command's own output back — a convincing-looking but entirely circular result.)
+
+To stop a running suite, **SIGTERM, never SIGKILL** — SIGTERM lets
+vng/virtme-run reap qemu; SIGKILL orphans it (`run_all.sh`'s header explains
+why). Verify with the `ps -eo pid,comm` form above; three clean stops during
+the 2026-08-06 re-run left zero orphans.
+
+### 2.6 Rocky's GRUB silently strips Ubuntu's boot args (invalidates §8.4–8.6)
+
+**Fixed 2026-08-06, but verify it survived — this one produces wrong results
+rather than an error.** The firmware boots Rocky (`BootCurrent: 0000`), and
+Rocky's `30_os-prober` had generated the Ubuntu entry from a *stale snapshot*
+of Ubuntu's `grub.cfg`, carrying only `ro crashkernel=…` — **no
+`nvme_core.multipath=N`, no `iommu=pt`** — while Ubuntu's own `/etc/default/grub`
+and `grub.cfg` both looked correct. The box therefore booted with
+`multipath=Y` (the nvme-rdma leg then cannot advertise `BLK_FEAT_PCI_P2PDMA`,
+so member-AND gating turns the array's advertise off) and `iommu=DMA-FQ`
+instead of passthrough (changes the THRU_HOST_BRIDGE mapping path — the same
+axis as the el10 `dma_address=0` bug). The os-prober menu had also gone stale
+in a second way: it still offered a `7.0.0-14` kernel that no longer exists.
+
+The fix, in Rocky:
+
+- `GRUB_DISABLE_OS_PROBER=true` in `/etc/default/grub` (stale entries gone),
+  plus `GRUB_TIMEOUT_STYLE=menu` and `grub2-editenv - unset menu_auto_hide`
+  (the menu was being suppressed entirely).
+- Three explicit entries in `/etc/grub.d/40_custom`:
+  `ubuntu-meshstor` (kernel-pinned, args spelled out), `ubuntu-chainload`
+  (`configfile` into Ubuntu's own grub.cfg — never goes stale), and `windows`
+  (`chainloader` to `/EFI/Microsoft/Boot/bootmgfw.efi` on the **Kingston** ESP,
+  FAT UUID `D8F1-4B9B`; os-prober never found Windows because its bootloader
+  is on a second ESP, not the shared `sda1` one). Secure Boot is off, so a
+  direct chainload is valid.
+- `grub2-set-default ubuntu-meshstor` (so a headless `sudo reboot` lands in
+  Ubuntu with the right args) and `set fallback=ubuntu-chainload` (so a future
+  Ubuntu kernel update cannot strand an SSH-only box on a pinned entry that no
+  longer resolves).
+
+Gotchas paid for: `sed -i` and `grub2-mkconfig` both replace the inode and
+**drop the SELinux label** (Rocky is enforcing) — re-set `bootloader_etc_t` on
+`/etc/default/grub` and `boot_t` on `grub.cfg`. And never leave a backup copy
+of a `grub.d` script *inside* `/etc/grub.d/`: it stays executable and
+`grub2-mkconfig` runs it, emitting a duplicate menu section. Originals are in
+Rocky's `/root/grub-backup-20260806/`.
+
+### 2.7 The suite's output must go through a pipe, or you lose all of it
+
+Redirecting the p2pdma suite to a file — the obvious
+`run_all.sh > suite.log 2>&1` — yields an **empty file**, even as the run
+proceeds normally. The test's stdout is inherited down through `run_vm.sh` →
+`vng` → `virtme-run`, which treats a regular-file stdout as the VM console and
+truncates/seeks it. The tell is that the writer's fd offset advances
+(`/proc/<pid>/fdinfo/1` shows `pos: 415`) while the file itself stays 0 bytes,
+and the path's inode number changes underneath it.
+
+Cost when not known: ~25 minutes and three restarted suite runs on 2026-08-06,
+including two wrong theories (a `TMPDIR` collision, then a sandbox overlay).
+**Give the VM a pipe, never a regular file** — see the §8.2 recipe.
+
+### 2.8 `--add` of a reconnected fabric leg: observed once, NOT reproducible
+
+**Do not treat this as a known bug.** On 2026-08-06 a first attempt to recover
+the rdma leg (`nvme disconnect` → `nvme connect` → `mdadm --add`) produced
+`mdadm: Failed to write metadata to /dev/nvme3n2`, and a later `--add` **hung**
+(killed at 90 s and at 300 s) with no kernel message, no D-state task, and the
+controller `live`. It was written up here as an open defect. **A deliberate
+attempt to reproduce it, the same day on the same box, failed four times.**
+
+Reproduction matrix — every cell SUCCEEDED, `mdadm` returning 0 with
+`ADD_NEW_DISK` completing in 5–23 ms:
+
+| # | Superblock on returning device | Array mounted | Dead member still in array | Result |
+|---|---|---|---|---|
+| 1 | intact | no | removed first | `re-added`, ok |
+| 2 | zeroed (forces a *fresh* add) | no | removed first | `added`, ok |
+| 3 | intact | **yes** (XFS, active) | removed first | `re-added`, ok |
+| 4 | intact | **yes** | **still present (F)** | `added`, ok |
+
+`strace` on the successful runs shows the superblock write completing normally
+(`write(…, 4096) = 4096`, `fsync = 0`, then `ADD_NEW_DISK = 0`), which is
+exactly the step that had reported failure.
+
+What the original episode therefore proves is only that a **transient** state
+can make `--add` fail and then block; its cause was not found. Two things
+plausibly contributed and are worth ruling out first if it recurs: the failing
+attempts ran ~3 s after `nvme connect`, while udev may still have been holding
+the fresh device, and the diagnostic `gnudd` zero-writes issued at offsets 0 and
+4096 during triage destroyed the superblock mid-sequence, so later attempts were
+not operating on the state the earlier ones saw.
+
+**If you hit it: capture `strace -f -T` of the hanging `mdadm`, plus
+`cat /proc/<pid>/stack`, `/proc/mdstat`, and `fuser -v <device>`, before killing
+anything** — that evidence is what this episode lacks. `bin/gds-rig-up` rebuilds
+a healthy `[UU]` array, so it never blocks progress.
+
+Note the returning namespace does get a **new name** (`nvme2n1` → `nvme3n2` or
+`nvme4n1`, nsid still 1); that part is real and expected, and it means recovery
+is `--remove detached` followed by `--add`, not `--re-add` on the old path.
 
 ---
 
@@ -187,8 +331,9 @@ patched mdadm: /home/mykola/mdadm/mdadm  (also /usr/sbin/msadm)
 path — cuFile p2pdma mode bypasses nvidia-fs entirely, so this does not block
 native validation.
 
-Repo: branch `gds-campaign`, HEAD `07a06fa5`, **15 commits ahead of origin,
-unpushed** (all pushes are Mykola's). Feature branch worktree:
+Repo: branch `gds-campaign`, HEAD `a3be4e12` (2026-08-06: origin has caught up,
+1 commit ahead — re-check with `git rev-list --count origin/gds-campaign..gds-campaign`
+rather than trusting this line; all pushes are Mykola's). Feature branch worktree:
 `.worktrees/p2pdma` at `04e102cf`. Design spec:
 `docs/superpowers/specs/2026-08-05-gds-native-mixed-leg-uek8-design.md` (rev 5 —
 note its UEK8 track is ON HOLD; the Ubuntu pivot in §"Rev 5" is what happened).
@@ -199,12 +344,15 @@ note its UEK8 track is ON HOLD; the Ubuntu pivot in §"Rev 5" is what happened).
 
 | Area | Result |
 |---|---|
-| QEMU p2pdma suite (22 tests, first ever run) | **18 pass / 0 real failures / 1 skip** — both apparent failures root-caused: one vng flake, one md-auto-assembly harness gap ("all cells matched v6 semantics") |
-| dkms tooling suite | **12 pass / 0 fail / 1 skip** (git-filter-repo absent); u2604 nvme compiles clean vs 7.0.0-29; all 12 patches apply at fuzz=0 |
-| Bare-metal advertise chain | both legs + `/dev/ms0` advertise `BLK_FEAT_PCI_P2PDMA`; member-AND gating proven |
-| Data integrity | 64 MB pattern through `/dev/ms0`, mirrored to both legs, readback exact |
+| QEMU p2pdma suite (19 test files, first ever run) | **18 pass / 0 real failures / 1 skip** — both apparent failures root-caused: one vng flake, one md-auto-assembly harness gap ("all cells matched v6 semantics") |
+| QEMU p2pdma suite — **re-confirmed 2026-08-06** | **18 pass / 0 fail / 1 skip**, identical. Raw run was 13/5/1; *all five* failures passed on solo re-run (§2.4). The skip is always `route_fence_el10` (el10-only). Notable evidence: `badblocks_exhaustion` faulted at write #513 of 520, limit 512 — exactly `MAX_BADBLOCKS + 1` |
+| dkms tooling suite | **12 pass / 0 fail / 1 skip** (git-filter-repo absent); u2604 nvme compiles clean vs 7.0.0-29; all 12 patches apply at fuzz=0 — **re-confirmed identical 2026-08-06** |
+| Bare-metal advertise chain | both legs + `/dev/ms0` advertise `BLK_FEAT_PCI_P2PDMA`; member-AND gating proven — **re-confirmed 2026-08-06** (`array advertise=yes policy=auto`, both members `advertise=yes`). Note this is exactly what `multipath=Y` makes unreachable (§2.6), so it doubles as the boot-arg check |
+| Data integrity | 64 MB pattern through `/dev/ms0`, mirrored to both legs, readback exact — **re-confirmed 2026-08-06**: identical md5 on the array, the local partition, and the nvmet backing store. Read the legs at `Data Offset` from `mdadm --examine` (34816 sectors here) with `gnudd iflag=direct,skip_bytes` |
 | Degraded mode | leg drop → `redirecting sector to other mirror` → `Operation continuing on 1 devices`; **v==2 latch fires** (`I/O error while the array advertises P2P (status=10)` — correctly NOT `no P2P path`); re-add → advertise re-evaluation clears it |
+| Degraded mode — 2026-08-06 | `[2/1] [U_]`, `Operation continuing on 1 devices`, degraded write ok, data intact. **Re-add re-confirmed** across 4 fail/recover cycles: `--remove detached` + `--add` → resync → `[UU]`, **advertise re-evaluation correct** (new member and array both `advertise=yes`), files intact throughout. Only gap: **the v==2 latch did NOT fire, correctly** — the writes were ordinary O_DIRECT (never P2P-tagged) and the leg dropped while idle, so the failure surfaced as `ms: super_written gets error=-5`. The latch needs a P2P-tagged bio to error while the array advertises, i.e. GPU-native I/O in flight, so **it is unvalidatable on the A2000** |
 | gds-campaign (4 partitions) | **21 PASS / 15 FAIL / 9 SKIP** — 14 FAILs are GPU-gated (`p2p_bios=0 … cmd_rc=255`), 1 is an environment artifact (§6) |
+| gds-campaign — **re-run 2026-08-06** | **23 PASS / 15 FAIL / 9 SKIP.** FAIL and SKIP sets **identical to baseline, member for member** (the 14 GPU-gated + `p4 merge_control`). PASS gained 2; the prior run's `verdict.tsv` no longer exists so the delta is **unattributed** — the plausible candidates are the fabric-dependent `rdma_gate`/`advertise_consistency` checks, which could not have behaved correctly under the `multipath=Y` boot (§2.6), but this is inference, not evidence. **Keep a copy of `verdict.tsv` this time** so the next run can diff |
 | GPUDirect RDMA (dma-buf) | **2759 MiB/s** GPU↔NIC via `ib_write_bw --use_cuda --use_cuda_dmabuf`, **zero PCIe AER errors** — platform P2P routing proven healthy |
 | CX-4 Lx dmabuf-MR | **WORKS** (`ibv_reg_dmabuf_mr` OK) — previously unanswered publicly; probe source: `tools/testing/selftests/md/p2pdma-vm/gds/dmabuf_probe.c` |
 
@@ -252,11 +400,33 @@ gitignored, so copy them somewhere durable if you still want them.
 Run in this order. Everything before §8.4 is a regression check of what already
 passed; §8.4–8.6 is the new coverage the GPU unlocks.
 
-### 8.0 Pre-flight (5 min)
+**Budget, measured on the 2026-08-06 re-run** (the original per-step estimates
+were optimistic — §8.2 alone is the bulk of it):
+
+| Step | Estimate | Notes |
+|---|---|---|
+| 8.0 pre-flight | 10 min | includes the stop-the-line boot-arg check |
+| 8.1 rebuild | 0–25 min | **skip entirely if `uname -r` is unchanged** — verify srcversion instead, it took seconds |
+| 8.2 QEMU suite | **60–90 min** | + 20–40 min of solo re-runs for vng false FAILs (§2.4) |
+| 8.3 dkms tooling | 5 min | reliable |
+| 8.4–8.6 | 60–90 min | GPU-dependent; unmeasured on a qualifying card |
+
+Two traps that between them cost ~40 min on 2026-08-06 and are now avoidable
+by reading §2.6 (boot args) and §2.7 (suite logging) **before** starting.
+Read those two first; they are the difference between a half-day and a
+morning.
+
+### 8.0 Pre-flight (10 min)
 
 ```bash
 cd /home/mykola/linux-meshstor
-uname -r; cat /proc/cmdline | tr ' ' '\n' | grep -E 'multipath|iommu'   # 7.0.0-29, N + pt
+uname -r                                                                 # 7.0.0-29-generic
+# STOP-THE-LINE CHECK -- must print BOTH. If it does not, you booted the wrong
+# GRUB entry and §8.4-8.6 will produce quietly wrong results (§2.6). Fix by
+# rebooting into `ubuntu-meshstor`; do not proceed and do not "work around" it.
+cat /proc/cmdline | tr ' ' '\n' | grep -E 'multipath|iommu'              # nvme_core.multipath=N + iommu=pt
+cat /sys/module/nvme_core/parameters/multipath                           # N
+cat /sys/kernel/iommu_groups/*/type | sort | uniq -c                     # identity (not DMA-FQ)
 grep CONFIG_PCI_P2PDMA /boot/config-$(uname -r)                          # =y
 for d in /dev/nvme[0-9]n1; do echo "$d $(sudo nvme id-ctrl $d | grep -m1 '^mn ' | cut -c1-45)"; done   # §1
 ls /etc/udev/rules.d/10-mdadm-no-udev-assemble.rules                     # §2.2
@@ -289,6 +459,30 @@ CUFILE_ENV_PATH_JSON=$SP/cufile-native.json /usr/local/cuda-13.3/gds/tools/gdsch
 grep -iE 'p2pdma|801' $SP/cufile_*.log      # must NOT say "gpu attribute pci_p2pdma not supported"
 ```
 
+**The A2000's exact failure signature (re-confirmed 2026-08-06)** — if the new
+card reproduces this, it does not clear the §3 BAR1 gate either:
+
+```
+cufio-cuda:745  Failed to get cuda p2p device address for ptr ... errornum: 801
+cufio-drv:107   gpu attribute pci_p2pdma not supported errornum: 801  CUDA_ERROR_NOT_SUPPORTED
+cufio-drv:156   Not all GPUs support PCIP2PDMA
+cufio-drv:1274  Reset all P2P flags to 0
+cufio-drv:1155  nvidia-fs.ko driver not loaded
+```
+
+Read that order carefully: cuFile rejects p2pdma **first**, then falls back to
+nvidia-fs and fails because it isn't built. `gdscheck -p` therefore prints only
+*"nvidia-fs driver is not loaded"* on the console, which is a **downstream
+symptom, not the cause** — do not go build nvidia-fs (§4) thinking it will
+unblock the native path. The `801` line in the DEBUG log is the real verdict,
+so `logging.level=DEBUG` is mandatory here.
+
+A qualifying card should show no `801` at all. Cross-check against the
+hardware gate in the same breath: `nvidia-smi -q -d MEMORY | grep -A3 BAR1`
+must report BAR1 Total **greater** than VRAM (the A2000 reports 8192 MiB BAR1
+against 12282 MiB VRAM, and its ReBAR `supported:` list tops out at 8GB —
+structurally impossible, §3).
+
 ### 8.1 Rebuild ms + nvme-rdma for the running kernel (if kernel changed)
 
 ```bash
@@ -302,18 +496,59 @@ sudo dkms install meshstor-nvme-rdma/0.2.0 && sudo modprobe nvme-rdma
 modinfo -F srcversion /lib/modules/$(uname -r)/updates/dkms/ms_mod.ko.zst; cat /sys/module/ms_mod/srcversion
 ```
 
-### 8.2 QEMU p2pdma suite — real p2pdma pages, GPU-independent (~30 min)
+### 8.2 QEMU p2pdma suite — real p2pdma pages, GPU-independent (60–90 min)
 
 ```bash
-SP=<scratchpad>; mkdir -p $SP/msmods
+SP=<scratchpad>; mkdir -p $SP/msmods $SP/logs $SP/vmtmp
 for m in ms_mod raid1_ms raid10_ms; do sudo zstd -dqf /var/lib/dkms/meshstor-ms/0.1.0/$(uname -r)/x86_64/module/$m.ko.zst -o $SP/msmods/$m.ko; done
 make -C .worktrees/p2pdma/tools/testing/selftests/md/p2pdma/modules   # injector for THIS kernel
-sudo env MD_SUBSYS=ms MS_MOD_DIR=$SP/msmods MDADM=/home/mykola/mdadm/mdadm TMPDIR=$SP \
-     bash .worktrees/p2pdma/tools/testing/selftests/md/p2pdma/run_all.sh
 ```
-Baseline: 18 pass / 1 skip. Re-run any FAIL solo with `P2P_TEST_TIMEOUT=600`
-before believing it (§2.4). Note the suite's log is polluted with VM serial
-padding — `tr -d '\000'` it.
+
+**Do not run `run_all.sh` with its stdout redirected to a file — you will get an
+empty file and no results (§2.7).** Drive the same loop with a wrapper that
+pipes each test and appends per-test verdicts, and use a 600 s timeout from the
+start (§2.4). Write this to `$SP/run_suite.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -u
+cd "${SUITE_DIR:?}" || exit 2
+LOG=${LOG:?}; : > "$LOG.rc"
+pass=0 fail=0 skip=0
+for t in ${TESTS:-test_*.sh}; do
+	[ -e "$t" ] || continue
+	printf '=== %s ===\n' "$t" >> "$LOG"
+	# PIPE, never a regular file: a regular-file stdout is inherited into
+	# vng/virtme-run, which truncates it as the VM console (§2.7).
+	timeout --kill-after=30 "${P2P_TEST_TIMEOUT:-600}" bash "$t" 2>&1 | tee -a "$LOG" >/dev/null
+	rc=${PIPESTATUS[0]}
+	printf '%s\trc=%s\n' "$t" "$rc" >> "$LOG.rc"
+	case $rc in 0) pass=$((pass+1));; 4) skip=$((skip+1));; *) fail=$((fail+1));; esac
+done
+printf -- '--- p2pdma selftests: pass=%s fail=%s skip=%s ---\n' "$pass" "$fail" "$skip" >> "$LOG"
+```
+
+```bash
+sudo env MD_SUBSYS=ms MS_MOD_DIR=$SP/msmods MDADM=/home/mykola/mdadm/mdadm TMPDIR=$SP/vmtmp \
+     SUITE_DIR=$PWD/.worktrees/p2pdma/tools/testing/selftests/md/p2pdma LOG=$SP/logs/suite.log \
+     bash $SP/run_suite.sh
+# live progress, from another shell:
+cat $SP/logs/suite.log.rc ; tr -d '\000' < $SP/logs/suite.log | tail
+```
+
+Baseline: **18 pass / 0 fail / 1 skip** (the skip is `route_fence_el10`).
+Budget ~60–90 min at 600 s, not the 30 min originally written here — vng
+retries dominate. Keep `LOG` **outside** `TMPDIR`, and `tr -d '\000'` the log
+(VM serial padding).
+
+Then re-run every failure solo before believing any of it (§2.4) — same
+wrapper, adding `TESTS="test_a.sh test_b.sh"`. On 2026-08-06 that took two
+passes: four cleared on the first solo re-run, and `stop_clean_after_p2p_error`
+needed a third, fully standalone attempt (it then printed
+`PASS: array stopped clean after p2p-error write`). Its own
+`timeout 15 mdadm --stop` bounds the thing it actually asserts, so a genuine
+`writes_pending` leak fails fast with a message — a bare 600 s hang is the
+harness, not the array.
 
 ### 8.3 dkms tooling suite (~5 min)
 
@@ -404,6 +639,18 @@ ps -eo pid,comm | awk '$2 ~ /^(qemu|vng|fio|gdsio)/'      # must be empty
   `/dev/md*` before re-creating (the udev rule handles it on this box, but the
   suite is not portable without it).
 - **`merge_control`** should SKIP when a raw control shows no merges (§6).
+- **`run_all.sh` should pipe each test's stdout rather than pass its own
+  through.** As written, any redirection of the suite to a file loses
+  everything (§2.7), because the inherited regular-file stdout is treated as
+  the VM console by virtme-run. The one-line fix is
+  `bash "$t" 2>&1 | tee -a "$LOG" >/dev/null` with `rc=${PIPESTATUS[0]}`; the
+  §8.2 wrapper does this externally so the suite source stays untouched on the
+  `p2pdma` feature branch. Its default `P2P_TEST_TIMEOUT` should also be 600,
+  not 300 (§2.4).
+- **`run_all.sh` prints no progress and no per-test verdict file.** A 60–90 min
+  run is opaque, and a killed run yields nothing at all. The §8.2 wrapper's
+  `$LOG.rc` (one `name<TAB>rc=N` line per test, appended and closed each time)
+  is what makes a long run observable and a partial run salvageable.
 
 ---
 
@@ -429,8 +676,9 @@ ps -eo pid,comm | awk '$2 ~ /^(qemu|vng|fio|gdsio)/'      # must be empty
 
 ## 11. Ground rules (carried forward)
 
-- **All pushes/sends are Mykola's, manually.** Branch `gds-campaign` is 15
-  commits ahead of origin; stage commands, never run them.
+- **All pushes/sends are Mykola's, manually.** Stage commands, never run them
+  (check the actual divergence with `git rev-list --count
+  origin/gds-campaign..gds-campaign`; the count in §4 goes stale).
 - This runbook is tracked (`docs/gds-ai-pc-rerun-runbook.md`); the
   `docs/superpowers/` archive is gitignored and now only holds a pointer to it.
 - Tear down every VM/array/target you start (§2.5).
