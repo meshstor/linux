@@ -116,6 +116,16 @@ advertises `BLK_FEAT_PCI_P2PDMA` (it has no `supports_pci_p2pdma` ctrl op). Only
   **ANSWERED (L40S 2026-07-02, rxe substrate only — the box's mlx5 ports were uncabled):
   an nvme-rdma loopback leg does NOT advertise on 6.17** (`local=1 remote=0`), member-AND held,
   raid1+raid10 PASS. The hardware-RoCE variant remains open for a box with cabled RDMA ports.
+  **2026-07-03 update: root-caused twice over.** The rdma `remote=0` had TWO independent
+  maskers: (1) stock 6.17 lacks `23528aa3320a` (the `supports_pci_p2pdma` wiring, first in
+  v7.1-rc2) — fixed by the **meshstor-nvme-rdma override** the kit now ships and `install.sh`
+  installs; (2) the nvme **multipath head split** — nvmet advertises CMIC, so on a
+  `nvme_core.multipath=Y` boot (default) the probed node is the head gendisk and
+  `BLK_FEAT_PCI_P2PDMA` never propagates to it (not in `BLK_FEAT_INHERIT_MASK`; needs a
+  `nvme_core.multipath=N` boot — see the runbook's post-cabling procedure). rxe stays
+  non-advertising by design regardless: `ib_uses_virt_dma()` ⇒
+  `ib_dma_pci_p2p_dma_supported()` = false. The P4c gate + its expectations table encode all
+  of this (§4.5, §5, §8).
 
 ---
 
@@ -140,12 +150,15 @@ load-bearing ones (kernel ≥ 6.11, CONFIG_PCI_P2PDMA=y, BTF, bpftrace); the res
 
 ### 3.1 The kit (how to get the software onto the L40S box)
 `build/gds-kit-0.1.0.tar.gz` (~1 MB) is self-contained: featured (`*.gds1`, member-AND) + baseline
-(`*.gds0`, upstream unconditional-advertise) DKMS tarballs, the `bin/` tools, the `gds/`
-selftests, the `inval-inject/` module source, the udev rule, `install.sh`, and the runbook. On the
+(`*.gds0`, upstream unconditional-advertise) DKMS tarballs, the nvme-rdma override
+(`tarballs/meshstor-nvme-rdma-<ver>.dkms.tar.gz`), the `bin/` tools, the `gds/`
+selftests, the `inval-inject/` module source, the udev rule, `install.sh`, and the runbook.
+`install.sh` also best-effort-installs the nvme-rdma P2PDMA override — look for the OK/WARNING
+line (WARNING = campaign runs on the STOCK driver; P0 records which). On the
 box:
 ```
 tar xzf gds-kit-0.1.0.tar.gz && cd gds-kit-0.1.0
-sudo ./install.sh                      # dkms installs the FEATURED variant + modprobe + udev rule
+sudo ./install.sh                      # featured ms variant + nvme-rdma override + modprobe + udev rule
 sudo bin/perf-make-test-partitions /dev/nvmeXnY   # two (or 4) 25GiB GPT test partitions
 sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign --results /root/gds-results
 ```
@@ -178,6 +191,13 @@ cuFile's kernel-native path needs GPU BAR1 registered as kernel p2pdma memory
    (With the regkeys missing the same probe fails with error **801 NOT_SUPPORTED** instead —
    the errornum distinguishes the two gates.)
 3. **cuFile userspace gates** — see §4.6a; the kernel being ready is necessary, not sufficient.
+
+Everything above is the GPU-side chain; fabric-leg P2P advertisement is a second, independent
+AND'd chain: a **real HCA** (rxe/siw are virt-DMA and refuse by design) + the
+**meshstor-nvme-rdma override** on < 7.1 kernels (stock lacks the `supports_pci_p2pdma` wiring)
++ a **`nvme_core.multipath=N` boot** (the head split otherwise hides the feature from the
+consumed node). This leg-side chain gates only the rdma leg's block-layer advertisement — see
+§8's ladder and the runbook's post-cabling procedure.
 
 Topology note: the L40S box has no PIX/PXB GPU↔NVMe pairing (every GPU behind its own root
 port, NVMes on one host bridge) — host-bridge (NODE) P2P **works** on Sapphire Rapids with
@@ -242,6 +262,7 @@ phases (stops on a wedge, exit 3). Campaign exits non-zero iff any row is FAIL (
 | `test_gds_raid1_fabric.sh` | P3 | CSI topology: local + loopback NVMe-oF leg (tcp default, `GDS_TRANSPORT=rdma`, `GDS_RAID10=1` for 4-member raid10). Records the Finding-E rdma answer; asserts array advertise == AND(members); witnessed GDS when advertising, clean compat when not. |
 | `test_gate_tcp_leg_no_advertise.sh` | P4a | Member-AND: a tcp (non-P2P) leg makes the array NOT advertise. |
 | `test_gate_hotadd_clears.sh` | P4b | `clear_on_add`: hot-adding a non-P2P (loop) member to an advertising array clears the advertisement; removal alone preserves it (raid1 + raid10). |
+| `test_gate_rdma_leg_advertise.sh` | P4c | driver×substrate×head-aware rdma-leg advertise gate; the PASS string is the evidence (head-masked / stock-no-op / virt-refusal-correct / override+hw positive incl. member-AND both-advertise). GPU-independent. |
 | `test_divergence_inval.sh` | P6 | **Reproduces the bug**: injected INVAL is swallowed → write reports success, `[UU]` preserved, leg silently stale; IOERR control correctly faults the leg. PASS = bug present as expected. |
 | `test_unit_helpers.sh` | — | Rootless unit test + `bash -n` gate over every campaign file. Run after any edit. |
 
@@ -320,6 +341,7 @@ Run priority order; highest-value/lowest-risk first. P5/P6 last (they swap packa
 | **P3 rdma** | `sudo GDS_TRANSPORT=rdma bash …/test_gds_raid1_fabric.sh` | INFO records whether rdma leg advertises (**new data**); if array advertises + gdsio: witnessed native PASS + leg integrity | SKIP if no RDMA NIC / no gdsio |
 | **P4a** | `sudo bash …/test_gate_tcp_leg_no_advertise.sh` | PASS: local adv, tcp ns not, array not | PASS (GPU-independent) |
 | **P4b** | `sudo bash …/test_gate_hotadd_clears.sh` | PASS: advertise → persist on remove → cleared on non-P2P add (raid1+raid10) | PASS (GPU-independent) |
+| **P4c** | `sudo bash …/test_gate_rdma_leg_advertise.sh` | multipath=Y boot (today): PASS "multipath head masks leg advertise; driver=override substrate=…"; post-cabling + multipath=N: PASS "override+hw: leg=adv array=adv (member-AND positive)". Any FAIL = real defect | same — GPU-independent; SKIP only if no RDMA-capable address |
 | **P5** | `bin/gds-campaign --phases p5 --kit <dir>` | baseline swap: tcp-leg array **falsely** advertises (baseline has no member-AND) = expected finding; restore featured PASS | needs `--kit`; else SKIP |
 | **P6** | `sudo bash …/test_divergence_inval.sh` | PASS: `BLK_STS_INVAL swallowed … injected=N` (N≥1), `[UU]` preserved, leg stale | PASS (loop substrate ok, GPU-independent) |
 
@@ -450,6 +472,7 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 |---|---|---|
 | `modprobe ms_mod` → `Key was rejected by service` | **Secure Boot** rejecting the unsigned DKMS module | `mokutil --sb-state`; enroll a MOK (`bin/mok-enroll`) + reboot, or disable SB in firmware. Do this before anything else. |
 | `mdadm: /dev/ms0` rejected / "unknown device" | using the **system** mdadm on an ms array | Use the patched mdadm (`MDADM=` / kit `bin/mdadm-ms`). System mdadm is only for in-tree `/dev/mdN` cleanup. |
+| rdma leg doesn't advertise (P4c FAIL or unexpected refusal) | in order: multipath head split (expected on multipath=Y — not a driver problem); override not loaded; rxe/siw substrate (expected refusal); BUILD_EXCLUSIVE refused the build; IOMMU/ACS blocks `dma_pci_p2pdma_supported` | walk the ladder: `readlink /sys/class/block/nvmeXnY` contains `nvme-subsystem` ⇒ boot `nvme_core.multipath=N`; `/sys/module/nvme_rdma/srcversion` == `modinfo -F srcversion` + path under `.../updates/` ⇒ else reload; substrate rxe/siw ⇒ correct refusal (post-cabling: `rdma link delete rxe0` first); `dkms status` + install.sh WARNING; only then suspect IOMMU/ACS. NB built-in nvme-rdma shows `(builtin)` from modinfo (P0: built-in (not overridable)), not "absent" |
 | P0 `pci_p2pdma_config FAIL` | kernel built without `CONFIG_PCI_P2PDMA=y` | **Stop** — native P2P is impossible on this kernel. Report; use a kernel with it =y. Not fixable in tooling. |
 | gdsio errors on flags / unexpected `-x`/`-V` behavior | the wrappers' gdsio flags (`-d 0 -w 4 -s 256M -i 1M -x {0,1} -I {0,1} -V`) were written from docs, **never run against a real gdsio** | `gdsio -h` FIRST; if mode numbering or verify semantics differ, fix ONLY the two wrappers `gds_gdsio_write`/`gds_gdsio_readverify` in `gds/lib.sh` (they isolate this exact risk), re-run unit gate + P1. |
 | cuFile refuses the file on an ms array (`Unsupported block device` / `RAID level not supported` / `RAID member not supported`) despite witness proving raw-partition native | one of cuFile's **three userspace gates** (§4.6a): missing `MD_*` props (msadm/rule), the **raid0-only level policy**, or a non-PCIe member transport | Walk the §4.6a ladder in order: `udevadm info --query=property /dev/msN | grep MD_` (empty → install `/usr/sbin/msadm` + trigger); `RAID level not supported` → expected on raid1/raid10, use the test-only level-spoof for kernel-path evidence + escalate as product finding; `unknown NVMe transport` → cuFile's own member AND, working as designed. |
@@ -540,11 +563,11 @@ on branch `p2pdma` as `docs/…p2pdma-blk-sts-inval-and-self-heal-followup.md`.
 ## 12. First moves on the L40S box (suggested order)
 
 1. **Sanity:** `mokutil --sb-state` (**Secure Boot must be off or MOK enrolled — see §3, do this first**); `uname -r`; `grep CONFIG_PCI_P2PDMA /boot/config-$(uname -r)`; `command -v bpftrace gdsio gdscheck`; `nvidia-smi`; `modinfo -F license nvidia` (want `GPL`/OpenRM); `cat /proc/driver/nvidia/version` (**≥ 595 on a ≥ 6.15 kernel — else apply §3.2 before anything GDS-native**); apply the §3.2 regkeys + verify `p2pmem/` per GPU; `cat /proc/cmdline` (note iommu settings for the evidence). If `CONFIG_PCI_P2PDMA` ≠ y or the NVIDIA module is proprietary, **stop and report** — native P2P won't work.
-2. **Install:** kit `sudo ./install.sh`, then `sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm` (§3.1 kit gap — required for cuFile classification), or use the checkout's already-loaded modules. Confirm `/proc/msstat` shows `[raid1] [raid10]`. For the GDS-native phases install the §4.6a test-only level-spoof (cuFile 1.15 is raid0-only) and remove it after.
+2. **Install:** kit `sudo ./install.sh` (featured ms variant + nvme-rdma override + modprobe + udev rule — note the override's OK/WARNING line), then `sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm` (§3.1 kit gap — required for cuFile classification), or use the checkout's already-loaded modules. Confirm `/proc/msstat` shows `[raid1] [raid10]`. For the GDS-native phases install the §4.6a test-only level-spoof (cuFile 1.15 is raid0-only) and remove it after.
 3. **Verify gdsio's interface:** `gdsio -h` — cross-check the wrappers' flags (`-x` mode numbering, `-V` verify, `-I` read/write) before P1; fix only the two lib wrappers if they differ (§8 row). Pick the GPU index for `-d`: `nvidia-smi topo -m` — choose the GPU with the tightest path (PIX/PXB, not SYS) to the test NVMe.
 4. **Partitions:** `sudo bin/perf-make-test-partitions /dev/nvmeXnY` (4K-LBA NVMe with trailing free space; make 4 across two drives for the raid10 fabric case, passed via `GDS_PART_LIST`). Confirm `/dev/disk/by-partlabel/*-meshstor-test-*`.
 5. **Kernel check for the witness (§7):** if not a 6.17-class kernel, verify the pgmap/enum offsets and recalibrate on P1 before trusting P2/P3.
-6. **Run in priority order**, reading `verdict.tsv` after each: P0 → P1 → P2 (+ **`probe-cufile-recognition` on P2's mounted array**, §4.6) → P3(tcp then rdma) → P4a → P4b → then **P6 in its own invocation** (unload in-tree raid1 first) → P5 last (needs `--kit`; verify featured restored after; the manual strict-gdsio-on-baseline step only once everything else is on disk).
+6. **Run in priority order**, reading `verdict.tsv` after each: P0 → P1 → P2 (+ **`probe-cufile-recognition` on P2's mounted array**, §4.6) → P3(tcp then rdma) → P4a → P4b → P4c → then **P6 in its own invocation** (unload in-tree raid1 first) → P5 last (needs `--kit`; verify featured restored after; the manual strict-gdsio-on-baseline step only once everything else is on disk).
 7. **Collect evidence** (§10) **before** the window ends.
 
 Work from the git checkout or the kit; keep the operator informed of every FAIL with its `.out` +

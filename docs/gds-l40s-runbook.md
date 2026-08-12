@@ -62,7 +62,7 @@ driver version gate above is not met; P1 will fail with map_hits=0.
 
 ```bash
 tar xzf /opt/gds-kit-0.1.0.tar.gz -C /opt && cd /opt/gds-kit-0.1.0
-sudo ./install.sh                             # dkms featured variant + modprobe + udev rule
+sudo ./install.sh                             # featured ms variant + nvme-rdma override + modprobe + udev rule
 sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm   # REQUIRED: the udev rule's IMPORT{program}
                                               # runs /usr/sbin/msadm; install.sh does not install
                                               # it (known gap) and without it /dev/msN gets NO
@@ -71,6 +71,19 @@ grep Personalities /proc/msstat               # want: [raid1] [raid10]
 sudo bin/perf-make-test-partitions /dev/nvmeXnY    # 4K-LBA NVMe with trailing free space
 ls /dev/disk/by-partlabel/*-meshstor-test-*   # want: >=2 labels (4, across two drives, for raid10 fabric)
 ```
+
+`install.sh` now also installs the **meshstor-nvme-rdma override**
+(nvme-rdma + the 23528aa P2PDMA backport, overriding via /updates).
+Look for one of: `OK: nvme-rdma P2PDMA override active (loaded)` (good),
+`OK: nvme-rdma override installed (not loaded yet; ...)` (good — loads on
+first fabric connect), or a `WARNING:` (different-build-still-loaded /
+build-refused / tarball-unpack-failed — campaign still runs, on the STOCK
+driver; P0 records which). Manual check:
+`modinfo -F filename nvme_rdma` (expect a path under `.../updates/`) and
+`cat /sys/module/nvme_rdma/srcversion` vs `modinfo -F srcversion nvme_rdma`
+(equal = the override is the one actually running). Re-shipping changed
+override source under the same version is NOT supported — bump the
+package version.
 
 ## Step 2: verify gdsio's interface (the wrappers were written from docs, never run on a GPU box)
 
@@ -247,11 +260,27 @@ scp /root/gds-evidence.tgz <you>@<devbox>:/tmp/    # plus /var/log/kern.log if a
 p1 = box does native GDS (witness-calibrated); p2 = **headline** — GDS-native on
 ms raid1, kernel-witnessed, both legs identical; p3 = CSI fabric topology +
 whether an nvme-rdma leg advertises P2P (new empirical data); p4 = member-AND +
-hot-add-clear + Layer-B non-P2P regressions; p5 = upstream-baseline falsely
+hot-add-clear + rdma-leg advertise gate (P4c) + Layer-B non-P2P regressions;
+p5 = upstream-baseline falsely
 advertises with a tcp leg (justifies the fork's member-AND); p6 = BLK_STS_INVAL
 silent divergence reproduced (evidence for the fail-the-write follow-up);
 step 4's probe = cuFile actually classifies `/dev/msN` as RAID and takes the
 real P2P path (the kernel flag alone is necessary, not sufficient).
+
+P4c expectations (do not "fix" a PASS-refusal):
+
+| nvme-rdma driver | substrate | expected |
+|---|---|---|
+| any, multipath=Y boot | any | PASS "multipath head masks leg advertise" — the head split hides the feature from the probed node; not a driver problem |
+| stock (<7.1) | any | PASS "does not advertise" — install the override for hw runs |
+| override | rxe/siw | PASS "refusal is correct" — `ib_uses_virt_dma` ⇒ no P2P, by design |
+| override | real HCA, multipath=N | leg advertises AND the raid1 array advertises (member-AND positive) — the post-cabling headline |
+
+NB the two rxe notes measure different axes: P3's `rxe substrate:
+UNREPRESENTATIVE` is about the GPU-witness (rxe can't prove the native
+P2P data path); P4c's `refusal is correct` is about block-layer
+advertise correctness. An rxe run is meaningless for the former and a
+valid PASS for the latter.
 
 ## L40S 2026-07-02 outcome snapshot (gpu-cluster-manassas, 6.17.0-35, nvidia 595.71.05)
 
@@ -265,3 +294,30 @@ Standing product escalations: (1) cuFile 1.15 is raid0-only — CSI raid1/raid10
 volumes cannot do cuFile-native GDS without an NVIDIA-side change or a
 level-presentation shim; (2) kit install.sh must install `/usr/sbin/msadm`.
 Full chain of custody: `FINDINGS.md` inside the evidence tarball.
+
+**2026-07-03 addendum — Finding E rdma half root-caused, twice over.**
+The nvme-rdma leg's `remote=0` had TWO independent maskers: (1) stock
+6.17 lacks `23528aa3320a` ("nvme: enable PCI P2PDMA support for RDMA
+transport", first in v7.1-rc2) — fixed by the meshstor-nvme-rdma
+override the kit now installs; (2) the native-multipath head split —
+nvmet advertises CMIC, so on a `nvme_core.multipath=Y` boot (default)
+the probed/consumed `/dev/nvmeXnY` is the head gendisk, and
+`BLK_FEAT_PCI_P2PDMA` is set only on the hidden path disk and is not in
+`BLK_FEAT_INHERIT_MASK` (unchanged through v7.1). The override removes
+masker 1 only. On rxe the expected result stays negative regardless
+(virt-DMA refusal — correct; verified live on the dev box 2026-07-03:
+head features=0x10093 vs member 0x11093, bit 12 masked).
+
+## Post-cabling procedure (first actions when the RoCE ports go live)
+
+1. `sudo rdma link delete rxe0` — the stale soft-RoCE device P0
+   auto-created would otherwise skew substrate classification and
+   address selection toward virt-DMA.
+2. Boot with `nvme_core.multipath=N` (kernel cmdline, or
+   `options nvme_core multipath=N` in modprobe.d + initramfs regen +
+   reboot) — removes masker 2; NB device naming changes (no head node).
+3. Re-run `sudo ./install.sh` if the kit was refreshed (version bump
+   required if override source changed).
+4. Run the p4 rdma gate (or the full campaign): this is where the
+   override×hw positive rows — leg advertises, raid1 array advertises
+   (member-AND both-advertise) — first become reachable.
