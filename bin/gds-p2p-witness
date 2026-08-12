@@ -18,9 +18,21 @@ set -u
 EXPECT_MS=any EXPECT_MAP=any OUTFILE=""
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--expect-ms)  EXPECT_MS=$2; shift 2;;
-		--expect-map) EXPECT_MAP=$2; shift 2;;
-		-o)           OUTFILE=$2; shift 2;;
+		--expect-ms)
+			case "${2:-}" in
+				zero|nonzero|any) EXPECT_MS=$2;;
+				*) echo "gds-p2p-witness: --expect-ms needs zero|nonzero|any" >&2; exit 2;;
+			esac
+			shift 2;;
+		--expect-map)
+			case "${2:-}" in
+				zero|nonzero|any) EXPECT_MAP=$2;;
+				*) echo "gds-p2p-witness: --expect-map needs zero|nonzero|any" >&2; exit 2;;
+			esac
+			shift 2;;
+		-o)
+			[ -n "${2:-}" ] || { echo "gds-p2p-witness: -o needs a path" >&2; exit 2; }
+			OUTFILE=$2; shift 2;;
 		--)           shift; break;;
 		*) echo "usage: gds-p2p-witness [--expect-ms MODE] [--expect-map MODE] [-o FILE] -- CMD..." >&2; exit 2;;
 	esac
