@@ -94,6 +94,28 @@ cat /sys/bus/pci/devices/0000:XX:00.0/p2pmem/size   # want: BAR1 size (e.g. 6871
 No `p2pmem/` dir after a CUDA context touches the GPU → the regkeys or the
 driver version gate above is not met; P1 will fail with map_hits=0.
 
+**Sourcing 595+ open when the repos lag (2026-07-07, shadecloud).** apt / the CUDA
+repos for ubuntu2404 topped out at `nvidia-open-580`; 595 came from the **`.run`**
+open installer:
+
+```bash
+# apt driver userspace first (toolkit + libcufile are separate pkgs and survive):
+sudo apt-get -y remove cuda-drivers 'cuda-drivers-*' 'nvidia-*-570' 'libnvidia-*-570'
+curl -fSLO https://us.download.nvidia.com/XFree86/Linux-x86_64/595.71.05/NVIDIA-Linux-x86_64-595.71.05.run
+sudo sh NVIDIA-Linux-x86_64-595.71.05.run --silent --kernel-module-type=open --dkms --no-cc-version-check
+modinfo -F license nvidia   # want: Dual MIT/GPL (open)
+```
+
+**DKMS `.config` gotcha (mainline/zabbly headers).** If the headers package ships no
+`/lib/modules/$(uname -r)/build/.config`, both the meshstor and nvidia DKMS builds die
+`cp: cannot stat '.config'` — fix once before install.sh:
+`sudo cp /boot/config-$(uname -r) /lib/modules/$(uname -r)/build/.config`.
+
+On **≥7.1** the nvme-rdma override's `BUILD_EXCLUSIVE` refusal from install.sh is
+**expected and harmless** — stock nvme-rdma already carries the P2PDMA wiring
+(`23528aa`), so the campaign runs on the stock module with rdma-leg P2P intact. Do
+not chase that WARNING.
+
 ## Step 1: install + partitions
 
 ```bash
@@ -516,6 +538,26 @@ cross-RC P2P is *refused*; a witnessed success is a SKIP, not a FAIL. This also
 independently re-confirms host-bridge P2P across root complexes on this box.
 (NB the root arrays are left degraded — restore redundancy after the window by
 reclaiming nvme0n1 from the test partitions.)
+
+## shadecloud 2026-07-07 — second L40S box, newer stack, provisioned green
+
+Provisioning bank (environment readiness, **not** a full results run): `shadecloud`,
+**AMD EPYC 9354 (Zen 4)**, kernel **`7.1.3-zabbly+`**, 8× L40S, **NVIDIA open
+595.71.05**, **cuFile 1.18.1.6 / GDS 1.18** (upgraded from the toolkit's 1.13),
+meshstor **gdsM** 3-variant kit built + installed. Every hard gate green:
+`CONFIG_PCI_P2PDMA=y`, BTF, Secure Boot off, bpftrace attaches `submit_bio` +
+`__pci_p2pdma_update_state`, patched mdadm, 4 test partitions (all on `nvme1n1`),
+no root-on-md. **p2pmem `= 64 GiB` on all 8 GPUs** (BAR1 registered — the gate the
+580-driver Manassas box failed). meshstor **and** nvidia-open both compile on 7.1.3;
+`/proc/msstat = [raid1] [raid10]`; P0 all PASS incl. `ms_module_identity` (loaded
+`raid1_ms` srcversion == gdsM manifest row). **Zen 4 passes the platform P2P gate
+unconditionally** — no `iommu=pt`/host-bridge whitelist dependency (the robust CPU
+of §3.2). Two ≥7.1-specific banks: the witness needs no change (§7 briefing), and the
+P5/gds0 baseline false-advertise does **not** reproduce because 7.1 upstream self-ANDs
+P2PDMA in `blk_stack_limits` (§5/§6 briefing). Still gated on hardware: cross-RC P7f
+(single-disk test partitions — no root-complex-spanning pair) and cabled-RoCE P7g/h
+(`nvme_core.multipath=Y`, no cabled HCA). cuFile 1.18 makes the `p7c_userspace` SKIP
+the vendor-acknowledged Known-Issue path, not a version artifact.
 
 ## Post-cabling procedure — the gated P7g/P7h window (first actions when the RoCE ports go live)
 

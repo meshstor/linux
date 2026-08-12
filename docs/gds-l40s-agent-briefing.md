@@ -53,7 +53,11 @@ The four commits (in `drivers/md`, already built into the loaded modules):
    raid1 and raid10): the array sets `BLK_FEAT_PCI_P2PDMA` **only when every non-faulty member's
    queue advertises it**. Upstream advertises unconditionally and relies on a 7.1-era
    `blk_stack_limits` member-AND that is **absent from every meshstor target kernel** — so md must
-   do the AND itself. *Why it matters:* md is a pure router that never touches the pages; each
+   do the AND itself. **(≥7.1 caveat — verified in source 2026-07-07 on `7.1.3-zabbly+`: on a
+   7.1+ kernel that member-AND *is* present; `block/blk-settings.c` clears `BLK_FEAT_PCI_P2PDMA`
+   in `blk_stack_limits` whenever a stacked member lacks it, so upstream self-ANDs and the fork's
+   gate is redundant-but-harmless there. Consequence: on ≥7.1 the P5/gds0 baseline does NOT
+   falsely advertise with a tcp leg — see §5/§6.)** *Why it matters:* md is a pure router that never touches the pages; each
    member NVMe maps them, so a member that can't map GPU pages must never be handed P2P I/O.
 2. **Hot-add clear** — `raid1_p2pdma_clear_on_add()`: adding a **non-P2P** member to an
    advertising array clears the advertisement **before** the new member becomes write-eligible
@@ -153,7 +157,7 @@ load-bearing ones (kernel ≥ 6.11, CONFIG_PCI_P2PDMA=y, BTF, bpftrace); the res
 
 | Thing | Dev-box value | L40S must-have |
 |---|---|---|
-| Kernel | `6.17.0-35-generic` | **≥ 6.11** (for `BLK_FEAT_PCI_P2PDMA`); the shipped p2pdma feature is compiled in only then |
+| Kernel | `6.17.0-35-generic` | **≥ 6.11** (for `BLK_FEAT_PCI_P2PDMA`); the shipped p2pdma feature is compiled in only then. **≥7.1 verified 2026-07-07 (`7.1.3-zabbly+`, §7) — witness unchanged, but P5/gds0 baseline shifts (§5/§6 item 9)** |
 | `CONFIG_PCI_P2PDMA` | `=y` | **`=y`** — else native P2P is impossible regardless of md (authoritative gate; P0 checks it) |
 | `CONFIG_DEBUG_INFO_BTF` | `=y` | **`=y`** — the bpftrace tools are BTF-only (no DWARF) |
 | bpftrace | v0.20.2 | present |
@@ -214,6 +218,16 @@ cuFile's kernel-native path needs GPU BAR1 registered as kernel p2pdma memory
    error 5001 under strict json. 595.71.05+ carries the fix (`set_page_count(page, 1)`).
    (With the regkeys missing the same probe fails with error **801 NOT_SUPPORTED** instead —
    the errornum distinguishes the two gates.)
+   **Sourcing the driver on a fresh box (2026-07-07):** apt and the CUDA local/network repos may
+   lag — ubuntu2404 maxed at `nvidia-open-580` when ≥595 was required — so 595 open came from the
+   **`.run`** (`us.download.nvidia.com/XFree86/Linux-x86_64/595.71.05/…`,
+   `sh …run --silent --kernel-module-type=open --dkms`). Purge any apt-installed nvidia *driver*
+   userspace first (`apt remove 'nvidia-*-<branch>' cuda-drivers`) — it **preserves** the CUDA
+   toolkit + `libcufile`, which are separate packages. Confirm the open module took:
+   `modinfo -F license nvidia` = `Dual MIT/GPL`, then the p2pmem gate. (DKMS build gotcha on
+   mainline/zabbly headers: if `/lib/modules/$(uname -r)/build/.config` is missing, both the
+   meshstor and nvidia DKMS builds die `cp: cannot stat '.config'` — `cp /boot/config-$(uname -r)`
+   into the build tree first.)
 3. **cuFile userspace gates** — see §4.6a; the kernel being ready is necessary, not sufficient.
 
 Everything above is the GPU-side chain; fabric-leg P2P advertisement is a second, independent
@@ -419,7 +433,7 @@ faults) — but all run in the **single default invocation** (`--phases` default
 | **P4a** | `sudo bash …/test_gate_tcp_leg_no_advertise.sh` | PASS: local adv, tcp ns not, array not | PASS (GPU-independent) |
 | **P4b** | `sudo bash …/test_gate_hotadd_clears.sh` | PASS: advertise → persist on remove → cleared on non-P2P add (raid1+raid10) | PASS (GPU-independent) |
 | **P4c** | `sudo bash …/test_gate_rdma_leg_advertise.sh` | multipath=Y boot (today): PASS "multipath head masks leg advertise; driver=override substrate=…"; post-cabling + multipath=N: PASS "override+hw: leg=adv array=adv (member-AND positive)". Any FAIL = real defect | same — GPU-independent; SKIP only if no RDMA-capable address |
-| **P5** | `bin/gds-campaign --phases p5 --kit <dir>` | baseline swap: tcp-leg array **falsely** advertises (baseline has no member-AND) = expected finding; restore featured PASS | needs `--kit`; else SKIP |
+| **P5** | `bin/gds-campaign --phases p5 --kit <dir>` | baseline swap: tcp-leg array **falsely** advertises (baseline has no member-AND) = expected finding; restore featured PASS. **On ≥7.1 kernels the false-advertise does NOT reproduce** — upstream's own `blk_stack_limits` member-AND clears it, so gds0 correctly non-advertises (expected, not a P5 regression; confirm with `ms-queue-features` per leg) | needs `--kit`; else SKIP |
 | **P6** | `sudo bash …/test_divergence_inval.sh` | PASS: `non-P2P INVAL swallowed (narrowness proof) -- rc=0, [UU], leg1 stale, no breadcrumb (injected=N)` | PASS (loop substrate ok, GPU-independent; runs even with in-tree raid1 loaded) |
 | **P7a/b** | `--phases p0,p7` (campaign manages the spoof) | PASS: `stage-1 INVAL arm on raid1 (injected=N, write failed loud, no fault, no badblocks, breadcrumb)` (b: TARGET) | SKIP rc=4 (gdsio absent) — INCOMPLETE on a GPU box |
 | **P7c** | (same invocation) | kernel rows PASS; userspace PASS `compat convergence` or SKIP `cuFile compat mode does not retry mid-IO errors` (escalate to product — NVIDIA Known Issue thru r1.18, §4.6a) | SKIP |
@@ -519,12 +533,31 @@ these — handle them operationally as described.**
    producible on the Manassas-class targets (root on in-tree md RAID1) — no guard to defeat,
    nothing to bank remotely. Expect `p6 divergence PASS narrowness: ...` there now.
 
+9. **(≥7.1 kernels) baseline gds0 does NOT falsely advertise with a tcp leg.** On a 7.1+ target
+   upstream's own `blk_stack_limits` performs the member-AND (`block/blk-settings.c` clears
+   `BLK_FEAT_PCI_P2PDMA` when any stacked member lacks it), so the P5 "baseline falsely
+   advertises" finding — and the very premise of the per-member gate (§1.2 item 1) — no longer
+   applies. gds0 correctly non-advertising there is **expected, not a regression**; the fork's
+   explicit gate is redundant-but-harmless. Confirm with `ms-queue-features` per leg rather than
+   assuming the documented false-advertise. (On <7.1 targets the member-AND line is absent and P5
+   reproduces as written — that is why the gate ships.)
+
 ---
 
 ## 7. PORTABILITY: what may silently misbehave if the L40S kernel ≠ 6.17-class
 
 The bpftrace tools read kernel structs by BTF. If the L40S box runs a **materially different
 kernel**, verify before trusting counts:
+
+**Banked positive result (2026-07-07, shadecloud, kernel `7.1.3-zabbly+`):** the 7.1.x
+portability check passed with **no tooling change** — `enum memory_type` still has
+`MEMORY_DEVICE_PCI_P2PDMA == 5`, `include/linux/memremap.h` still reaches pgmap via
+`folio->pgmap` (the witness's folio cast is correct), and `__pci_p2pdma_update_state` is a global
+traceable symbol (the witness selects the precise map probe, not the glob fallback). Both the
+meshstor DKMS modules and the NVIDIA **open 595.71.05** module compile clean against 7.1.3. Still
+calibrate on P1 (control=0, native>0) before trusting P2/P3 counts. **But note the one ≥7.1
+*behavioral* shift that is NOT a portability bug: upstream self-ANDs P2PDMA in `blk_stack_limits`,
+so P5/gds0 no longer falsely advertises (§1.2 item 1, §5, §6 item 9).**
 - **`gds-p2p-witness`** casts `bio->bi_io_vec->bv_page` **through `struct folio`** to reach
   `->pgmap` (6.17 moved `pgmap` out of `struct page` into the folio union) and uses
   `MEMORY_DEVICE_PCI_P2PDMA == 5`. On an **older** kernel where `struct page` still has a direct
