@@ -106,9 +106,12 @@ BPID=$!
 trap cleanup EXIT
 cleanup() { kill "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null; rm -rf "$WORK"; }
 # bpftrace's attach banner is "Attaching N probes..." (<=0.20) or "Attached N
-# probe(s)" (>=0.21) -- and it prints to stderr ($WORK/err), not stdout.
-for _ in $(seq 60); do grep -qE 'Attach(ing|ed)' "$WORK/err" 2>/dev/null && break; sleep 0.25; done
-if ! grep -qE 'Attach(ing|ed)' "$WORK/err" 2>/dev/null; then
+# probe(s)" (>=0.21). Which STREAM it lands on varies by build: some emit it on
+# stderr, but bpftrace 0.20.2 (the L40S box) prints it on stdout ($WORK/trc).
+# Grep BOTH so the wait works regardless of the banner's stream; the @map
+# parsing below keys on '^@...' lines, so a banner in trc never pollutes it.
+for _ in $(seq 60); do grep -qE 'Attach(ing|ed)' "$WORK/err" "$WORK/trc" 2>/dev/null && break; sleep 0.25; done
+if ! grep -qE 'Attach(ing|ed)' "$WORK/err" "$WORK/trc" 2>/dev/null; then
 	cat "$WORK/err" >&2; cleanup
 	echo "SKIP: bpftrace failed to attach" >&2; exit 4
 fi
