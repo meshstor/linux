@@ -94,6 +94,30 @@ p0() {
 	capture $p acs sh -c 'lspci -vvv 2>/dev/null | grep -B40 ACSCtl | grep -E "^[0-9a-f]|ACSCtl" || true'
 	capture $p nvme nvme list
 	capture $p rdma sh -c 'command -v ibv_devices && ibv_devices && ibv_devinfo || echo none'
+	capture $p nvme_rdma_override sh -c \
+		'modprobe nvme_rdma 2>/dev/null; modinfo -F filename nvme_rdma 2>/dev/null; modinfo -F srcversion nvme_rdma 2>/dev/null; cat /sys/module/nvme_rdma/srcversion 2>/dev/null'
+	local nr_file nr_disk nr_loaded
+	nr_file=$(modinfo -F filename nvme_rdma 2>/dev/null || true)
+	nr_disk=$(modinfo -F srcversion nvme_rdma 2>/dev/null || true)
+	nr_loaded=$(cat /sys/module/nvme_rdma/srcversion 2>/dev/null || true)
+	# "active" must mean LOADED: after dkms install, depmod already
+	# prefers /updates, so modinfo alone reports the override even
+	# while the stock module is resident. initstate = loadedness;
+	# srcversion equality = build identity. modinfo prints "(builtin)"
+	# for CONFIG_NVME_RDMA=y -- its own arm, not the empty string.
+	case "$nr_file" in
+	*/updates/*)
+		if [ ! -e /sys/module/nvme_rdma/initstate ]; then
+			verd $p nvme_rdma_override INFO "installed (module not loaded yet)"
+		elif [ "$nr_loaded" = "$nr_disk" ]; then
+			verd $p nvme_rdma_override INFO active
+		else
+			verd $p nvme_rdma_override INFO "installed but a different build is loaded (reload needed)"
+		fi;;
+	"")	verd $p nvme_rdma_override INFO absent;;
+	*builtin*) verd $p nvme_rdma_override INFO "built-in (not overridable)";;
+	*)	verd $p nvme_rdma_override INFO stock;;
+	esac
 	if [ "$REHEARSAL" = 0 ]; then
 		capture $p nvidia nvidia-smi
 		capture $p topo nvidia-smi topo -m
@@ -132,6 +156,7 @@ p0() {
 		fi
 	fi
 	verd $p transport INFO "$TRANSPORT"
+	[ "$TRANSPORT" = rxe ] && verd $p note INFO "rxe = virt-DMA: nvme-rdma override correctly refuses P2P advertise on this substrate"
 	# partitions
 	if [ -n "${GDS_MAKE_PARTITIONS:-}" ]; then
 		"$SELF_DIR/perf-make-test-partitions" "$GDS_MAKE_PARTITIONS" || true
@@ -179,6 +204,7 @@ p3() {
 }
 p4() {
 	run_test p4 tcp_no_advertise "$GDS_TESTS/test_gate_tcp_leg_no_advertise.sh" || true
+	run_test p4 rdma_gate "$GDS_TESTS/test_gate_rdma_leg_advertise.sh" || true
 	run_test p4 hotadd_clears "$GDS_TESTS/test_gate_hotadd_clears.sh" || true
 	local t
 	for t in "$LAYERB"/test_*.sh; do
