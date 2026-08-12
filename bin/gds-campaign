@@ -122,6 +122,8 @@ p0() {
 	if [ "$TRANSPORT" = auto ]; then
 		if [ -n "$(ls /sys/class/infiniband 2>/dev/null)" ] && ! ls /sys/class/infiniband | grep -q '^rxe'; then
 			TRANSPORT=rdma
+		elif ls /sys/class/infiniband 2>/dev/null | grep -q '^rxe'; then
+			TRANSPORT=rxe                       # reuse a pre-existing soft-RoCE device
 		elif command -v rdma >/dev/null && rdma link add rxe0 type rxe netdev \
 			"$(ip -o route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')" 2>/dev/null; then
 			TRANSPORT=rxe
@@ -180,6 +182,7 @@ p4() {
 	run_test p4 hotadd_clears "$GDS_TESTS/test_gate_hotadd_clears.sh" || true
 	local t
 	for t in "$LAYERB"/test_*.sh; do
+		[ -e "$t" ] || continue
 		run_test p4 "layerb_$(basename "$t" .sh)" "$t" || true
 	done
 	if [ "$REHEARSAL" = 0 ] && [ -x "$SELF_DIR/probe-cufile-recognition" ] && mountpoint -q /mnt/gds-probe 2>/dev/null; then
@@ -188,7 +191,13 @@ p4() {
 }
 p5() {
 	[ -n "$KIT" ] || { verd p5 baseline SKIP "no kit (baseline tarball unavailable)"; return 0; }
-	kit_install_variant baseline || { verd p5 baseline FAIL "baseline install failed"; return 1; }
+	if ! kit_install_variant baseline; then
+		verd p5 baseline FAIL "baseline install failed"
+		kit_install_variant featured \
+			&& verd p5 restore PASS "featured restored after baseline install failure" \
+			|| verd p5 restore FAIL "featured re-install ALSO failed -- node left without ms_mod"
+		return 1
+	fi
 	# baseline advertises unconditionally: a tcp-leg array MUST (falsely) advertise
 	local out; out="$RESULTS/p5/false_advertise.out"; mkdir -p "$RESULTS/p5"
 	dmesg_mark
