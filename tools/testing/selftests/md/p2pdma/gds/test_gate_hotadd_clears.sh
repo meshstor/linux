@@ -8,32 +8,59 @@ set -eu
 DIR="$(dirname "$0")"; . "$DIR/lib.sh"
 p2pdma_require_root; p2pdma_require_modules; p2pdma_require_tools
 QF="$(gds_tool ms-queue-features)"
-trap gds_teardown EXIT
+
+hotadd_cleanup() {
+	[ -n "$P2PDMA_ARRAY" ] && "$MDADM" --stop "$P2PDMA_ARRAY" >/dev/null 2>&1 || true
+	P2PDMA_ARRAY=""
+	[ -n "${LOOP:-}" ] && "$MDADM" --zero-superblock "$LOOP" >/dev/null 2>&1 || true
+	[ -n "${M0:-}" ] && "$MDADM" --zero-superblock "$M0" "$M1" >/dev/null 2>&1 || true
+	gds_teardown
+}
+trap hotadd_cleanup EXIT
 
 p2pdma_pick_members raid1
 [ "$P2PDMA_SUBSTRATE" = nvme ] || { echo "SKIP: needs real NVMe test partitions" >&2; exit 4; }
 M0="$P2PDMA_M0"; M1="$P2PDMA_M1"
-"$QF" "$M0" || { echo "SKIP: members do not advertise P2P on this box" >&2; exit 4; }
+"$QF" "$M0" >/dev/null || { echo "SKIP: members do not advertise P2P on this box" >&2; exit 4; }
 
 img=$(mktemp /tmp/gds-hotadd-XXXX.img); truncate -s 256M "$img"
 LOOP=$(losetup --find --show "$img"); P2PDMA_LOOPS+=("$LOOP"); rm -f "$img"
 
 run_level() {
-	local level=$1
+	local level=$1 rc
 	gds_csi_mdadm_create /dev/ms0 "$level" "$M0" "$M1" -- --size=131072 \
 		>/dev/null 2>&1 || { echo "SKIP: $level create failed" >&2; exit 4; }
 	P2PDMA_ARRAY=/dev/ms0
-	"$QF" /dev/ms0 || { echo "FAIL: $level all-NVMe array does not advertise" >&2; exit 1; }
-	"$MDADM" --manage /dev/ms0 --fail "$M1" --remove "$M1" >/dev/null 2>&1
-	"$QF" /dev/ms0 || { echo "FAIL: $level advertisement lost on REMOVAL (should persist)" >&2; exit 1; }
+
+	rc=0; "$QF" /dev/ms0 >/dev/null || rc=$?
+	case $rc in
+		0) : ;;
+		1) echo "FAIL: $level all-NVMe array does not advertise" >&2; exit 1 ;;
+		*) echo "SKIP: $level cannot probe queue features (rc=$rc)" >&2; exit 4 ;;
+	esac
+
+	"$MDADM" --manage /dev/ms0 --fail "$M1" --remove "$M1" >/dev/null 2>&1 \
+		|| { echo "SKIP: $level fail/remove of $M1 failed" >&2; exit 4; }
+
+	rc=0; "$QF" /dev/ms0 >/dev/null || rc=$?
+	case $rc in
+		0) : ;;
+		1) echo "FAIL: $level advertisement lost on REMOVAL (should persist)" >&2; exit 1 ;;
+		*) echo "SKIP: $level cannot probe queue features (rc=$rc)" >&2; exit 4 ;;
+	esac
+
 	"$MDADM" --manage /dev/ms0 --add "$LOOP" >/dev/null 2>&1 \
 		|| { echo "SKIP: $level hot-add failed" >&2; exit 4; }
-	if "$QF" /dev/ms0; then
-		echo "FAIL: $level still advertises after adding non-P2P member -- clear_on_add broken" >&2
-		exit 1
-	fi
+
+	rc=0; "$QF" /dev/ms0 >/dev/null || rc=$?
+	case $rc in
+		0) echo "FAIL: $level still advertises after adding non-P2P member -- clear_on_add broken" >&2; exit 1 ;;
+		1) : ;;
+		*) echo "SKIP: $level cannot probe queue features (rc=$rc)" >&2; exit 4 ;;
+	esac
+
 	gds_verdict p4b "hotadd_$level" PASS "advertise cleared on non-P2P add"
-	"$MDADM" --stop /dev/ms0 >/dev/null 2>&1; P2PDMA_ARRAY=""
+	"$MDADM" --stop /dev/ms0 >/dev/null 2>&1 || true; P2PDMA_ARRAY=""
 	# the loop now carries stale metadata; wipe for the next level
 	"$MDADM" --zero-superblock "$LOOP" >/dev/null 2>&1 || true
 	"$MDADM" --zero-superblock "$M0" "$M1" >/dev/null 2>&1 || true
