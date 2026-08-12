@@ -23,7 +23,8 @@ KN=$(lsblk -no PKNAME "$DEV" 2>/dev/null | head -1)
 # Bit position: parse the running kernel's headers; fallback 12 (6.11..6.17).
 KDIR=${KDIR:-/lib/modules/$(uname -r)/build}
 BIT=$(grep -h 'define BLK_FEAT_PCI_P2PDMA' "$KDIR/include/linux/blkdev.h" 2>/dev/null \
-	| grep -o 'BIT([0-9]*)' | grep -o '[0-9]*' | head -1 || true)
+	| grep -oE 'BIT\([0-9]+\)|1u? *<< *[0-9]+' | grep -oE '[0-9]+' | tail -1 || true)
+[ -n "$BIT" ] || echo "ms-queue-features: warn: could not parse BLK_FEAT_PCI_P2PDMA bit from $KDIR headers; assuming bit 12" >&2
 BIT=${BIT:-12}
 
 FF=/sys/kernel/tracing/available_filter_functions
