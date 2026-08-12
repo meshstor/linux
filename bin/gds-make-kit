@@ -51,7 +51,7 @@ VER=$(ls "$TMP" | sed -n 's/^meshstor-ms-//p' | head -1)
 rm -rf "/usr/src/meshstor-ms-$VER"; cp -r "$TMP/meshstor-ms-$VER" /usr/src/; rm -rf "$TMP"
 dkms add "meshstor-ms/$VER" || true
 dkms install "meshstor-ms/$VER"
-modprobe ms_mod raid1_ms raid10_ms
+modprobe ms_mod && modprobe raid1_ms && modprobe raid10_ms
 install -m0644 "$HERE/udev/63-ms-raid-arrays.rules" /usr/lib/udev/rules.d/
 udevadm control --reload
 grep -q 'Personalities' /proc/msstat && echo "OK: /proc/msstat live"
