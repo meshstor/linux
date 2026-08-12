@@ -6,7 +6,10 @@
 #   @p2p_bios : bios entering ms_submit_bio whose first bvec page is
 #               ZONE_DEVICE MEMORY_DEVICE_PCI_P2PDMA (impossible after a bounce)
 #   @host_bios: other bios entering ms_submit_bio
-#   @map_hits : calls into pci_p2pdma_* (member DMA-map path)
+#   @map_hits : calls into the P2P DMA-map path (__pci_p2pdma_update_state
+#               where traceable, else the pci_p2pdma_* glob; the glob also
+#               matches one-time setup calls like pci_p2pdma_add_resource,
+#               which the precise probe deliberately excludes)
 # A compat/CPU run must show p2p_bios=0 map_hits=0; a native GDS run > 0.
 # The pgmap union read can't false-negative and false-positives are excluded
 # by the mandatory zero-control runs (P1 calibration / rehearsal).
@@ -50,7 +53,17 @@ FF=/sys/kernel/tracing/available_filter_functions
 grep -q '^ms_submit_bio\b' "$FF" 2>/dev/null \
 	|| { echo "SKIP: ms_submit_bio not traceable (ms_mod loaded?)" >&2; exit 4; }
 HAVE_MAP=1
-grep -q '^pci_p2pdma_' "$FF" 2>/dev/null || HAVE_MAP=0
+# Prefer the per-request DMA-map slow path (6.17-class kernels): it fires for
+# every P2P-containing request and never for device registration.  The glob
+# fallback also counts setup calls (pci_p2pdma_add_resource fires once per GPU
+# when UVM lazily registers BAR1), which can pollute a zero-expectation window.
+if grep -q '^__pci_p2pdma_update_state\b' "$FF" 2>/dev/null; then
+	MAP_PROBE='kprobe:__pci_p2pdma_update_state'
+elif grep -q '^pci_p2pdma_' "$FF" 2>/dev/null; then
+	MAP_PROBE='kprobe:pci_p2pdma_*'
+else
+	HAVE_MAP=0
+fi
 
 WORK=$(mktemp -d)
 PROG="$WORK/witness.bt"
@@ -71,7 +84,7 @@ kprobe:ms_submit_bio {
 	}
 }
 BT
-[ "$HAVE_MAP" = 1 ] && echo 'kprobe:pci_p2pdma_* { @map_hits[func] = count(); }' >> "$PROG"
+[ "$HAVE_MAP" = 1 ] && echo "$MAP_PROBE { @map_hits[func] = count(); }" >> "$PROG"
 
 bpftrace "$PROG" > "$WORK/trc" 2> "$WORK/err" &
 BPID=$!
