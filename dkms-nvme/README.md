@@ -29,6 +29,65 @@ tarball root (not per-variant) because every variant's vendored `rdma.c`
 drop it, or every variant fails to build with `rdma.c: fatal error:
 compat.h: No such file or directory`.
 
+## DEPLOYMENT HAZARD: pair only with an `ms` build that has `0012`
+
+**Never install this package on a host whose `meshstor-ms` was built from a
+tree where `dkms/patches/0012-p2pdma-blk-sts-compat.patch` was skipped.** That
+combination loses writes silently, and neither package can detect it.
+
+Because this package emits the **native** status 18, and `0012` is what
+teaches `ms` to handle a status the host block layer does not know, an `ms`
+built without `0012` does the following on a kernel whose `blk_errors[]` has a
+zero-filled hole at index 18:
+
+1. `raid1_should_handle_error()` passes status 18 through — it is neither
+   `BLK_STS_INVAL` nor `BLK_STS_TARGET`, so nothing swallows it;
+2. the ordinary write-error path runs and reaches `narrow_write_error()`;
+3. `submit_bio_wait()` on the retry chunk returns
+   `blk_status_to_errno(18)` = **0**;
+4. the chunk is recorded as *written*, **no badblock is set**, and
+5. the master write is acked to the application.
+
+Data the application believes reached that member is not there, and md has no
+record that anything went wrong. **Before this package was patched, that leg
+returned a real errno and md's ordinary path fenced it correctly — so
+patching `nvme-rdma` is what introduced this hazard** for any `ms` build
+lacking `0012`.
+
+The trap is that `0012` skipping is quiet: `bin/build-tarball` prints an
+ordinary `Skipping 0012-p2pdma-blk-sts-compat.patch (guard not satisfied: ...)`
+line, indistinguishable from the intended skip on a bare-upstream `master`
+baseline. So deploy the two packages **together, from the same build**, and
+before installing this one, confirm the `ms` tarball's build log says
+*Applying* `0012-p2pdma-blk-sts-compat.patch`, not *Skipping*. A host carrying
+only one of the two packages is safe: unpatched `nvme-rdma` never emits 18,
+and `ms` with `0012` copes whether or not anything emits it.
+(Mirror of the same warning in `dkms/patches/README.md`; keep the two in step.)
+
+## HAZARD: a GDS/O_DIRECT writer on the RAW namespace, not through `ms`
+
+On **Ubuntu with `nvme_core.multipath=N`**, this package's patched
+`nvme-rdma` makes `/dev/nvmeXnY` itself advertise P2P and return status 18 on
+an unroutable transfer. A GDS / `O_DIRECT` writer talking to that **raw block
+device — not through an `ms` array —** gets `blk_status_to_errno(18)` = **0**
+back from the blkdev direct-I/O completion. The write is reported
+**successful and nothing is written**: silent data loss, outside md's
+boundary, created by this package.
+
+`ms` is not involved and cannot help: `0012`'s clamp and status checks live
+inside md, and a raw-device writer never enters them. This is a supported-use
+constraint on this package, not an md bug.
+
+- **Unreachable on RHEL 10**, where an rdma namespace always gets a multipath
+  head and the head gendisk never advertises P2P, so no P2P I/O is granted to
+  the raw device in the first place.
+- **Reachable on Ubuntu booted `nvme_core.multipath=N`**, which is exactly the
+  configuration recommended for GDS-native on an rdma leg.
+- The clean fix is the **host kernel carrying upstream v6 p1** ("block: add
+  `BLK_STS_P2PDMA` …"), which puts a real errno at index 18 of `blk_errors[]`.
+  Until then, on such a host, route GDS traffic through `/dev/msN` and treat
+  raw `/dev/nvmeXnY` GDS writes as unsupported.
+
 Supported kernel families (see `BUILD_EXCLUSIVE_KERNEL` in dkms.conf):
 
 | Variant     | Family            | Source of vendored files            |
