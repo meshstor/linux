@@ -235,7 +235,13 @@ gates. For the two candidate L40S CPUs:
   choice, no whitelist/topology dependency.
 - **Intel Xeon 8468 (Sapphire Rapids)** — whitelisted, but relies on the whitelist match AND
   needs `iommu=pt` (VT-d on, not `iommu=off`); confirmed working on the dev L40S
-  (P1 map_hits=512). Slightly more fragile than the EPYC.
+  (P1 map_hits=512). Slightly more fragile than the EPYC. **Empirically confirmed
+  cross-RC on 2026-07-07 (P7f):** a real asymmetric raid1 spanning two root complexes
+  (`nvme0n1`@`pci0000:00` × `nvme2n1`@`pci0000:48`) did a strict native write that
+  *succeeded* on both legs (witness `p2p_bios=520 map_hits=777 rc=0`), so the stage-1
+  natural arm correctly did NOT fire — the whitelisted host bridge permits cross-RC P2P
+  exactly as the gate above predicts (P7f SKIP "platform whitelists cross-RC P2P", never
+  a FAIL). The natural arm is reachable only on a non-whitelisted platform.
 If P1 reads `map_hits=0` on a Zen/whitelisted-server platform with every NVIDIA gate satisfied,
 the member NVMe's DMA-map is hitting `MAP_NOT_SUPPORTED` — see §8. (A consumer platform — desktop
 Intel/AMD-APU — refuses this P2P outright regardless of GPU class or BAR1 size.)

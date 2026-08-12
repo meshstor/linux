@@ -504,6 +504,19 @@ escalation refined: `p7c_userspace` is **not** a 1.15 artifact — the mid-IO
 **r1.18** (briefing §4.6a 4th finding); only stage-2 self-heal closes it
 in-house.
 
+Later the same day `nvme0n1` was freed from the (now degraded, single-disk
+`nvme1n1`) root arrays and repartitioned into test partitions — it sits on a
+DIFFERENT root complex (`pci0000:00`) from nvme2n1/nvme3n1 (`pci0000:48`), so
+**P7f finally had a genuine cross-RC pair and ran**: the strict native write on
+the asymmetric raid1 (`nvme0n1`×`nvme2n1`) **succeeded** on both legs (witness
+`p2p_bios=520 map_hits=777 rc=0`) → `P7f SKIP "platform whitelists cross-RC
+P2P — witnessed native success, never a FAIL"`. Correct outcome on the
+whitelisted SPR host bridge (§3.2): the natural stage-1 arm only fires where
+cross-RC P2P is *refused*; a witnessed success is a SKIP, not a FAIL. This also
+independently re-confirms host-bridge P2P across root complexes on this box.
+(NB the root arrays are left degraded — restore redundancy after the window by
+reclaiming nvme0n1 from the test partitions.)
+
 ## Post-cabling procedure — the gated P7g/P7h window (first actions when the RoCE ports go live)
 
 1. `sudo rdma link delete rxe0` — the stale soft-RoCE device P0
