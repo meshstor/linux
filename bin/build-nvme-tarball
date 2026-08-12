@@ -13,7 +13,9 @@ set -euo pipefail
 VER="${1:?usage: $0 <version>}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 OUT="$REPO_ROOT/build/meshstor-nvme-rdma-$VER"
-VARIANTS=(u2404-hwe u2604 rhel10)
+# u2404-hwe was retired 2026-07-30: noble-7.0 boxes build u2604 (byte-identity
+# guarded by bin/vendor-nvme-sources, exit 4 when it breaks).
+VARIANTS=(u2604 rhel10)
 FILES=(rdma.c nvme.h fabrics.h PROVENANCE)
 
 cd "$REPO_ROOT"

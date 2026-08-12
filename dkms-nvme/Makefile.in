@@ -18,9 +18,13 @@ ccflags-y += -I$(src)
 
 ifneq ($(findstring .el10,$(KVER)),)
 VARIANT := rhel10
-else ifneq ($(filter 6.17.%,$(KVER)),)
-VARIANT := u2404-hwe
 else ifneq ($(filter 7.0.%,$(KVER)),)
+# u2604 INTENTIONALLY serves both Ubuntu 26.04 (resolute) and Ubuntu 24.04
+# HWE 7.0 (noble): both ship byte-identical {rdma.c,nvme.h,fabrics.h}, and
+# `-generic` alone cannot tell the distros apart anyway. The mapping is
+# guarded at vendor time — bin/vendor-nvme-sources fails (exit 4) the
+# moment noble's newest HWE family diverges from resolute's sources; only
+# then does a separate noble variant get vendored.
 VARIANT := u2604
 else
 VARIANT :=
@@ -39,7 +43,7 @@ all: copy-src
 variant-check:
 	@if [ -z "$(VARIANT)" ]; then \
 	    echo "error: unsupported kernel $(KVER)" >&2; \
-	    echo "       supported families: 6.12.*.el10* (rhel10), 6.17.* (u2404-hwe), 7.0.* (u2604)" >&2; \
+	    echo "       supported families: 6.12.*.el10* (rhel10), 7.0.* (u2604; serves 26.04 and 24.04-HWE-7.0)" >&2; \
 	    exit 1; \
 	fi
 	@utsrel=$$(sed -n 's/^#define UTS_RELEASE "\(.*\)"$$/\1/p' \

@@ -3,8 +3,10 @@
 #
 # The meshstor-nvme-rdma wrapper Makefile must select the vendored source
 # variant from the target kernel release string — rhel10 for *.el10*,
-# u2404-hwe for 6.17.*, u2604 for 7.0.* — and hard-error with the
-# supported-family list on anything else. It must also refuse a KDIR
+# u2604 for 7.0.* (deliberately serving BOTH Ubuntu 26.04 and 24.04-HWE-7.0;
+# the byte-identity behind that is guarded by bin/vendor-nvme-sources) —
+# and hard-error with the supported-family list on anything else. 6.17 was
+# retired 2026-07-30 with the u2404-hwe variant. It must also refuse a KDIR
 # whose utsrelease.h disagrees with KVER (ABI-pinned override module:
 # building variant X against kernel Y is the exact failure this package
 # exists to prevent).
@@ -26,8 +28,13 @@ want() { # KVER EXPECTED_VARIANT
 	assert_eq "$2" "$got" "variant selected for KVER=$1"
 }
 want 6.12.0-211.26.1.el10_2.x86_64 rhel10
-want 6.17.0-35-generic             u2404-hwe
 want 7.0.0-27-generic              u2604
+want 7.0.0-28-generic              u2604
+
+# Retired family (6.17) -> now unsupported, same hard error as any other.
+out="$(make -s -C "$d" variant-check KVER=6.17.0-35-generic KDIR=/nonexistent 2>&1)" \
+	&& dkms_fail "variant-check must fail for retired 6.17 kernel"
+assert_contains "$out" "unsupported kernel" "retired-family error message"
 
 # Unsupported family -> hard error naming the supported list.
 out="$(make -s -C "$d" variant-check KVER=6.8.0-136-generic KDIR=/nonexistent 2>&1)" \
@@ -36,9 +43,9 @@ assert_contains "$out" "unsupported kernel" "unsupported-kernel error message"
 
 # KVER/KDIR utsrelease mismatch -> refused.
 mkdir -p "$d/kdir/include/generated"
-echo '#define UTS_RELEASE "6.17.0-99-generic"' > "$d/kdir/include/generated/utsrelease.h"
-out="$(make -s -C "$d" variant-check KVER=6.17.0-35-generic KDIR="$d/kdir" 2>&1)" \
+echo '#define UTS_RELEASE "7.0.0-99-generic"' > "$d/kdir/include/generated/utsrelease.h"
+out="$(make -s -C "$d" variant-check KVER=7.0.0-27-generic KDIR="$d/kdir" 2>&1)" \
 	&& dkms_fail "variant-check must fail when KDIR utsrelease != KVER"
-assert_contains "$out" "6.17.0-99-generic" "utsrelease mismatch message"
+assert_contains "$out" "7.0.0-99-generic" "utsrelease mismatch message"
 
 dkms_pass "variant selection and safety guards behave"

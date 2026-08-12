@@ -3,7 +3,7 @@
 #
 # Real compile of the vendored+patched nvme-rdma against an installed
 # kernel's headers, when one matching a vendored family is present
-# (this dev box runs Ubuntu 24.04 HWE 6.17 -> u2404-hwe). SKIPs
+# (rhel10 for *.el10*, u2604 for 7.0.*-generic). SKIPs
 # otherwise. Asserts: correct variant selected, nvme-rdma.ko produced,
 # no modpost "undefined!" warnings (i.e. every imported symbol resolved
 # against the target kernel's Module.symvers).
@@ -11,13 +11,12 @@ set -u
 # shellcheck source=tools/testing/selftests/dkms/lib.sh
 . "$(dirname "$0")/lib.sh"
 
-[ -d "$REPO_ROOT/dkms-nvme/vendor/u2404-hwe" ] \
+[ -d "$REPO_ROOT/dkms-nvme/vendor/u2604" ] \
 	|| dkms_skip "vendor sources not populated (run bin/vendor-nvme-sources)"
 
 pick_variant() { # $1 = kernel release -> echoes variant key, or nothing
 	case "$1" in
 		*.el10*) echo rhel10 ;;
-		6.17.*)  echo u2404-hwe ;;
 		7.0.*)   echo u2604 ;;
 	esac
 }

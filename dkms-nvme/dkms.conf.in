@@ -19,4 +19,4 @@ NO_WEAK_MODULES="yes"
 # (or will get) 23528aa in-tree, and its private headers would not match
 # the vendored copies. DKMS skips non-matching kernels gracefully; the
 # in-tree nvme-rdma keeps working there.
-BUILD_EXCLUSIVE_KERNEL="^(6\.12\..*\.el10|6\.17\..*-generic|7\.0\..*-generic)"
+BUILD_EXCLUSIVE_KERNEL="^(6\.12\..*\.el10|7\.0\..*-generic)"

@@ -92,9 +92,18 @@ Supported kernel families (see `BUILD_EXCLUSIVE_KERNEL` in dkms.conf):
 
 | Variant     | Family            | Source of vendored files            |
 |-------------|-------------------|-------------------------------------|
-| `u2404-hwe` | `6.17.*-generic`  | Launchpad noble `Ubuntu-hwe-6.17-*` |
 | `u2604`     | `7.0.*-generic`   | Launchpad resolute `Ubuntu-7.0.0-*` |
 | `rhel10`    | `6.12.*.el10*`    | Rocky 10 BaseOS kernel SRPM         |
+
+`u2604` deliberately serves BOTH Ubuntu 26.04 and Ubuntu 24.04 HWE 7.0:
+noble's HWE-7.0 copies of the three files are byte-identical to
+resolute's (and the `-generic` release string cannot tell the distros
+apart anyway). `bin/vendor-nvme-sources` guards that mapping on every
+run — it exits 4 the moment noble's newest HWE family stops being
+resolute's family or its sources diverge; only then is a real noble
+variant vendored. Its sunset probe likewise reports when a target's
+in-tree `nvme-rdma` gains native P2P support (≥ 7.1), i.e. when a
+variant can retire.
 
 ## Why variant selection is version-keyed (exception to the HAVE_* rule)
 
@@ -125,13 +134,14 @@ Each variant now carries **four** patches applied in order, not one:
 four** patches for that variant, not just 0001 — a distro rebase can shift
 context anywhere in `rdma.c`, including the regions 0002-0004 touch.
 
-1. `bin/vendor-nvme-sources [--u2404 TAG] [--u2604 TAG] [--rhel10 NVR]`
-   (defaults to latest; exit 3 = files changed).
+1. `bin/vendor-nvme-sources [--u2604 TAG] [--rhel10 NVR] [--noble TAG]
+   [--skip-rhel10]` (defaults to latest; exit 3 = files changed, exit 4 =
+   the noble mapping guard tripped).
 2. For each variant `V` whose vendored `rdma.c` changed, regenerate that
    variant's patches, in order:
 
    ```bash
-   V=rhel10   # or u2404-hwe / u2604
+   V=rhel10   # or u2604
    d="$(mktemp -d)"
    cp "dkms-nvme/vendor/$V/rdma.c" "$d/a-rdma.c"
    cp "dkms-nvme/vendor/$V/rdma.c" "$d/b-rdma.c"
@@ -175,7 +185,7 @@ context anywhere in `rdma.c`, including the regions 0002-0004 touch.
    ```bash
    V6=/path/to/v6/send   # wherever v6-0009..v6-0011 are staged
    S="$(mktemp -d)"
-   for V in rhel10 u2404-hwe u2604; do
+   for V in rhel10 u2604; do
        mkdir -p "$S/$V"; cp "dkms-nvme/vendor/$V/rdma.c" "$S/$V/"
        patch -p1 --fuzz=0 -d "$S/$V" \
            < "dkms-nvme/patches/$V/0001-nvme-rdma-enable-pci-p2pdma.patch"

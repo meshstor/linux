@@ -10,7 +10,7 @@ set -u
 . "$(dirname "$0")/lib.sh"
 
 [ -x "$REPO_ROOT/bin/build-nvme-tarball" ] || dkms_fail "bin/build-nvme-tarball missing"
-[ -d "$REPO_ROOT/dkms-nvme/vendor/u2404-hwe" ] \
+[ -d "$REPO_ROOT/dkms-nvme/vendor/u2604" ] \
 	|| dkms_skip "vendor sources not populated (run bin/vendor-nvme-sources)"
 
 VER="0.0.selftest"
@@ -22,7 +22,7 @@ TB="$REPO_ROOT/build/meshstor-nvme-rdma-$VER.dkms.tar.gz"
 d="$(dkms_mktemp_dir)"
 tar xzf "$TB" -C "$d"
 root="$d/meshstor-nvme-rdma-$VER"
-for v in u2404-hwe u2604 rhel10; do
+for v in u2604 rhel10; do
 	for f in rdma.c nvme.h fabrics.h PROVENANCE; do
 		[ -f "$root/$v/$f" ] || dkms_fail "missing $v/$f in tarball"
 	done

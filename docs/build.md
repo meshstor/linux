@@ -140,9 +140,12 @@ Supported kernel families — and only these (enforced by
 
 | Variant     | Family           | Vendored from                        |
 |-------------|------------------|--------------------------------------|
-| `u2404-hwe` | `6.17.*-generic` | Launchpad noble `Ubuntu-hwe-6.17-*`  |
 | `u2604`     | `7.0.*-generic`  | Launchpad resolute `Ubuntu-7.0.0-*`  |
 | `rhel10`    | `6.12.*.el10*`   | Rocky 10 BaseOS kernel SRPM          |
+
+(`u2604` serves both Ubuntu 26.04 and Ubuntu 24.04 HWE 7.0 — the sources
+are byte-identical, and `bin/vendor-nvme-sources` fails loudly the moment
+that stops being true. See `dkms-nvme/README.md`.)
 
 ```bash
 bin/build-nvme-tarball 0.1.0            # tarball only
@@ -169,7 +172,8 @@ the backport patches still apply:
 
 ```bash
 bin/vendor-nvme-sources        # exit 3 = files changed — re-check patches
-# per-variant pins: --u2404 TAG --u2604 TAG --rhel10 NVR
+# pins: --u2604 TAG --rhel10 NVR --noble TAG; --skip-rhel10 skips the SRPM
+# exit 4 = the noble byte-identity guard tripped — vendor a noble variant
 ```
 
 The patch-regeneration recipe and operational caveats (initramfs,

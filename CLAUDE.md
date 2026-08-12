@@ -166,9 +166,10 @@ noarch DKMS package is portable across distros.
 Rebuilds each target kernel's **own** `nvme-rdma` with upstream `23528aa3320a`
 (PCI P2PDMA for the RDMA transport, v7.1) backported; overrides the in-tree
 module via `/updates` depmod priority. **No rename pass**; in-tree
-nvme-core/fabrics untouched. Exactly three kernel families
-(`BUILD_EXCLUSIVE_KERNEL`): Ubuntu 24.04 HWE 6.17 (`u2404-hwe`), Ubuntu 26.04
-7.0 (`u2604`), Rocky/RHEL 10 6.12 (`rhel10`).
+nvme-core/fabrics untouched. Exactly two kernel families
+(`BUILD_EXCLUSIVE_KERNEL`): Ubuntu 7.0 (`u2604` — serves BOTH 26.04 and
+24.04-HWE-7.0; byte-identity guarded by `vendor-nvme-sources`, exit 4 when it
+breaks) and Rocky/RHEL 10 6.12 (`rhel10`).
 
 - Build: `bin/build-nvme-tarball <ver>`; package with
   `bin/build-rpm|build-deb --pkg nvme-rdma <ver>` (bare invocations still
@@ -316,17 +317,18 @@ KERNEL_TREE=build/linux-meshstor-rebuilt bash tools/testing/selftests/dkms/run_a
 
 ## Verification before merging a rebase or compat change
 
-The tree must build clean against **all four target kernels** before merge:
+The tree must build clean against **every target kernel** before merge
+(decided 2026-07-30: RHEL 9 dropped as a target — `ms` does not even build
+there, `0007` is unguarded; U24.04-HWE support floor is 7.0):
 
 | Distro | Kernel |
 |---|---|
-| RHEL 9.x / Rocky 9 | 5.14 |
 | RHEL 10.x / Rocky 10 | 6.12 |
-| Ubuntu 24.04 LTS HWE | 6.14 |
-| Ubuntu 26.04 LTS | 6.17 |
+| Ubuntu 24.04 LTS HWE | 7.0 |
+| Ubuntu 26.04 LTS | 7.0 |
 
 ```bash
-for K in <r10 6.12> <r9 5.14> <u24 6.14> <u26 6.17>; do
+for K in <r10 6.12> <u 7.0>; do   # one 7.0 header tree serves both Ubuntus
     env -u KDIR KDIR="$K" bin/build-tarball 0.1.0 2>&1 | tail -2   # each must print "Built: …"
 done
 ```

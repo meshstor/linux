@@ -3,20 +3,36 @@
 # kernel's private nvme host sources {rdma.c, nvme.h, fabrics.h}.
 #
 # Variants and default sources ("latest" = newest release tag / SRPM):
-#   u2404-hwe  Ubuntu 24.04 HWE 6.17   Launchpad noble linux git, Ubuntu-hwe-6.17-* tag
-#   u2604      Ubuntu 26.04 (7.0)      Launchpad resolute linux git, Ubuntu-7.0.0-* tag
-#   rhel10     Rocky/RHEL 10 (6.12)    latest Rocky 10 BaseOS kernel SRPM
+#   u2604   Ubuntu 26.04 (7.0) AND Ubuntu 24.04 HWE 7.0
+#           Launchpad resolute linux git, Ubuntu-7.0.0-* tag
+#   rhel10  Rocky/RHEL 10 (6.12)  latest Rocky 10 BaseOS kernel SRPM
+#
+# There is deliberately NO noble (24.04) variant: noble's HWE-7.0
+# {rdma.c,nvme.h,fabrics.h} are byte-identical to resolute's, so a
+# noble-7.0 box builds the u2604 variant (dkms-nvme/Makefile.in maps
+# 7.0.*-generic there). That mapping is sound ONLY while the byte-identity
+# holds, so this script FAILS (exit 4) the moment noble's newest HWE
+# family diverges from resolute — the signal to vendor a real noble
+# variant. It also fails if noble's newest HWE family is no longer
+# resolute's family at all (e.g. noble rolls to 7.1 before resolute moves).
+#
+# Sunset probe: for every fetched IN-TREE rdma.c this script reports when
+# the distro kernel itself gained P2PDMA support (upstream 23528aa3320a,
+# v7.1) — at that point the variant (or, for noble, the whole package on
+# that family) can retire.
 #
 # Files are vendored BYTE-IDENTICAL to the distro source. The p2pdma
 # backport lives in dkms-nvme/patches/<variant>/ and is applied at
 # tarball-assembly time (bin/build-nvme-tarball), never here.
 #
 # Exit: 0 = vendor tree unchanged, 3 = files were (re)written — re-verify
-# that dkms-nvme/patches/ still applies at --fuzz=0 before committing.
+# that dkms-nvme/patches/ still applies at --fuzz=0 before committing,
+# 4 = the noble mapping guard tripped (family moved or sources diverged).
 # Network-using by design; run manually when a target moves, never from
 # the build pipeline.
 #
-# Usage: bin/vendor-nvme-sources [--u2404 TAG] [--u2604 TAG] [--rhel10 NVR]
+# Usage: bin/vendor-nvme-sources [--u2604 TAG] [--rhel10 NVR] [--noble TAG]
+#                                [--skip-rhel10]
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -27,13 +43,14 @@ NOBLE_GIT="https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/no
 RESOLUTE_GIT="https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute"
 ROCKY_SRC="https://dl.rockylinux.org/pub/rocky/10/BaseOS/source/tree/Packages/k"
 
-U2404_TAG= U2604_TAG= RHEL10_NVR=
+U2604_TAG= RHEL10_NVR= NOBLE_TAG= SKIP_RHEL10=
 while (($#)); do
     case "$1" in
-        --u2404)  U2404_TAG="${2:?}";  shift 2 ;;
         --u2604)  U2604_TAG="${2:?}";  shift 2 ;;
         --rhel10) RHEL10_NVR="${2:?}"; shift 2 ;;
-        *) echo "usage: $0 [--u2404 TAG] [--u2604 TAG] [--rhel10 NVR]" >&2; exit 2 ;;
+        --noble)  NOBLE_TAG="${2:?}";  shift 2 ;;
+        --skip-rhel10) SKIP_RHEL10=1;  shift ;;
+        *) echo "usage: $0 [--u2604 TAG] [--rhel10 NVR] [--noble TAG] [--skip-rhel10]" >&2; exit 2 ;;
     esac
 done
 
@@ -110,14 +127,63 @@ fetch_rocky() { # $1=NVR like 6.12.0-211.26.1.el10_2, or empty = latest
     fi
 }
 
-[[ -n "$U2404_TAG" ]] || U2404_TAG="$(latest_tag "$NOBLE_GIT" 'Ubuntu-hwe-6.17-*')"
+sunset_probe() { # $1=label  $2=path to an IN-TREE (pre-backport) rdma.c
+    if grep -q 'p2pdma' "$2"; then
+        echo "SUNSET: $1 in-tree nvme-rdma now references p2pdma — the distro"
+        echo "        kernel gained native P2P support (upstream 23528aa3320a);"
+        echo "        this variant/family can likely retire. Verify and prune."
+    fi
+}
+
+# The noble mapping guard (see header): newest noble HWE family must still
+# be resolute's family, and its three files must be byte-identical to the
+# freshly vendored u2604 set. Either failure exits 4.
+noble_hwe_check() {
+    local tag="$NOBLE_TAG" fam res_fam f differs=
+    res_fam="$(sed -E 's/^Ubuntu-([0-9]+\.[0-9]+)\..*/\1/' <<<"$U2604_TAG")"
+    if [[ -z "$tag" ]]; then
+        fam="$(git ls-remote --tags "$NOBLE_GIT" 'Ubuntu-hwe-*' \
+            | awk -F/ '{print $NF}' | grep -v '\^{}$' \
+            | sed -nE 's/^Ubuntu-hwe-([0-9]+\.[0-9]+)-.*/\1/p' | sort -uV | tail -1)"
+        [[ -n "$fam" ]] || { echo "error: cannot list noble HWE families" >&2; exit 1; }
+        tag="$(latest_tag "$NOBLE_GIT" "Ubuntu-hwe-$fam-*")"
+    else
+        fam="$(sed -nE 's/^Ubuntu-hwe-([0-9]+\.[0-9]+)-.*/\1/p' <<<"$tag")"
+    fi
+    if [[ "$fam" != "$res_fam" ]]; then
+        echo "error: noble's newest HWE family is $fam, but the vendored u2604 family is $res_fam." >&2
+        echo "       The '7.0.*-generic -> u2604' mapping no longer covers noble's newest" >&2
+        echo "       kernel: vendor a real noble variant or retire the family (README)." >&2
+        exit 4
+    fi
+    mkdir -p "$TMP/noble"
+    for f in "${FILES[@]}"; do
+        curl -fsS "$NOBLE_GIT/plain/drivers/nvme/host/$f?h=$tag" -o "$TMP/noble/$f"
+        cmp -s "$TMP/noble/$f" "$VENDOR/u2604/$f" || differs+=" $f"
+    done
+    if [[ -n "$differs" ]]; then
+        echo "error: noble $tag DIVERGES from vendored u2604 in:$differs" >&2
+        echo "       The byte-identity that lets noble-7.0 boxes build the u2604 variant" >&2
+        echo "       is broken — vendor a real noble variant now (dkms-nvme/README.md)." >&2
+        exit 4
+    fi
+    echo "noble ok  <-  $tag (byte-identical to u2604: ${FILES[*]})"
+    sunset_probe "noble ($fam HWE)" "$TMP/noble/rdma.c"
+}
+
 [[ -n "$U2604_TAG" ]] || U2604_TAG="$(latest_tag "$RESOLUTE_GIT" 'Ubuntu-7.0.0-*')"
-[[ -n "$U2404_TAG" && -n "$U2604_TAG" ]] \
+[[ -n "$U2604_TAG" ]] \
     || { echo "error: could not resolve a Launchpad tag" >&2; exit 1; }
 
-fetch_launchpad u2404-hwe "$NOBLE_GIT" "$U2404_TAG" --u2404
 fetch_launchpad u2604 "$RESOLUTE_GIT" "$U2604_TAG" --u2604
-fetch_rocky "$RHEL10_NVR"
+sunset_probe "u2604 (resolute)" "$VENDOR/u2604/rdma.c"
+noble_hwe_check
+if [[ -z "$SKIP_RHEL10" ]]; then
+    fetch_rocky "$RHEL10_NVR"
+    sunset_probe "rhel10" "$VENDOR/rhel10/rdma.c"
+else
+    echo "skipping rhel10 (--skip-rhel10)"
+fi
 
 if git -C "$REPO_ROOT" status --porcelain -- dkms-nvme/vendor | grep -q .; then
     echo
