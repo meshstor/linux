@@ -115,6 +115,14 @@ GDS_MNT="${GDS_MNT:-/mnt/gds-test}"
 # have no PCI device dir and name their netdev in the "parent" attribute
 # instead (observed live: rxe0 on bond0 was invisible to the device/net
 # scan and the rdma tests skipped with "no RDMA-capable address").
+# Also records GDS_RDMA_ADDR and GDS_RDMA_IBDEV (owning ibdev basename)
+# so callers can classify the substrate of the device that will carry
+# the connect (rxe*/siw* = virt-DMA); a sysfs-wide glob can disagree
+# with the actually-chosen device on a mixed hw+rxe box. NB: the
+# globals only survive when the function is called WITHOUT command
+# substitution.
+GDS_RDMA_ADDR=""
+GDS_RDMA_IBDEV=""
 gds_rdma_addr() {
 	local ibdev nd addr
 	for ibdev in /sys/class/infiniband/*; do
@@ -123,7 +131,12 @@ gds_rdma_addr() {
 		          $(cat "$ibdev/parent" 2>/dev/null); do
 			addr=$(ip -4 -o addr show dev "$nd" 2>/dev/null \
 				| awk '{print $4}' | cut -d/ -f1 | head -1)
-			[ -n "$addr" ] && { echo "$addr"; return 0; }
+			[ -n "$addr" ] && {
+				GDS_RDMA_ADDR=$addr
+				GDS_RDMA_IBDEV=$(basename "$ibdev")
+				echo "$addr"
+				return 0
+			}
 		done
 	done
 	return 1
@@ -160,7 +173,9 @@ gds_nvmet_export() {
 	[ -d /sys/kernel/config/nvmet ] || { echo "SKIP: nvmet configfs unavailable" >&2; exit 4; }
 	case "$tr" in
 		tcp)  addr=127.0.0.1; port=4420;;
-		rdma) addr=$(gds_rdma_addr) || { echo "SKIP: no RDMA-capable address" >&2; exit 4; }
+		rdma) gds_rdma_addr >/dev/null \
+			|| { echo "SKIP: no RDMA-capable address" >&2; exit 4; }
+		      addr=$GDS_RDMA_ADDR
 		      port=4421;;
 		*) echo "gds_nvmet_export: bad transport '$tr'" >&2; return 1;;
 	esac
