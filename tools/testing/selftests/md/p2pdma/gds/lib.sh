@@ -263,3 +263,47 @@ gds_teardown() {
 	p2pdma_teardown
 	gds_nvmet_teardown
 }
+
+# ---------------------------------------------------------------------------
+# GDS I/O battery (needs gdsio + a GPU; callers SKIP via gds_require_gdsio)
+gds_require_gdsio() {
+	[ -x "$GDSIO" ] || { echo "SKIP: gdsio not found (set GDSIO=)" >&2; exit 4; }
+}
+
+# gds_gdsio_write MNT MODE JSON   (MODE: 0=GDS, 1=POSIX-through-CPU)
+gds_gdsio_write() {
+	local mnt=$1 mode=$2 json=$3
+	mkdir -p "$GDS_RESULTS"
+	CUFILE_ENV_PATH_JSON="$json" "$GDSIO" -f "$mnt/gds-test.bin" \
+		-d 0 -w 4 -s 256M -i 1M -x "$mode" -I 1 \
+		> "$GDS_RESULTS/gdsio-w.out" 2>&1
+}
+
+# gds_gdsio_readverify MNT JSON — read back with verification
+gds_gdsio_readverify() {
+	local mnt=$1 json=$2
+	CUFILE_ENV_PATH_JSON="$json" "$GDSIO" -f "$mnt/gds-test.bin" \
+		-d 0 -w 4 -s 256M -i 1M -x 0 -I 0 -V \
+		> "$GDS_RESULTS/gdsio-r.out" 2>&1
+}
+
+# gds_sha_direct FILE -> sha256 via CPU O_DIRECT read (page cache dropped)
+gds_sha_direct() {
+	sync; echo 3 > /proc/sys/vm/drop_caches
+	dd if="$1" bs=1M iflag=direct status=none | sha256sum | awk '{print $1}'
+}
+
+# gds_leg_sha MEMBER RELPATH -> sha256 of RELPATH on that leg's filesystem
+# (loop at data offset, ro,nouuid so both legs of a mirror mount cleanly)
+gds_leg_sha() {
+	local member=$1 rel=$2 off lo mnt sha
+	off=$(gds_data_offset_sectors "$member") || return 1
+	lo=$(losetup --find --show -r -o $((off * 512)) "$member") || return 1
+	mnt=$(mktemp -d)
+	if ! mount -t xfs -o ro,nouuid "$lo" "$mnt" 2>/dev/null; then
+		losetup -d "$lo"; rmdir "$mnt"; return 1
+	fi
+	sha=$(sha256sum "$mnt/$rel" | awk '{print $1}')
+	umount "$mnt"; losetup -d "$lo"; rmdir "$mnt"
+	echo "$sha"
+}
