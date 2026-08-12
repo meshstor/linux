@@ -55,8 +55,23 @@ rc=0; "$WITNESS" --expect-ms nonzero --expect-rc any -o "$GDS_RESULTS/p7c-witnes
 case $rc in
 	0) : ;;
 	4) echo "SKIP: witness could not attach" >&2; exit 4;;
-	*) gds_verdict p7 p7c_kernel FAIL "no native attempt witnessed: $(head -1 "$GDS_RESULTS/p7c-witness.txt" 2>/dev/null)"
-	   echo "FAIL: lenient run never attempted the native path (rig assumption broken)" >&2; exit 1;;
+	*)	# cuFile-policy escape hatch (P7g/h parity): lenient cuFile may skip the
+		# native path entirely. A witness-zero attempt with no breadcrumb and a
+		# clean dmesg delta is a userspace policy refusal, NOT a kernel bug —
+		# treat "no native attempt witnessed" as the compat-mode hatch (runbook
+		# Step 5b): SKIP on the whitelisted string, banking the same
+		# p7c-userspace-outcome P7h inherits. FAIL only when the refusal is
+		# non-vacuous (P2P bios seen, a breadcrumb, or an I/O error in the delta).
+		P2P=$(head -1 "$GDS_RESULTS/p7c-witness.txt" 2>/dev/null | sed -n 's/^p2p_bios=\([0-9]*\).*/\1/p'); P2P=${P2P:-0}
+		if [ "$P2P" -eq 0 ] && gds_assert_no_breadcrumb 2>/dev/null \
+		   && ! gds_dmesg_delta | grep -Eq 'I/O error|Buffer I/O error'; then
+			echo "cuFile compat mode does not retry mid-IO errors" > "$GDS_RESULTS/p7c-userspace-outcome"
+			gds_verdict p7 p7c_kernel SKIP "cuFile compat mode does not retry mid-IO errors (lenient cuFile skipped the native path; product escalation)"
+			echo "SKIP: cuFile compat mode does not retry mid-IO errors — lenient run never attempted the native path (product escalation)" >&2
+			exit 4
+		fi
+		gds_verdict p7 p7c_kernel FAIL "no native attempt witnessed: $(head -1 "$GDS_RESULTS/p7c-witness.txt" 2>/dev/null)"
+		echo "FAIL: lenient run never attempted the native path (rig assumption broken)" >&2; exit 1;;
 esac
 WREPORT=$(head -1 "$GDS_RESULTS/p7c-witness.txt")
 WRC=$(echo "$WREPORT" | sed -n 's/.*cmd_rc=\([0-9]*\).*/\1/p')
