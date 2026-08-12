@@ -94,12 +94,38 @@ retry a transfer that cannot route and diverge the mirror silently.
    KNOWN RESIDUAL, deliberately NOT closed by this part: an UNTAGGED
    mixed-pgmap bio -- host page in bi_io_vec[0], P2P pages after, which
    md_bio_is_p2pdma() cannot detect because it only inspects the first bvec --
-   is not covered. On 6.17/7.0 it fails BLK_STS_INVAL, is untagged so part 2
-   does not translate it, and raid1_should_handle_error() swallows it before
-   any write-error handling runs -- it never reaches narrow_write_error() at
-   all. On 6.12/6.14 it fails BLK_STS_TARGET, which maps to a nonzero errno,
-   so the ordinary path already fences it. The design spec accepts this
-   residual: it is bounded to crafted iovecs, and cuFile does not build them.
+   is not covered.
+
+   CORRECTED 2026-08-12. An earlier revision of this note said that on
+   6.17/7.0 such a bio fails BLK_STS_INVAL and raid1_should_handle_error()
+   swallows it. That mechanism is not reachable: since 6.17, bio_add_page()
+   refuses a page whose pgmap does not match the previous bvec's (upstream
+   requires it because blk_dma_map_iter_start() caches the P2PDMA mapping
+   state from the first segment), so the bio cannot be BUILT and no
+   completion status ever arises. On those kernels the residual does not
+   exist at all -- verified by running md_p2p_test mixed=1 on 7.0, where the
+   device-page add is refused and no I/O is submitted. The 6.12/6.14 clause
+   was and remains correct: there the bio IS constructible, fails
+   BLK_STS_TARGET, which maps to a nonzero errno, so the ordinary path
+   already fences it. The design spec accepts this residual: it is bounded
+   to crafted iovecs, and cuFile does not build them.
+
+   The correction does not change what this patch does, only why. It does
+   change the testing: because the scenario is unconstructible on the Ubuntu
+   targets, hunk 5 had NO asserting coverage there, and its only nominated
+   test (test_mixed_pgmap_untagged.sh) asserts nothing anywhere. Coverage is
+   now carried by three selftests instead:
+     - test_kernel_rejects_mixed_pgmap.sh   asserts which rule this kernel
+       enforces, with host+host / dev+dev controls, so the answer is a
+       measurement and not an inference from a failed I/O;
+     - test_mixed_pgmap_untagged.sh         now SKIPs where the bio cannot be
+       built (it previously PASSED there, having silently interpreted a leg
+       that was never written);
+     - test_narrow_write_error_untagged.sh  reaches hunk 5 directly on every
+       target via an ORDINARY untagged write against a dm-errstat leg armed
+       "5,p2pdma" -- no mixed-pgmap bio and no real P2P hardware needed.
+       Verified to FAIL with hunk 5 removed (badblocks cover only part of the
+       retried range) and PASS with it present.
 
 Deliberately NOT changed: the raid1_p2pdma_observe() diagnostics latch still
 gates on whether the array advertises, not on the new tag. Rewiring it here
@@ -229,15 +255,15 @@ minimal and symmetric.
 +		 * carries upstream v6 p9-p11 and produces the status, so
 +		 * this check is live, not merely defensive scaffolding.
 +		 *
-+		 * It does NOT close the untagged mixed-pgmap case (host page
-+		 * in bi_io_vec[0], P2P pages after), which md_bio_is_p2pdma()
-+		 * cannot see: on 6.17/7.0 that bio fails BLK_STS_INVAL,
-+		 * is untagged so untranslated, and raid1_should_handle_error()
-+		 * swallows it before any write-error handling runs. On
-+		 * 6.12/6.14 it fails BLK_STS_TARGET, which maps to a nonzero
-+		 * errno, so the ordinary path already fences it. That
-+		 * residual is a known, accepted limitation of the design
-+		 * (bounded to crafted iovecs; cuFile does not build them).
++		 * The untagged mixed-pgmap case (host page in bi_io_vec[0],
++		 * P2P pages after) that md_bio_is_p2pdma() cannot see is a
++		 * >= 6.17 non-issue: bio_add_page() refuses a pgmap-mismatched
++		 * page, so that bio cannot be built at all. On <= 6.14 it can,
++		 * and fails BLK_STS_TARGET -> nonzero errno, so the ordinary
++		 * path fences it. Either way the residual is bounded and
++		 * accepted (crafted iovecs only; cuFile does not build them).
++		 * Guarded by selftests test_kernel_rejects_mixed_pgmap.sh and
++		 * test_narrow_write_error_untagged.sh (this check's own test).
 +		 */
 +		if (wbio->bi_status == BLK_STS_P2PDMA)
 +			err = -EIO;
@@ -390,15 +416,15 @@ minimal and symmetric.
 +		 * carries upstream v6 p9-p11 and produces the status, so
 +		 * this check is live, not merely defensive scaffolding.
 +		 *
-+		 * It does NOT close the untagged mixed-pgmap case (host page
-+		 * in bi_io_vec[0], P2P pages after), which md_bio_is_p2pdma()
-+		 * cannot see: on 6.17/7.0 that bio fails BLK_STS_INVAL,
-+		 * is untagged so untranslated, and raid1_should_handle_error()
-+		 * swallows it before any write-error handling runs. On
-+		 * 6.12/6.14 it fails BLK_STS_TARGET, which maps to a nonzero
-+		 * errno, so the ordinary path already fences it. That
-+		 * residual is a known, accepted limitation of the design
-+		 * (bounded to crafted iovecs; cuFile does not build them).
++		 * The untagged mixed-pgmap case (host page in bi_io_vec[0],
++		 * P2P pages after) that md_bio_is_p2pdma() cannot see is a
++		 * >= 6.17 non-issue: bio_add_page() refuses a pgmap-mismatched
++		 * page, so that bio cannot be built at all. On <= 6.14 it can,
++		 * and fails BLK_STS_TARGET -> nonzero errno, so the ordinary
++		 * path fences it. Either way the residual is bounded and
++		 * accepted (crafted iovecs only; cuFile does not build them).
++		 * Guarded by selftests test_kernel_rejects_mixed_pgmap.sh and
++		 * test_narrow_write_error_untagged.sh (this check's own test).
 +		 */
 +		if (wbio->bi_status == BLK_STS_P2PDMA)
 +			err = -EIO;
