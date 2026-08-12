@@ -6,18 +6,51 @@
 #   @p2p_bios : bios entering ms_submit_bio whose first bvec page is
 #               ZONE_DEVICE MEMORY_DEVICE_PCI_P2PDMA (impossible after a bounce)
 #   @host_bios: other bios entering ms_submit_bio
-#   @map_hits : calls into the P2P DMA-map path (__pci_p2pdma_update_state
-#               where traceable, else the pci_p2pdma_* glob; the glob also
-#               matches one-time setup calls like pci_p2pdma_add_resource,
-#               which the precise probe deliberately excludes)
-# A compat/CPU run must show p2p_bios=0 map_hits=0; a native GDS run > 0.
-# The pgmap union read can't false-negative and false-positives are excluded
-# by the mandatory zero-control runs (P1 calibration / rehearsal).
+#   @map_dev  : P2P DMA-map calls, KEYED BY THE MAPPING DEVICE (see below)
+#   @dma_zero : P2P sg segments mapped to dma_address==0 with a success return
+#               (the el10 thru-host-bridge corruption signature), where the
+#               kernel's map path exposes an sg to a kretprobe
+# A compat/CPU run must show p2p_bios=0 and no map_dev entries; a native GDS
+# run > 0 for both.
+#
+# WHY PER-DEVICE (2026-08-06 rewrite): the previous version summed every
+# pci_p2pdma_* hit into one counter, so it could not express the assertion the
+# mixed-leg rig actually needs -- "the local NVMe *and* the fabric HCA both
+# mapped P2P pages".  A run where only the local leg mapped (and the remote leg
+# silently bounced) produced a nonzero counter and "passed".  --require-dev
+# closes that hole.  It also dropped to a `pci_p2pdma_*` glob when the precise
+# symbol was missing, which counts one-time setup calls like
+# pci_p2pdma_add_resource and pollutes zero-expectation windows; the glob is
+# gone -- no anchor now means SKIP (exit 4), never a silent miscount.
+#
+# PORTABILITY: nothing here is hard-coded to one kernel.  Both the map anchor
+# and the ZONE_DEVICE accessor are probed at run time:
+#   anchor    __pci_p2pdma_update_state(state, struct device *dev, page)
+#               -- provider-era kernels (7.x, and RHEL/Rocky el10's graft)
+#             pci_p2pdma_map_segment(state, struct device *dev, sg)
+#               -- vanilla 6.12-class kernels; also gives sg->dma_address, so
+#                  @dma_zero is only meaningful here
+#             (device is arg1 in BOTH signatures -- verified against BTF)
+#   pgmap     struct folio ->pgmap   on kernels carrying the 6.15 mm reorg
+#                                    (7.x and el10: struct page's field is the
+#                                    kABI ghost _unused_pgmap_compound_head)
+#             struct page  ->pgmap   on vanilla 6.12
+# Each candidate is compile-tested with `bpftrace --dry-run` before use, so a
+# layout change fails loud (SKIP) instead of miscounting silently.
 #
 # Usage: gds-p2p-witness [--expect-ms zero|nonzero|any]
 #                        [--expect-map zero|nonzero|any]
-#                        [--expect-rc zero|nonzero|any] [-o FILE] -- CMD...
+#                        [--expect-rc zero|nonzero|any]
+#                        [--require-dev SUBSTR]...   (repeatable; ALL must map)
+#                        [--expect-dma-zero zero|any]
+#                        [-o FILE] [--selftest] -- CMD...
 # Exit: 0 ok, 1 expectation violated, 2 usage, 4 cannot attach (skip)
+#
+# --require-dev matches a substring of the mapping device's kobject name, which
+# for PCI devices is the BDF (e.g. "0000:02:00.0").  Pass it once per leg.
+# --selftest runs the mandatory controls (positive: a raw-device O_DIRECT read
+# from GPU memory must fire the probe; negative: a host-page read must not) and
+# exits without running a workload.
 #
 # --expect-rc decouples the wrapped command's exit code from --expect-ms.
 # ABSENT = legacy semantics (kept because existing callers rely on them in
@@ -26,14 +59,9 @@
 # GIVEN = the rc is judged only by --expect-rc (any = don't judge), and
 # --expect-ms nonzero tests only the counter. Intentional-failure tests
 # (stage-1 fail-the-write) use --expect-ms nonzero --expect-rc nonzero.
-#
-# NOTE: the bpftrace program's struct-folio cast for ->pgmap and the
-# MEMORY_DEVICE_PCI_P2PDMA enum value are shaped against the 6.17 kernel
-# (the kit's L40S target); on a materially different kernel the pgmap read
-# could miscount silently rather than fail loud -- verify offsets before
-# trusting this witness elsewhere.
 set -u
-EXPECT_MS=any EXPECT_MAP=any EXPECT_RC="" OUTFILE=""
+EXPECT_MS=any EXPECT_MAP=any EXPECT_RC="" EXPECT_DMA0=any OUTFILE="" SELFTEST=0
+REQUIRE_DEVS=()
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--expect-rc)
@@ -54,76 +82,130 @@ while [ $# -gt 0 ]; do
 				*) echo "gds-p2p-witness: --expect-map needs zero|nonzero|any" >&2; exit 2;;
 			esac
 			shift 2;;
+		--expect-dma-zero)
+			case "${2:-}" in
+				zero|any) EXPECT_DMA0=$2;;
+				*) echo "gds-p2p-witness: --expect-dma-zero needs zero|any" >&2; exit 2;;
+			esac
+			shift 2;;
+		--require-dev)
+			[ -n "${2:-}" ] || { echo "gds-p2p-witness: --require-dev needs a substring" >&2; exit 2; }
+			REQUIRE_DEVS+=("$2"); shift 2;;
+		--selftest)   SELFTEST=1; shift;;
 		-o)
 			[ -n "${2:-}" ] || { echo "gds-p2p-witness: -o needs a path" >&2; exit 2; }
 			OUTFILE=$2; shift 2;;
 		--)           shift; break;;
-		*) echo "usage: gds-p2p-witness [--expect-ms MODE] [--expect-map MODE] [--expect-rc MODE] [-o FILE] -- CMD..." >&2; exit 2;;
+		*) echo "usage: gds-p2p-witness [--expect-ms MODE] [--expect-map MODE] [--expect-rc MODE] [--require-dev SUBSTR]... [--expect-dma-zero MODE] [-o FILE] [--selftest] -- CMD..." >&2; exit 2;;
 	esac
 done
-[ $# -gt 0 ] || { echo "no command given" >&2; exit 2; }
+[ "$SELFTEST" = 1 ] || [ $# -gt 0 ] || { echo "no command given" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "SKIP: root required" >&2; exit 4; }
 command -v bpftrace >/dev/null 2>&1 || { echo "SKIP: bpftrace not installed" >&2; exit 4; }
 FF=/sys/kernel/tracing/available_filter_functions
 grep -q '^ms_submit_bio\b' "$FF" 2>/dev/null \
 	|| { echo "SKIP: ms_submit_bio not traceable (ms_mod loaded?)" >&2; exit 4; }
-HAVE_MAP=1
-# Prefer the per-request DMA-map slow path (6.17-class kernels): it fires for
-# every P2P-containing request and never for device registration.  The glob
-# fallback also counts setup calls (pci_p2pdma_add_resource fires once per GPU
-# when UVM lazily registers BAR1), which can pollute a zero-expectation window.
-if grep -q '^__pci_p2pdma_update_state\b' "$FF" 2>/dev/null; then
-	MAP_PROBE='kprobe:__pci_p2pdma_update_state'
-elif grep -q '^pci_p2pdma_' "$FF" 2>/dev/null; then
-	MAP_PROBE='kprobe:pci_p2pdma_*'
+
+# --- run-time capability probes ---------------------------------------------
+bt_compiles() { bpftrace --dry-run -e "$1" >/dev/null 2>&1; }
+
+# ZONE_DEVICE accessor: folio (6.15 mm reorg) vs page (vanilla 6.12).
+if bt_compiles 'kprobe:ms_submit_bio { $f=(struct folio *)0; if ($f->pgmap != 0) { @x = count(); } }'; then
+	PGMAP_CAST='(struct folio *)'
+elif bt_compiles 'kprobe:ms_submit_bio { $p=(struct page *)0; if ($p->pgmap != 0) { @x = count(); } }'; then
+	PGMAP_CAST='(struct page *)'
 else
-	HAVE_MAP=0
+	echo "SKIP: neither folio->pgmap nor page->pgmap resolves (BTF missing or layout changed)" >&2; exit 4
+fi
+
+# Map anchor. Device is arg1 in both signatures. Only pci_p2pdma_map_segment
+# hands us an sg, so the dma_address==0 check rides along only there.
+MAP_PROBE="" MAP_KIND=none
+if grep -q '^__pci_p2pdma_update_state\b' "$FF" 2>/dev/null \
+   && bt_compiles 'kprobe:__pci_p2pdma_update_state { $d=(struct device *)arg1; @m[str($d->kobj.name)] = count(); }'; then
+	MAP_PROBE=__pci_p2pdma_update_state; MAP_KIND=state
+elif grep -q '^pci_p2pdma_map_segment\b' "$FF" 2>/dev/null \
+   && bt_compiles 'kprobe:pci_p2pdma_map_segment { $d=(struct device *)arg1; @m[str($d->kobj.name)] = count(); }'; then
+	MAP_PROBE=pci_p2pdma_map_segment; MAP_KIND=segment
+fi
+if [ -z "$MAP_PROBE" ]; then
+	# No precise anchor: refuse rather than fall back to a pci_p2pdma_* glob,
+	# which also counts one-time registration (pci_p2pdma_add_resource).
+	echo "SKIP: no traceable P2P map anchor (__pci_p2pdma_update_state / pci_p2pdma_map_segment); CONFIG_PCI_P2PDMA off?" >&2
+	exit 4
 fi
 
 WORK=$(mktemp -d)
 PROG="$WORK/witness.bt"
-cat > "$PROG" <<'BT'
+cat > "$PROG" <<BT
 kprobe:ms_submit_bio {
-	$b = (struct bio *)arg0;
-	if ($b->bi_io_vec != 0) {
-		/* struct page no longer carries a directly-named "pgmap" field
-		 * (folio conversion moved it into struct folio's anonymous
-		 * union); struct folio aliases struct page byte-for-byte at
-		 * this offset, so cast through folio to reach it. */
-		$pg = (struct folio *)$b->bi_io_vec->bv_page;
-		if ($pg->pgmap != 0 && $pg->pgmap->type == MEMORY_DEVICE_PCI_P2PDMA) {
+	\$b = (struct bio *)arg0;
+	if (\$b->bi_io_vec != 0) {
+		\$pg = ${PGMAP_CAST}\$b->bi_io_vec->bv_page;
+		if (\$pg->pgmap != 0 && \$pg->pgmap->type == MEMORY_DEVICE_PCI_P2PDMA) {
 			@p2p_bios = count();
 		} else {
 			@host_bios = count();
 		}
 	}
 }
+kprobe:$MAP_PROBE {
+	\$d = (struct device *)arg1;
+	@map_dev[str(\$d->kobj.name)] = count();
+}
 BT
-[ "$HAVE_MAP" = 1 ] && echo "$MAP_PROBE { @map_hits[func] = count(); }" >> "$PROG"
+if [ "$MAP_KIND" = segment ]; then
+	# sg->dma_address is only valid after the call; a success return with a
+	# zero address is the el10 thru-host-bridge corruption signature.
+	cat >> "$PROG" <<BT
+kprobe:$MAP_PROBE { @sg[tid] = arg2; @sgd[tid] = arg1; }
+kretprobe:$MAP_PROBE / @sg[tid] != 0 / {
+	\$sg = (struct scatterlist *)@sg[tid];
+	\$d  = (struct device *)@sgd[tid];
+	if (retval >= 0 && \$sg->dma_address == 0) {
+		@dma_zero[str(\$d->kobj.name)] = count();
+	}
+	delete(@sg[tid]); delete(@sgd[tid]);
+}
+BT
+fi
 
+cleanup() { kill "${BPID:-}" 2>/dev/null; wait "${BPID:-}" 2>/dev/null; rm -rf "$WORK"; }
 bpftrace "$PROG" > "$WORK/trc" 2> "$WORK/err" &
 BPID=$!
 trap cleanup EXIT
-cleanup() { kill "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null; rm -rf "$WORK"; }
 # bpftrace's attach banner is "Attaching N probes..." (<=0.20) or "Attached N
 # probe(s)" (>=0.21). Which STREAM it lands on varies by build: some emit it on
 # stderr, but bpftrace 0.20.2 (the L40S box) prints it on stdout ($WORK/trc).
-# Grep BOTH so the wait works regardless of the banner's stream; the @map
-# parsing below keys on '^@...' lines, so a banner in trc never pollutes it.
+# Grep BOTH so the wait works regardless of the banner's stream; the @ parsing
+# below keys on '^@...' lines, so a banner in trc never pollutes it.
 for _ in $(seq 60); do grep -qE 'Attach(ing|ed)' "$WORK/err" "$WORK/trc" 2>/dev/null && break; sleep 0.25; done
 if ! grep -qE 'Attach(ing|ed)' "$WORK/err" "$WORK/trc" 2>/dev/null; then
 	cat "$WORK/err" >&2; cleanup
 	echo "SKIP: bpftrace failed to attach" >&2; exit 4
 fi
 
-"$@"; RC=$?
+if [ "$SELFTEST" = 1 ]; then
+	# Negative control only: a host-page read must not light the P2P counters.
+	# (The positive control needs GPU memory and a p2pdma-capable card, so it
+	# lives in the caller -- run a native gdsio under this witness and require
+	# @p2p_bios>0; that IS the positive control.)
+	dd if=/dev/zero of=/dev/null bs=1M count=8 >/dev/null 2>&1
+	RC=0
+	set -- true
+else
+	"$@"; RC=$?
+fi
 
 kill -INT "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null
 P2P=$(awk -F': ' '/^@p2p_bios/  {print $2}' "$WORK/trc"); P2P=${P2P:-0}
 HOST=$(awk -F': ' '/^@host_bios/ {print $2}' "$WORK/trc"); HOST=${HOST:-0}
-MAPS=$(awk -F': ' '/^@map_hits/  {s+=$2} END {print s+0}' "$WORK/trc")
-[ "$HAVE_MAP" = 1 ] || MAPS=unavailable
-REPORT="p2p_bios=$P2P host_bios=$HOST map_hits=$MAPS cmd_rc=$RC"
+# @map_dev[0000:02:00.0]: 17  ->  sum, and the device list
+MAPS=$(awk -F': ' '/^@map_dev\[/ {s+=$2} END {print s+0}' "$WORK/trc")
+DEVS=$(awk -F'[][]' '/^@map_dev\[/ {printf "%s%s", sep, $2; sep=","}' "$WORK/trc")
+DMA0=$(awk -F': ' '/^@dma_zero\[/ {s+=$2} END {print s+0}' "$WORK/trc")
+[ "$MAP_KIND" = segment ] || DMA0=unavailable
+REPORT="p2p_bios=$P2P host_bios=$HOST map_hits=$MAPS cmd_rc=$RC map_devs=[${DEVS:-}] dma_zero=$DMA0 anchor=$MAP_PROBE"
 if [ -n "$OUTFILE" ]; then
 	{ echo "$REPORT"; echo "--- raw bpftrace ---"; cat "$WORK/trc"; } > "$OUTFILE"
 fi
@@ -131,6 +213,15 @@ echo "$REPORT"
 rm -rf "$WORK"; trap - EXIT
 
 BAD=0
+if [ "$SELFTEST" = 1 ]; then
+	# Negative control: host-page I/O must not be counted as P2P, and must not
+	# fire the map anchor. A failure here means the witness would false-positive.
+	[ "$P2P" -eq 0 ] || { echo "SELFTEST FAIL: host-page I/O counted as P2P ($P2P)" >&2; BAD=1; }
+	[ "$MAPS" -eq 0 ] || { echo "SELFTEST FAIL: map anchor fired on host-page I/O ($MAPS via $DEVS)" >&2; BAD=1; }
+	[ "$BAD" = 0 ] && echo "SELFTEST OK: negative control clean (anchor=$MAP_PROBE pgmap=$PGMAP_CAST)"
+	exit "$BAD"
+fi
+
 case "$EXPECT_MS" in
 	zero)    [ "$P2P" -eq 0 ] || BAD=1;;
 	nonzero)
@@ -143,8 +234,23 @@ case "$EXPECT_MS" in
 		fi;;
 esac
 case "$EXPECT_MAP" in
-	zero)    [ "$MAPS" = unavailable ] || [ "$MAPS" -eq 0 ] || BAD=1;;
-	nonzero) [ "$MAPS" != unavailable ] && [ "$MAPS" -gt 0 ] || BAD=1;;
+	zero)    [ "$MAPS" -eq 0 ] || BAD=1;;
+	nonzero) [ "$MAPS" -gt 0 ] || BAD=1;;
+esac
+# Every required leg must appear among the mapping devices. This is the
+# assertion a summed counter cannot make.
+for want in ${REQUIRE_DEVS+"${REQUIRE_DEVS[@]}"}; do
+	case ",$DEVS," in
+		*"$want"*) : ;;
+		*) echo "gds-p2p-witness: required device '$want' never mapped P2P (saw [${DEVS:-}])" >&2; BAD=1;;
+	esac
+done
+case "$EXPECT_DMA0" in
+	zero)	if [ "$DMA0" = unavailable ]; then
+			echo "gds-p2p-witness: --expect-dma-zero zero requested but this kernel's anchor ($MAP_PROBE) exposes no sg" >&2; BAD=1
+		elif [ "$DMA0" -ne 0 ]; then
+			echo "gds-p2p-witness: $DMA0 P2P segment(s) mapped to dma_address=0 with success -- corrupting host-bridge mapping" >&2; BAD=1
+		fi;;
 esac
 case "$EXPECT_RC" in
 	zero)    [ "$RC" -eq 0 ] || BAD=1;;
@@ -153,5 +259,6 @@ case "$EXPECT_RC" in
 esac
 # all-any passthrough only in legacy mode (no --expect-rc): callers that
 # pass --expect-rc any explicitly want expectation-exit semantics.
-[ "$EXPECT_MS" = any ] && [ "$EXPECT_MAP" = any ] && [ -z "$EXPECT_RC" ] && exit "$RC"
+[ "$EXPECT_MS" = any ] && [ "$EXPECT_MAP" = any ] && [ -z "$EXPECT_RC" ] \
+	&& [ "${#REQUIRE_DEVS[@]}" -eq 0 ] && [ "$EXPECT_DMA0" = any ] && exit "$RC"
 exit "$BAD"
