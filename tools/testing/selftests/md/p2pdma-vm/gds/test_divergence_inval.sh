@@ -1,10 +1,13 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
-# P6: stage-1 NARROWNESS PROOF. Stage-1 fail-the-write keys on the R1BIO_P2P
-# bit; this test injects INVAL into plain (non-P2P) CPU writes, so upstream's
-# swallow semantics MUST still hold on a stage-1 module: the injected
+# P6: NARROWNESS PROOF. The v6 P2PDMA completion arm keys on the
+# R1BIO_P2PDMA bit (renamed from the retired R1BIO_P2P; the completion
+# handling itself was also reworked -- a P2P-tagged completion that can't
+# route is now badblocked and the master write succeeds, NOT failed loud --
+# see docs/admin.md); this test injects INVAL into plain (non-P2P) CPU
+# writes, so upstream's swallow semantics MUST still hold: the injected
 # plain-bio INVAL is counted as success (rc=0), [UU] preserved, the flakey
-# leg silently stale — and the stage-1 arm must NOT fire ("no P2P path"
+# leg silently stale — and the P2P arm must NOT fire ("no P2P path"
 # breadcrumb absent from the dmesg delta). A PASS proves the guard is
 # correctly narrow; a breadcrumb here means the arm fired for a non-P2P bio
 # — kernel bug, escalate, do not loosen.

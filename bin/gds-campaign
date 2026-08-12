@@ -165,10 +165,16 @@ p0() {
 		fi
 	fi
 	verd $p modules PASS "$(lsmod | awk '$1 ~ /^(ms_mod|raid1_ms|raid10_ms)$/ {printf "%s ", $1}')"
-	# --- ms module identity vs the kit manifest (stage-1: police the
-	# PERSONALITY modules — the stage-1 delta is invisible in ms_mod's
-	# srcversion). Stale loaded variant => reinstall gdsM; FAIL only if the
-	# reinstall cannot proceed.
+	# --- ms module identity vs the kit manifest (v6 P2PDMA: police the
+	# PERSONALITY modules — the v6 completion-handling delta (upstream's
+	# badblock-and-continue vs gds1's pre-rework pin, which still carries the
+	# retired stage-1 fail-the-write arm, not "no arm") is invisible in
+	# ms_mod's srcversion. NB gds1's exact pin/behavior needs re-verifying
+	# against whatever bin/gds-make-kit next resolves it to — the branch
+	# reset (2026-07-29) means no single commit on `p2pdma` today represents
+	# "advertise gate present, completion handling absent"; see
+	# docs/gds-l40s-agent-briefing.md §3.1.) Stale loaded variant =>
+	# reinstall gdsM; FAIL only if the reinstall cannot proceed.
 	if [ -n "$KIT" ] && [ -e "$KIT/kit-manifest.tsv" ] && [ -x "$SELF_DIR/gds-kit-manifest" ]; then
 		if assert_ms_identity gdsM; then
 			verd $p ms_module_identity PASS "loaded personalities match the gdsM manifest row"
@@ -258,7 +264,9 @@ p0() {
 
 # assert_ms_identity VARIANT — loaded module srcversions must equal the
 # manifest row. Compares the PERSONALITY modules first (raid1_ms/raid10_ms:
-# the stage-1 delta lives there; gds1 and gdsM can share an identical
+# the v6 completion-handling delta — badblock-and-continue on a P2P-tagged
+# completion, vs gds1's pre-rework pin (still the retired stage-1
+# fail-the-write arm) — lives there; gds1 and gdsM can share an identical
 # ms_mod srcversion). Kernels without CONFIG_MODULE_SRCVERSION_ALL (no
 # /sys/module/*/srcversion) fall back to the loaded-vs-ondisk identity
 # discipline the nvme-rdma override row uses: dkms shows the variant's
@@ -413,7 +421,7 @@ p7_spoof_verify() {
 
 p7() {
 	local p=p7; mkdir -p "$RESULTS/$p"
-	log "[p7] active variant: gdsM (stage-1 fail-the-write under test)"
+	log "[p7] active variant: gdsM (v6 P2PDMA completion handling under test: a P2P-tagged completion is badblocked and the master write succeeds off the surviving leg — NOT fail-the-write)"
 	# --- phase-entry plumbing gates (plumbing owns both: FAIL, not SKIP) ----
 	if [ ! -x /usr/sbin/msadm ]; then
 		verd $p entry_msadm FAIL "/usr/sbin/msadm missing — every P7 subtest is downstream of the udev rule"
@@ -462,7 +470,7 @@ p7() {
 	if [ -n "$KIT" ]; then
 		if ! kit_install_variant featured; then
 			verd $p restore FAIL "gdsM re-install FAILED -- box left on gds1 (PRE-FIX module)"
-			log "CRITICAL: box is on gds1 (pre-stage-1 module); reinstall gdsM before trusting any later phase"
+			log "CRITICAL: box is on gds1 (pre-rework pin, retired stage-1 fail-the-write arm); reinstall gdsM before trusting any later phase"
 			exit 3
 		fi
 		verd $p restore PASS "gdsM restored after A/B contrast (srcversion re-asserted)"
@@ -549,7 +557,7 @@ fi
 # --- no-vacuous-green: escalation is BY REASON, not by subtest name. On a
 # GPU-present, non-rehearsal box any P7 SKIP outside the enumerated
 # expected set (hardware gates + named cuFile-policy hatches) masks
-# stage-1 evidence and turns the verdict INCOMPLETE (exit 5, treat as red).
+# v6 P2P-arm evidence and turns the verdict INCOMPLETE (exit 5, treat as red).
 p7_skip_expected() {  # DETAIL
 	case "$1" in
 	*"fewer than 4 test partitions"*) return 0;;                     # P7d hw gate
@@ -578,13 +586,13 @@ if [ "$REHEARSAL" = 0 ] && [ "${GPU_PRESENT:-0}" = 1 ]; then
 		[ "$vst" = SKIP ] || continue
 		if ! p7_skip_expected "$vdetail"; then
 			INCOMPLETE=1
-			log "INCOMPLETE: unexpected P7 SKIP masks stage-1 evidence: $vname ($vdetail)"
+			log "INCOMPLETE: unexpected P7 SKIP masks v6 P2P-arm evidence: $vname ($vdetail)"
 		fi
 	done < "$RESULTS/verdict.tsv"
 fi
 grep -q $'\tFAIL\t' "$RESULTS/verdict.tsv" && exit 1
 if [ "$INCOMPLETE" = 1 ]; then
-	log "campaign verdict: INCOMPLETE — stage-1 evidence missing without an accepted reason (exit 5)"
+	log "campaign verdict: INCOMPLETE — v6 P2P-arm evidence missing without an accepted reason (exit 5)"
 	exit 5
 fi
 exit 0
