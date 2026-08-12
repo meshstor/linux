@@ -21,7 +21,7 @@ fi
 export GDS_BIN="$SELF_DIR"
 export GDS_INJ_DIR="$INJ_DIR"
 
-REHEARSAL=0; PHASES="p0,p1,p2,p3,p4,p5,p6"; TRANSPORT=auto
+REHEARSAL=0; PHASES="p0,p1,p2,p3,p4,p5,p6,p7"; TRANSPORT=auto
 RESULTS=""; KIT="${GDS_KIT_DIR:-}"
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -43,6 +43,31 @@ export MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$RESULTS/campaign.log"; }
 verd() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS/verdict.tsv"; }
 
+# Campaign-scope cleanup: heartbeat/restore failures exit 3 mid-flight and
+# would otherwise leave the cuFile level-spoof live until reboot, and an
+# armed match=success p2p_only=1 probe would keep rewriting statuses under
+# the operator's recovery I/O. Idempotent; the final checks additionally
+# assert both are gone. Ownership rule: the campaign takes ownership of the
+# spoof whenever p7 runs (SPOOF_OWNED=1 — p7 overwrites any pre-installed
+# rule) and removes it at exit; reinstall manually for post-campaign steps.
+SPOOF_OWNED=0
+campaign_cleanup() {
+	if [ "${SPOOF_OWNED:-0}" = 1 ] && [ -e /run/udev/rules.d/64-ms-raid0-spoof.rules ]; then
+		rm -f /run/udev/rules.d/64-ms-raid0-spoof.rules
+		udevadm control --reload 2>/dev/null || true
+	fi
+	# Guard on the module being present: bash opens the `>` redirect target
+	# before `2>/dev/null` is in effect, so writing `remaining` when
+	# inval_inject is unloaded leaks a "No such file or directory" to stderr
+	# on EVERY clean exit. rmmod of an absent module is already a no-op, so
+	# this guard is semantically identical and silences the leak.
+	if [ -d /sys/module/inval_inject ]; then
+		echo 0 > /sys/module/inval_inject/parameters/remaining 2>/dev/null || true
+		rmmod inval_inject 2>/dev/null || true
+	fi
+}
+trap campaign_cleanup EXIT
+
 dmesg_mark() { dmesg | wc -l > "$RESULTS/.dmesg-mark"; }
 dmesg_delta() {
 	local mark; mark=$(cat "$RESULTS/.dmesg-mark" 2>/dev/null || echo 0)
@@ -58,10 +83,12 @@ run_test() {  # PHASE NAME SCRIPT [ENV...]
 	local phase=$1 name=$2 script=$3; shift 3
 	local out="$RESULTS/$phase/$name.out" rc
 	mkdir -p "$RESULTS/$phase"
+	# every phase's .out header records the active variant (identity gap)
+	echo "active-variant: raid1_ms srcversion=$(cat /sys/module/raid1_ms/srcversion 2>/dev/null || echo unknown) ms_mod srcversion=$(cat /sys/module/ms_mod/srcversion 2>/dev/null || echo unknown)" > "$out"
 	dmesg_mark
 	log "[$phase] $name ..."
 	env "$@" GDS_RESULTS="$RESULTS" GDS_BIN="$GDS_BIN" GDS_INJ_DIR="$GDS_INJ_DIR" \
-		MDADM="$MDADM" timeout 1200 bash "$script" > "$out" 2>&1
+		MDADM="$MDADM" timeout 1200 bash "$script" >> "$out" 2>&1
 	rc=$?
 	dmesg_delta "$RESULTS/$phase/$name.dmesg"
 	case $rc in
@@ -118,7 +145,9 @@ p0() {
 	*builtin*) verd $p nvme_rdma_override INFO "built-in (not overridable)";;
 	*)	verd $p nvme_rdma_override INFO stock;;
 	esac
+	GPU_PRESENT=0
 	if [ "$REHEARSAL" = 0 ]; then
+		nvidia-smi >/dev/null 2>&1 && GPU_PRESENT=1
 		capture $p nvidia nvidia-smi
 		capture $p topo nvidia-smi topo -m
 		capture $p openrm sh -c 'modinfo -F license nvidia 2>/dev/null'
@@ -129,13 +158,48 @@ p0() {
 	fi
 	# DKMS featured install (kit mode); skip when modules already loaded
 	if ! lsmod | grep -q '^ms_mod '; then
-		if [ -n "$KIT" ] && ls "$KIT"/tarballs/*gds1*.dkms.tar.gz >/dev/null 2>&1; then
-			kit_install_variant featured || { verd $p dkms FAIL "featured install failed"; return 1; }
+		if [ -n "$KIT" ] && ls "$KIT"/tarballs/*gdsM*.dkms.tar.gz >/dev/null 2>&1; then
+			kit_install_variant featured || { verd $p dkms FAIL "featured (gdsM) install failed"; return 1; }
 		else
 			verd $p dkms FAIL "ms_mod not loaded and no kit tarball"; return 1
 		fi
 	fi
 	verd $p modules PASS "$(lsmod | awk '$1 ~ /^(ms_mod|raid1_ms|raid10_ms)$/ {printf "%s ", $1}')"
+	# --- ms module identity vs the kit manifest (stage-1: police the
+	# PERSONALITY modules — the stage-1 delta is invisible in ms_mod's
+	# srcversion). Stale loaded variant => reinstall gdsM; FAIL only if the
+	# reinstall cannot proceed.
+	if [ -n "$KIT" ] && [ -e "$KIT/kit-manifest.tsv" ] && [ -x "$SELF_DIR/gds-kit-manifest" ]; then
+		if assert_ms_identity gdsM; then
+			verd $p ms_module_identity PASS "loaded personalities match the gdsM manifest row"
+		else
+			log "stale/unknown ms variant loaded — reinstalling gdsM"
+			if kit_install_variant featured; then
+				verd $p ms_module_identity PASS "gdsM reinstalled over a stale variant"
+			else
+				verd $p ms_module_identity FAIL "loaded modules mismatch gdsM manifest and reinstall failed"
+				return 1
+			fi
+		fi
+	elif [ -n "$KIT" ]; then
+		verd $p ms_module_identity INFO "no kit manifest (old kit -- rebuild with current gds-make-kit)"
+	else
+		verd $p ms_module_identity INFO "no kit manifest — identity unasserted (repo mode)"
+	fi
+	# --- /usr/sbin/msadm: the udev classification rule's IMPORT{program};
+	# every P7 subtest is downstream of that rule.
+	if [ ! -x /usr/sbin/msadm ] && [ -x "$MDADM" ]; then
+		install -m0755 "$MDADM" /usr/sbin/msadm 2>/dev/null || true
+	fi
+	if [ -x /usr/sbin/msadm ]; then
+		verd $p msadm_present PASS /usr/sbin/msadm
+	else
+		verd $p msadm_present FAIL "no /usr/sbin/msadm — cuFile RAID classification dead (install.sh or install from \$MDADM)"
+	fi
+	# --- nvme_core.multipath: P7g/h precondition (=N), pre-window planning item
+	capture $p multipath sh -c 'cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo unknown'
+	# NB capture()'s first line is the command echo — read the LAST line.
+	verd $p multipath INFO "nvme_core.multipath=$(tail -1 "$RESULTS/$p/multipath.txt" | tr -d '[:space:]')"
 	# udev rule for cuFile RAID classification
 	if [ ! -e /usr/lib/udev/rules.d/63-ms-raid-arrays.rules ]; then
 		local rule="$REPO_ROOT/dkms/udev/63-ms-raid-arrays.rules"
@@ -166,13 +230,60 @@ p0() {
 	HB_DEV=$(echo "$parts" | awk '{print $1}')
 	echo "TRANSPORT=$TRANSPORT" > "$RESULTS/env.sh"
 	echo "HB_DEV=${HB_DEV:-}" >> "$RESULTS/env.sh"
+	echo "GPU_PRESENT=${GPU_PRESENT:-0}" >> "$RESULTS/env.sh"
 	log "P0 done: transport=$TRANSPORT parts=${parts:-none}"
 }
 
-kit_install_variant() {  # featured|baseline
-	local want=$1 tb ver
-	tb=$(ls "$KIT"/tarballs/*gds$([ "$want" = featured ] && echo 1 || echo 0)*.dkms.tar.gz 2>/dev/null | head -1)
-	[ -n "$tb" ] || { log "no $want tarball in $KIT/tarballs"; return 1; }
+# assert_ms_identity VARIANT — loaded module srcversions must equal the
+# manifest row. Compares the PERSONALITY modules first (raid1_ms/raid10_ms:
+# the stage-1 delta lives there; gds1 and gdsM can share an identical
+# ms_mod srcversion). Kernels without CONFIG_MODULE_SRCVERSION_ALL (no
+# /sys/module/*/srcversion) fall back to the loaded-vs-ondisk identity
+# discipline the nvme-rdma override row uses: dkms shows the variant's
+# version installed for this kernel AND the modules are live.
+# CAVEAT: srcversion embeds the generated feature_flags.h/version.h, so
+# this gate presumes the kit-build box and the target resolve the HAVE_*
+# probes identically (same-kernel campaign). A PERSISTENT mismatch after a
+# reinstall therefore means feature-probe divergence, not a wrong tarball
+# — record it, don't chase.
+assert_ms_identity() {  # VARIANT
+	local variant=$1 mf="$KIT/kit-manifest.tsv" mgr="$SELF_DIR/gds-kit-manifest"
+	[ -n "$KIT" ] && [ -e "$mf" ] && [ -x "$mgr" ] || return 0   # nothing to assert against
+	local svs m want have missing=0
+	svs=$("$mgr" "$mf" "$variant" srcversions) \
+		|| { log "identity: no manifest row for variant $variant"; return 1; }
+	modprobe raid1_ms 2>/dev/null || true
+	modprobe raid10_ms 2>/dev/null || true
+	for m in raid1_ms raid10_ms ms_mod; do
+		want=$(echo "$svs" | tr ' ' '\n' | sed -n "s/^$m=//p")
+		have=$(cat "/sys/module/$m/srcversion" 2>/dev/null || true)
+		[ -n "$have" ] || { missing=1; continue; }
+		[ "$have" = "$want" ] \
+			|| { log "identity: $m loaded=$have manifest($variant)=$want"; return 1; }
+	done
+	if [ "$missing" = 1 ]; then
+		local ver
+		ver=$(basename "$("$mgr" "$mf" "$variant" tarball)" .dkms.tar.gz)
+		ver=${ver#meshstor-ms-}
+		dkms status "meshstor-ms/$ver" -k "$(uname -r)" 2>/dev/null | grep -q ': installed' \
+			|| { log "identity fallback: meshstor-ms/$ver not dkms-installed"; return 1; }
+		[ -e /sys/module/ms_mod/initstate ] \
+			|| { log "identity fallback: ms_mod not live"; return 1; }
+	fi
+	return 0
+}
+
+kit_install_variant() {  # featured|baseline|gds0|gds1|gdsM
+	local want=$1 variant tb ver
+	case "$want" in featured) variant=gdsM;; baseline) variant=gds0;; *) variant=$want;; esac
+	local mf="$KIT/kit-manifest.tsv" mgr="$SELF_DIR/gds-kit-manifest"
+	tb=""
+	if [ -e "$mf" ] && [ -x "$mgr" ]; then
+		tb="$KIT/tarballs/$("$mgr" "$mf" "$variant" tarball)" || tb=""
+	fi
+	[ -n "$tb" ] && [ -e "$tb" ] \
+		|| tb=$(ls "$KIT"/tarballs/*"$variant"*.dkms.tar.gz 2>/dev/null | head -1)
+	[ -n "$tb" ] || { log "no $variant tarball in $KIT/tarballs (manifest+glob both missed)"; return 1; }
 	modprobe -r raid10_ms raid1_ms ms_mod 2>/dev/null || true
 	for v in $(dkms status 2>/dev/null | awk -F'[/,]' '/meshstor-ms/ {print $2}' | sort -u); do
 		dkms remove "meshstor-ms/$v" --all >/dev/null 2>&1 || true
@@ -185,7 +296,11 @@ kit_install_variant() {  # featured|baseline
 	dkms add "meshstor-ms/$ver" >/dev/null && dkms install "meshstor-ms/$ver" >/dev/null \
 		|| return 1
 	modprobe ms_mod && modprobe raid1_ms && modprobe raid10_ms || return 1
-	log "installed $want (meshstor-ms/$ver)"
+	# re-assert build identity after EVERY swap (P0, P5 both directions,
+	# P7e both directions) — personality modules included.
+	assert_ms_identity "$variant" \
+		|| { log "srcversion identity assert FAILED after installing $variant"; return 1; }
+	log "installed $want=$variant (meshstor-ms/$ver)"
 }
 
 p1() { run_test p1 raw_baseline "$GDS_TESTS/test_gds_raw_baseline.sh"; }
@@ -253,8 +368,120 @@ p5() {
 }
 p6() { run_test p6 divergence "$GDS_TESTS/test_divergence_inval.sh" || true; }
 
+# behavioral spoof verify: file presence alone misses a skipped udev reload
+# (which would surface later as a misleading kernel-shaped P7a FAIL).
+p7_spoof_verify() {
+	local m0 m1
+	m0=$(ls /dev/disk/by-partlabel/*-meshstor-test-* 2>/dev/null | sed -n 1p)
+	m1=$(ls /dev/disk/by-partlabel/*-meshstor-test-* 2>/dev/null | sed -n 2p)
+	[ -n "$m0" ] && [ -n "$m1" ] || { log "spoof verify: need 2 test partitions"; return 1; }
+	(
+		. "$GDS_TESTS/lib.sh"
+		gds_csi_mdadm_create /dev/ms0 1 "$m0" "$m1" >/dev/null 2>&1 || exit 1
+		udevadm trigger --subsystem-match=block --action=change /dev/ms0 2>/dev/null || true
+		udevadm settle 2>/dev/null || true
+		lvl=$(udevadm info --query=property /dev/ms0 2>/dev/null | sed -n 's/^MD_LEVEL=//p')
+		"$MDADM" --stop /dev/ms0 >/dev/null 2>&1
+		# belt-and-suspenders (repo convention): scrub the scratch superblocks
+		[ -b "$m0" ] && "$MDADM" --zero-superblock "$m0" >/dev/null 2>&1 || true
+		[ -b "$m1" ] && "$MDADM" --zero-superblock "$m1" >/dev/null 2>&1 || true
+		[ "$lvl" = raid0 ]
+	)
+}
+
+p7() {
+	local p=p7; mkdir -p "$RESULTS/$p"
+	log "[p7] active variant: gdsM (stage-1 fail-the-write under test)"
+	# --- phase-entry plumbing gates (plumbing owns both: FAIL, not SKIP) ----
+	if [ ! -x /usr/sbin/msadm ]; then
+		verd $p entry_msadm FAIL "/usr/sbin/msadm missing — every P7 subtest is downstream of the udev rule"
+		return 1
+	fi
+	if [ -x "${GDSIO:-/usr/local/cuda/gds/tools/gdsio}" ] || command -v gdsio >/dev/null 2>&1; then
+		mkdir -p /run/udev/rules.d
+		printf 'SUBSYSTEM=="block", KERNEL=="ms*", ENV{MD_LEVEL}="raid0"\n' \
+			> /run/udev/rules.d/64-ms-raid0-spoof.rules
+		udevadm control --reload
+		SPOOF_OWNED=1   # campaign owns (and must remove) this spoof
+		if p7_spoof_verify; then
+			verd $p spoof PASS "behavioral: scratch ms array reports MD_LEVEL=raid0"
+		else
+			verd $p spoof FAIL "spoof installed but scratch array MD_LEVEL != raid0 (udev reload skipped?)"
+			return 1
+		fi
+	else
+		verd $p spoof INFO "gdsio absent — spoof not installed; GPU subtests will SKIP"
+	fi
+	# --- run order (design §2): a,b,c,d -> g,h -> e (swap) -> f -------------
+	run_test p7 p7a "$GDS_TESTS/test_p7a_inval_arm.sh" || true
+	run_test p7 p7b "$GDS_TESTS/test_p7b_target_arm.sh" || true
+	run_test p7 p7c "$GDS_TESTS/test_p7c_compat_convergence.sh" || true
+	run_test p7 p7d "$GDS_TESTS/test_p7d_raid10_arm.sh" || true
+	local tr=$TRANSPORT
+	run_test p7 p7g "$GDS_TESTS/test_p7g_rdma_native.sh" GDS_TRANSPORT="$tr" || true
+	run_test p7 p7h "$GDS_TESTS/test_p7h_rdma_leg_fail.sh" GDS_TRANSPORT="$tr" || true
+	# --- P7e: A/B contrast — orchestrator owns swap/restore (P5 pattern);
+	# the injector insmod happens inside the test, strictly AFTER the swap.
+	if [ -z "$KIT" ]; then
+		# Deviation from spec §4 (which says FAIL): with no kit at all we
+		# SKIP per P5 precedent; on a GPU box this still escalates to
+		# INCOMPLETE via the unexpected-SKIP rule, so it cannot go
+		# silently green.
+		verd $p p7e SKIP "no kit (gds1 tarball unavailable)"
+	elif [ ! -e "$KIT/kit-manifest.tsv" ] \
+	     || ! "$SELF_DIR/gds-kit-manifest" "$KIT/kit-manifest.tsv" gds1 tarball >/dev/null 2>&1; then
+		verd $p p7e FAIL "gds1 missing from kit manifest (kit must ship it)"
+	elif ! kit_install_variant gds1; then
+		verd $p p7e FAIL "gds1 install failed (kit must ship a working gds1)"
+	else
+		run_test p7 p7e "$GDS_TESTS/test_p7e_ab_contrast.sh" \
+			GDS_KIT_MANIFEST="$KIT/kit-manifest.tsv" || true
+	fi
+	if [ -n "$KIT" ]; then
+		if ! kit_install_variant featured; then
+			verd $p restore FAIL "gdsM re-install FAILED -- box left on gds1 (PRE-FIX module)"
+			log "CRITICAL: box is on gds1 (pre-stage-1 module); reinstall gdsM before trusting any later phase"
+			exit 3
+		fi
+		verd $p restore PASS "gdsM restored after A/B contrast (srcversion re-asserted)"
+	fi
+	run_test p7 p7f "$GDS_TESTS/test_p7f_topology.sh" || true
+	# --- phase-exit: spoof off (the EXIT trap is the backstop, not the plan);
+	# p7 took ownership at install (overwriting any pre-installed rule) —
+	# post-campaign steps that need the spoof must reinstall it manually
+	if [ "${SPOOF_OWNED:-0}" = 1 ] && [ -e /run/udev/rules.d/64-ms-raid0-spoof.rules ]; then
+		rm -f /run/udev/rules.d/64-ms-raid0-spoof.rules
+		udevadm control --reload 2>/dev/null || true
+	fi
+	heartbeat || { log "NODE UNHEALTHY after p7"; exit 3; }
+}
+
 # ------------------------------------------------------------------ main
 log "gds-campaign start ts=$TS rehearsal=$REHEARSAL phases=$PHASES results=$RESULTS"
+# Fresh verdicts every invocation: verd() appends, so reusing a --results dir
+# for a partial rerun would otherwise carry stale FAIL/SKIP rows into this
+# run's exit-code judgement. campaign.log keeps appending (history is good);
+# verdict.tsv must describe THIS invocation only. No verd() call happens
+# before this point — nothing is lost by truncating here.
+: > "$RESULTS/verdict.tsv"
+# Partial-rerun safety: TRANSPORT resolution, HB_DEV and GPU_PRESENT are
+# produced by p0 and persisted in env.sh. A p0-less invocation (--phases
+# p6/p7 reruns) must inherit them from a previous run's --results dir.
+case ",$PHASES," in
+*,p0,*) : ;;
+*)
+	[ -e "$RESULTS/env.sh" ] || {
+		log "FATAL: --phases without p0 and no $RESULTS/env.sh — run --phases p0,... (or point --results at the dir of the run being repeated)"
+		exit 2
+	}
+	TR_CLI=$TRANSPORT            # an explicit --transport beats the persisted value
+	. "$RESULTS/env.sh"
+	[ "$TR_CLI" != auto ] && TRANSPORT=$TR_CLI
+	if [ "$TRANSPORT" = auto ]; then
+		log "WARNING: TRANSPORT=auto even after sourcing env.sh — transport was never resolved; P7g/P7h will SKIP their RDMA gates"
+	fi
+	;;
+esac
 FAILGATE=0
 case ",$PHASES," in *,p0,*) p0 || FAILGATE=1;; esac
 [ "$FAILGATE" = 1 ] && { log "P0 gate failed — see $RESULTS (diagnosis mode: fix env, rerun)"; }
@@ -270,6 +497,22 @@ if [ "$FAILGATE" = 0 ]; then
 	case ",$PHASES," in *,p4,*) p4;; esac
 	case ",$PHASES," in *,p5,*) p5 || true;; esac
 	case ",$PHASES," in *,p6,*) p6;; esac
+	case ",$PHASES," in *,p7,*) p7 || true;; esac
+fi
+# ------------------------------------------------------------ final checks
+if [ "${SPOOF_OWNED:-0}" != 1 ]; then
+	verd final spoof_removed INFO "spoof not campaign-owned — left untouched"
+elif [ ! -e /run/udev/rules.d/64-ms-raid0-spoof.rules ]; then
+	verd final spoof_removed PASS "64-ms-raid0-spoof.rules absent"
+else
+	campaign_cleanup
+	verd final spoof_removed FAIL "raid0 spoof still present at campaign end (removed now)"
+fi
+if [ ! -d /sys/module/inval_inject ]; then
+	verd final injector_unloaded PASS "inval_inject not loaded"
+else
+	campaign_cleanup
+	verd final injector_unloaded FAIL "inval_inject still loaded at campaign end (unloaded now)"
 fi
 log "campaign finished — verdicts:"
 # column(1) ships in a separate package on some distros (e.g. Ubuntu's
@@ -281,5 +524,45 @@ else
 	log "(column not found — printing verdict.tsv unaligned)"
 	tee -a "$RESULTS/campaign.log" < "$RESULTS/verdict.tsv"
 fi
+# --- no-vacuous-green: escalation is BY REASON, not by subtest name. On a
+# GPU-present, non-rehearsal box any P7 SKIP outside the enumerated
+# expected set (hardware gates + named cuFile-policy hatches) masks
+# stage-1 evidence and turns the verdict INCOMPLETE (exit 5, treat as red).
+p7_skip_expected() {  # DETAIL
+	case "$1" in
+	*"fewer than 4 test partitions"*) return 0;;                     # P7d hw gate
+	*"no hardware RDMA transport"*) return 0;;                       # P7g/h transport gate
+	*"boot nvme_core.multipath=N and rerun"*) return 0;;             # P7g/h boot param
+	*"rdma leg does not advertise"*) return 0;;                      # P7g/h advertise gate
+	*"mixed [local,rdma] array does not advertise"*) return 0;;      # P7g/h member-AND gate
+	*"cuFile member-transport policy (rdma)"*) return 0;;            # named policy hatch
+	*"cuFile compat mode does not retry mid-IO errors"*) return 0;;  # named policy hatch
+	*"cuFile refused the topology in userspace"*) return 0;;         # P7f vacuity guard
+	*"platform whitelists cross-RC P2P"*) return 0;;                 # P7f whitelisted host bridge
+	*"no cross-RC NVMe pair"*) return 0;;                            # P7f topology gate
+	# 'no native attempt' intentionally absent -- rig anomaly, must escalate (do not add)
+	esac
+	return 1
+}
+# GPU_PRESENT is assigned only inside p0(); a p0-less rerun already sourced
+# env.sh at invocation start (enforced in main), and a run that DID include
+# p0 refreshed the file since — re-source before judging so both paths read
+# the persisted value.
+[ -e "$RESULTS/env.sh" ] && . "$RESULTS/env.sh"
+INCOMPLETE=0
+if [ "$REHEARSAL" = 0 ] && [ "${GPU_PRESENT:-0}" = 1 ]; then
+	while IFS=$'\t' read -r vph vname vst vdetail; do
+		[ "$vph" = p7 ] || continue
+		[ "$vst" = SKIP ] || continue
+		if ! p7_skip_expected "$vdetail"; then
+			INCOMPLETE=1
+			log "INCOMPLETE: unexpected P7 SKIP masks stage-1 evidence: $vname ($vdetail)"
+		fi
+	done < "$RESULTS/verdict.tsv"
+fi
 grep -q $'\tFAIL\t' "$RESULTS/verdict.tsv" && exit 1
+if [ "$INCOMPLETE" = 1 ]; then
+	log "campaign verdict: INCOMPLETE — stage-1 evidence missing without an accepted reason (exit 5)"
+	exit 5
+fi
 exit 0
