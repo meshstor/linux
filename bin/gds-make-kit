@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 #
 # gds-make-kit — assemble the scp-able campaign kit for the L40S window.
-# Builds BOTH DKMS tarballs (featured = master+p2pdma with the member-AND;
-# baseline = verbatim master with upstream's unconditional advertise) and
-# stages tools, selftests, the injector, udev rule, runbook and installer.
+# Builds THREE DKMS tarballs (gdsM = origin/meshstor-main shipping
+# composition, the featured/default install; gds1 = master + p2pdma pinned
+# @0fb37cf5, pre-fix, P7e A/B contrast only; gds0 = verbatim master
+# baseline) plus kit-manifest.tsv (per-variant srcversion identity for
+# ms_mod/raid1_ms/raid10_ms), and stages tools, selftests, the injector,
+# udev rule, runbook and installer (installs gdsM + /usr/sbin/msadm).
 #
 # Usage: gds-make-kit <version> [--skip-tarballs]
 set -eu
@@ -13,17 +16,60 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KIT="$ROOT/build/gds-kit-$VER"
 MDADM_BIN="${MDADM_BIN:-/home/${SUDO_USER:-$USER}/mdadm/mdadm}"
 
+# Variant identity pins (every SHA must be origin-reachable — §1 rule of the
+# 2026-07-03 stage-1 validation design; local rewrite leftovers don't ship).
+PIN_GDS1=0fb37cf5          # p2pdma@0fb37cf5: last pre-fix md commit (hot-add clear)
+if [ "$SKIP_TB" = --skip-tarballs ]; then
+	# The manifest must describe the tarballs ACTUALLY built earlier — never
+	# freshly recomputed refs (origin may have moved since that build). The
+	# tarball build persists its SHAs; refuse to guess without them.
+	[ -e "$ROOT/build/gds-kit-shas.env" ] \
+		|| { echo "--skip-tarballs: build/gds-kit-shas.env missing — SHAs were not persisted at tarball-build time; rerun without --skip-tarballs" >&2; exit 1; }
+	. "$ROOT/build/gds-kit-shas.env"
+else
+	git -C "$ROOT" fetch origin p2pdma meshstor-main master
+	git -C "$ROOT" merge-base --is-ancestor "$PIN_GDS1" origin/p2pdma \
+		|| { echo "gds1 pin $PIN_GDS1 is not reachable from origin/p2pdma — refusing" >&2; exit 1; }
+	GDS1_SHA=$(git -C "$ROOT" rev-parse "$PIN_GDS1")
+	GDSM_SHA=$(git -C "$ROOT" rev-parse origin/meshstor-main)
+	# gds0/gds1 base = rebuild-main's OWN torvalds mirror (build/torvalds-linux.git),
+	# NOT this repo's origin/master: rebuild-main builds from that mirror and
+	# refetches it when run without --no-fetch. Pin by building BOTH gds0 and gds1
+	# with --no-fetch and recording the mirror's actual SHA — the tree actually
+	# built. (This SHA names the mirror's build input; it is the one recorded
+	# value exempt from the §1 origin-reachability rule, which governs pins in
+	# THIS repo's history.)
+	GDS0_SHA=$(git -C "$ROOT/build/torvalds-linux.git" rev-parse master)
+	# Persist for --skip-tarballs reruns: the manifest step below reuses
+	# EXACTLY the SHAs the tarballs were built from.
+	printf 'GDS0_SHA=%s\nGDS1_SHA=%s\nGDSM_SHA=%s\n' "$GDS0_SHA" "$GDS1_SHA" "$GDSM_SHA" \
+		> "$ROOT/build/gds-kit-shas.env"
+fi
+
 if [ "$SKIP_TB" != --skip-tarballs ]; then
-	echo "== baseline tree (verbatim master) =="
-	"$ROOT/bin/rebuild-main"
+	echo "== baseline tree (verbatim master @ $GDS0_SHA) =="
+	"$ROOT/bin/rebuild-main" --no-fetch
 	KERNEL_TREE="$ROOT/build/linux-meshstor-rebuilt" "$ROOT/bin/build-tarball" "$VER.gds0"
-	echo "== featured tree (master + p2pdma) =="
-	"$ROOT/bin/rebuild-main" --no-fetch p2pdma
+	echo "== gds1 tree (master + p2pdma pinned @ $GDS1_SHA, pre-fix A/B contrast) =="
+	# Pin mechanism: a throwaway local branch at the pinned SHA; rebuild-main
+	# sources branches local-first by NAME, so this never disturbs the local
+	# p2pdma branch and never floats with its head.
+	git -C "$ROOT" branch -f gds-kit-pin-gds1 "$GDS1_SHA"
+	"$ROOT/bin/rebuild-main" --no-fetch gds-kit-pin-gds1
+	git -C "$ROOT" branch -D gds-kit-pin-gds1
 	KERNEL_TREE="$ROOT/build/linux-meshstor-rebuilt" "$ROOT/bin/build-tarball" "$VER.gds1"
+	echo "== gdsM tree (origin/meshstor-main @ $GDSM_SHA — the shipping composition) =="
+	# Composition is rebuild-meshstor-main's job; the kit consumes the pushed
+	# result as-is via a scratch worktree (no cherry-picking here).
+	GDSM_WT="$ROOT/build/gdsM-src-worktree"
+	git -C "$ROOT" worktree remove --force "$GDSM_WT" 2>/dev/null || true
+	git -C "$ROOT" worktree add --detach "$GDSM_WT" "$GDSM_SHA"
+	KERNEL_TREE="$GDSM_WT" "$ROOT/bin/build-tarball" "$VER.gdsM"
+	git -C "$ROOT" worktree remove --force "$GDSM_WT"
 	echo "== nvme-rdma P2PDMA override =="
 	"$ROOT/bin/build-nvme-tarball" "$VER"
 fi
-for t in gds0 gds1; do
+for t in gds0 gds1 gdsM; do
 	ls "$ROOT/build/meshstor-ms-$VER.$t.dkms.tar.gz" >/dev/null \
 		|| { echo "missing tarball for $t — run without --skip-tarballs" >&2; exit 1; }
 done
@@ -31,11 +77,42 @@ ls "$ROOT/build/meshstor-nvme-rdma-$VER.dkms.tar.gz" >/dev/null \
 	|| { echo "missing nvme-rdma tarball for $VER — run without --skip-tarballs" >&2; exit 1; }
 
 rm -rf "$KIT"; mkdir -p "$KIT"/{bin,tarballs,udev,docs}
-cp "$ROOT/build/meshstor-ms-$VER".gds{0,1}.dkms.tar.gz "$KIT/tarballs/"
+cp "$ROOT/build/meshstor-ms-$VER".gds{0,1,M}.dkms.tar.gz "$KIT/tarballs/"
 cp "$ROOT/build/meshstor-nvme-rdma-$VER.dkms.tar.gz" "$KIT/tarballs/"
-for b in gds-campaign ms-queue-features gds-p2p-witness probe-cufile-recognition perf-make-test-partitions; do
+for b in gds-campaign ms-queue-features gds-p2p-witness gds-kit-manifest probe-cufile-recognition perf-make-test-partitions; do
 	cp "$ROOT/bin/$b" "$KIT/bin/"
 done
+
+# kit-manifest.tsv: variant<TAB>ref+sha<TAB>tarball<TAB>srcversions.
+# build-tarball emits SOURCE only, so do a throwaway local kbuild per
+# variant against the running kernel to read the srcversions the box will
+# see after dkms install (compat patches + rename applied at tarball time
+# => on-box rebuilds are source-identical and srcversion-stable). The
+# stage-1 delta lives entirely in raid1*/raid10* sources — gds1 and gdsM
+# may legitimately share an identical ms_mod srcversion; ALWAYS record all
+# three modules so the identity gate can police the personality under test.
+manifest_row() {  # VARIANT REF TARBALL
+	local variant=$1 ref=$2 tb=$3 tmp d sv_ms sv_r1 sv_r10
+	tmp=$(mktemp -d)
+	tar xzf "$ROOT/build/$tb" -C "$tmp"
+	d=$(ls -d "$tmp"/meshstor-ms-*)
+	make -C "$d" >/dev/null
+	sv_ms=$(modinfo -F srcversion "$d/ms_mod.ko")
+	sv_r1=$(modinfo -F srcversion "$d/raid1_ms.ko")
+	sv_r10=$(modinfo -F srcversion "$d/raid10_ms.ko")
+	[ -n "$sv_ms" ] && [ -n "$sv_r1" ] && [ -n "$sv_r10" ] \
+		|| { echo "manifest: empty srcversion for $variant" >&2; exit 1; }
+	printf '%s\t%s\t%s\tms_mod=%s raid1_ms=%s raid10_ms=%s\n' \
+		"$variant" "$ref" "$tb" "$sv_ms" "$sv_r1" "$sv_r10" >> "$KIT/kit-manifest.tsv"
+	rm -rf "$tmp"
+}
+: > "$KIT/kit-manifest.tsv"
+# 'master@' in the gds0/gds1 refs = the torvalds mirror's SHA actually built
+# ($GDS0_SHA from build/torvalds-linux.git), not this repo's origin/master.
+manifest_row gds0 "master@$GDS0_SHA" "meshstor-ms-$VER.gds0.dkms.tar.gz"
+manifest_row gds1 "master@$GDS0_SHA+p2pdma@$GDS1_SHA" "meshstor-ms-$VER.gds1.dkms.tar.gz"
+manifest_row gdsM "origin/meshstor-main@$GDSM_SHA" "meshstor-ms-$VER.gdsM.dkms.tar.gz"
+echo "== kit-manifest.tsv =="; column -t -s$'\t' "$KIT/kit-manifest.tsv" || cat "$KIT/kit-manifest.tsv"
 mkdir -p "$KIT/selftests"
 cp -r "$ROOT/tools/testing/selftests/md/p2pdma" "$KIT/selftests/"
 cp -r "$ROOT/dkms/inval-inject" "$KIT/inval-inject"
@@ -46,11 +123,25 @@ else echo "WARN: patched mdadm not at $MDADM_BIN — kit ships without it (set M
 
 cat > "$KIT/install.sh" <<'EOF'
 #!/usr/bin/env bash
-# Run as root on the target box. Installs the FEATURED package and prints the
-# environment to use. Requires: dkms, kernel headers, bpftrace, nvme-cli, fio.
+# Run as root on the target box. Installs the FEATURED package (gdsM — the
+# meshstor-main shipping composition, stage-1 fail-the-write included) and
+# prints the environment to use. gds1 (pre-fix) and gds0 (upstream baseline)
+# stay in tarballs/ for the campaign's A/B phases only.
+# Requires: dkms, kernel headers, bpftrace, nvme-cli, fio.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
-TB=$(ls "$HERE"/tarballs/*gds1*.dkms.tar.gz | head -1)
+# Manifest-driven selection (fallback glob for a manifest-less kit).
+# NB set -eu is live: a failing $() inside an assignment would abort the
+# installer, so the parser call carries its own || true.
+TB=""
+if [ -e "$HERE/kit-manifest.tsv" ] && [ -x "$HERE/bin/gds-kit-manifest" ]; then
+	MTB=$("$HERE/bin/gds-kit-manifest" "$HERE/kit-manifest.tsv" gdsM tarball || true)
+	[ -n "$MTB" ] && TB="$HERE/tarballs/$MTB"
+	cp -f "$HERE/kit-manifest.tsv" "$HERE/tarballs/"   # identity travels with the tarballs
+fi
+[ -n "$TB" ] && [ -f "$TB" ] || TB=$(ls "$HERE"/tarballs/*gdsM*.dkms.tar.gz 2>/dev/null | head -1)
+[ -n "$TB" ] && [ -f "$TB" ] \
+	|| { echo "install.sh: no gdsM tarball in $HERE/tarballs" >&2; exit 1; }
 TMP=$(mktemp -d); tar xzf "$TB" -C "$TMP"
 VER=$(ls "$TMP" | sed -n 's/^meshstor-ms-//p' | head -1)
 rm -rf "/usr/src/meshstor-ms-$VER"; cp -r "$TMP/meshstor-ms-$VER" /usr/src/; rm -rf "$TMP"
@@ -108,6 +199,14 @@ rm -rf "${NTMP:-}" 2>/dev/null || true
 fi
 install -m0644 "$HERE/udev/63-ms-raid-arrays.rules" /usr/lib/udev/rules.d/
 udevadm control --reload
+# /usr/sbin/msadm: the udev rule's IMPORT{program} hard-depends on it and
+# every P7 subtest is downstream of that rule (was the standing kit gap).
+if [ -x "$HERE/bin/mdadm-ms" ]; then
+	install -m0755 "$HERE/bin/mdadm-ms" /usr/sbin/msadm
+	echo "OK: /usr/sbin/msadm installed (udev RAID classification)"
+else
+	echo "WARNING: kit has no bin/mdadm-ms — install /usr/sbin/msadm manually (cuFile classification needs it)" >&2
+fi
 grep -q 'Personalities' /proc/msstat && echo "OK: /proc/msstat live"
 cat <<ENV
 Run the campaign:

@@ -11,7 +11,8 @@ fail() { echo "FAIL: $*" >&2; FAILED=1; }
 REPO_ROOT="$(cd "$DIR/../../../../../.." && pwd)"
 for f in "$DIR/lib.sh" "$DIR"/test_*.sh \
          "$REPO_ROOT/bin/gds-campaign" "$REPO_ROOT/bin/ms-queue-features" \
-         "$REPO_ROOT/bin/gds-p2p-witness" "$REPO_ROOT/bin/gds-make-kit"; do
+         "$REPO_ROOT/bin/gds-p2p-witness" "$REPO_ROOT/bin/gds-make-kit" \
+         "$REPO_ROOT/bin/gds-kit-manifest"; do
     [ -e "$f" ] || continue          # later-task files may not exist yet
     bash -n "$f" || fail "bash -n $f"
 done
@@ -156,6 +157,21 @@ GDS_KALLSYMS="$STUB/kallsyms" gds_kallsyms_check raid1_end_write_request raid5_m
     && fail "gds_kallsyms_check: zero-in-module must fail"
 GDS_KALLSYMS="$STUB/kallsyms" gds_kallsyms_check raid_end_bio_io raid10_ms 2>/dev/null \
     && fail "gds_kallsyms_check: two-in-same-module (ambiguous) must fail"
+
+# --- gds-kit-manifest parser --------------------------------------------------
+KM="$REPO_ROOT/bin/gds-kit-manifest"
+if [ -e "$KM" ]; then
+    printf 'gds0\tmaster@abc\tmeshstor-ms-0.2.0.gds0.dkms.tar.gz\tms_mod=A raid1_ms=B raid10_ms=C\n' > "$STUB/manifest.tsv"
+    printf 'gdsM\torigin/meshstor-main@def\tmeshstor-ms-0.2.0.gdsM.dkms.tar.gz\tms_mod=D raid1_ms=E raid10_ms=F\n' >> "$STUB/manifest.tsv"
+    out=$("$KM" "$STUB/manifest.tsv" gdsM tarball)
+    [ "$out" = meshstor-ms-0.2.0.gdsM.dkms.tar.gz ] || fail "gds-kit-manifest tarball: got '$out'"
+    out=$("$KM" "$STUB/manifest.tsv" gds0 srcversions)
+    [ "$out" = "ms_mod=A raid1_ms=B raid10_ms=C" ] || fail "gds-kit-manifest srcversions: got '$out'"
+    "$KM" "$STUB/manifest.tsv" gds9 tarball >/dev/null 2>&1; rc=$?
+    [ "$rc" = 1 ] || fail "gds-kit-manifest missing variant: want rc=1, got $rc"
+    "$KM" "$STUB/manifest.tsv" gdsM bogus >/dev/null 2>&1; rc=$?
+    [ "$rc" = 2 ] || fail "gds-kit-manifest bad field: want rc=2, got $rc"
+fi
 
 [ "$FAILED" = 0 ] && echo "PASS: unit helpers" && exit 0
 exit 1

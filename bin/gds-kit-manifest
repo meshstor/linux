@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#
+# gds-kit-manifest — the ONE parser for kit-manifest.tsv, shared by the kit
+# installer and bin/gds-campaign (keep TSV knowledge in exactly one place).
+#
+# kit-manifest.tsv row: variant<TAB>ref+sha<TAB>tarball<TAB>srcversions
+#   srcversions field: "ms_mod=<sv> raid1_ms=<sv> raid10_ms=<sv>"
+#
+# Usage: gds-kit-manifest FILE VARIANT ref|tarball|srcversions
+# Exit: 0 printed, 1 variant not found, 2 usage/unreadable file.
+set -u
+F=${1:-}; V=${2:-}; FLD=${3:-}
+[ -n "$F" ] && [ -n "$V" ] && [ -n "$FLD" ] \
+	|| { echo "usage: gds-kit-manifest FILE VARIANT ref|tarball|srcversions" >&2; exit 2; }
+[ -r "$F" ] || { echo "gds-kit-manifest: cannot read $F" >&2; exit 2; }
+case "$FLD" in
+	ref) C=2;; tarball) C=3;; srcversions) C=4;;
+	*) echo "gds-kit-manifest: FIELD must be ref|tarball|srcversions" >&2; exit 2;;
+esac
+awk -F'\t' -v v="$V" -v c="$C" '$1 == v { print $c; found = 1; exit } END { exit found ? 0 : 1 }' "$F"
