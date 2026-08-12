@@ -20,14 +20,19 @@ if [ "$SKIP_TB" != --skip-tarballs ]; then
 	echo "== featured tree (master + p2pdma) =="
 	"$ROOT/bin/rebuild-main" --no-fetch p2pdma
 	KERNEL_TREE="$ROOT/build/linux-meshstor-rebuilt" "$ROOT/bin/build-tarball" "$VER.gds1"
+	echo "== nvme-rdma P2PDMA override =="
+	"$ROOT/bin/build-nvme-tarball" "$VER"
 fi
 for t in gds0 gds1; do
 	ls "$ROOT/build/meshstor-ms-$VER.$t.dkms.tar.gz" >/dev/null \
 		|| { echo "missing tarball for $t — run without --skip-tarballs" >&2; exit 1; }
 done
+ls "$ROOT/build/meshstor-nvme-rdma-$VER.dkms.tar.gz" >/dev/null \
+	|| { echo "missing nvme-rdma tarball for $VER — run without --skip-tarballs" >&2; exit 1; }
 
 rm -rf "$KIT"; mkdir -p "$KIT"/{bin,tarballs,udev,docs}
 cp "$ROOT/build/meshstor-ms-$VER".gds{0,1}.dkms.tar.gz "$KIT/tarballs/"
+cp "$ROOT/build/meshstor-nvme-rdma-$VER.dkms.tar.gz" "$KIT/tarballs/"
 for b in gds-campaign ms-queue-features gds-p2p-witness probe-cufile-recognition perf-make-test-partitions; do
 	cp "$ROOT/bin/$b" "$KIT/bin/"
 done
@@ -50,8 +55,57 @@ TMP=$(mktemp -d); tar xzf "$TB" -C "$TMP"
 VER=$(ls "$TMP" | sed -n 's/^meshstor-ms-//p' | head -1)
 rm -rf "/usr/src/meshstor-ms-$VER"; cp -r "$TMP/meshstor-ms-$VER" /usr/src/; rm -rf "$TMP"
 dkms add "meshstor-ms/$VER" || true
-dkms install "meshstor-ms/$VER"
+# same-version re-run: already-installed = success (dkms 3.x exits nonzero)
+dkms status "meshstor-ms/$VER" -k "$(uname -r)" 2>/dev/null | grep -q ': installed' \
+	|| dkms install "meshstor-ms/$VER"
 modprobe ms_mod && modprobe raid1_ms && modprobe raid10_ms
+# nvme-rdma P2PDMA override (best-effort; BUILD_EXCLUSIVE_KERNEL refuses
+# non-target kernels -- campaign then runs on the stock driver and P0
+# records that). set -eu is active: every fallible step below sits inside
+# an if-condition so NOTHING in this block can abort the installer.
+NTB=$(ls "$HERE"/tarballs/meshstor-nvme-rdma-*.dkms.tar.gz 2>/dev/null | head -1)
+if [ -n "$NTB" ]; then
+if NTMP=$(mktemp -d) && tar xzf "$NTB" -C "$NTMP" \
+   && NVER=$(ls "$NTMP" | sed -n 's/^meshstor-nvme-rdma-//p' | head -1) \
+   && [ -n "$NVER" ] \
+   && rm -rf "/usr/src/meshstor-nvme-rdma-$NVER" \
+   && cp -r "$NTMP/meshstor-nvme-rdma-$NVER" /usr/src/; then
+	dkms add "meshstor-nvme-rdma/$NVER" >/dev/null 2>&1 || true
+	# dkms 3.x exits nonzero ("already installed") on a re-run of the
+	# same module/version/kernel tuple -- and the runbook says to re-run
+	# install.sh. Treat already-installed as success. NB: re-shipping
+	# CHANGED override source under the same version keeps the old
+	# build -- bump the package version instead.
+	if dkms status "meshstor-nvme-rdma/$NVER" -k "$(uname -r)" 2>/dev/null | grep -q ': installed' \
+	   || dkms install "meshstor-nvme-rdma/$NVER"; then
+		# reload so the override takes effect if the stock module was
+		# already loaded; -r fails if a fabric is connected
+		modprobe -r nvme_rdma 2>/dev/null || true
+		modprobe nvme_rdma 2>/dev/null || true
+		# "active" must mean LOADED (depmod already prefers /updates
+		# right after dkms install, so modinfo alone would lie).
+		# initstate = loadedness; srcversion equality = build identity.
+		ondisk=$(modinfo -F srcversion nvme_rdma 2>/dev/null || true)
+		loaded=$(cat /sys/module/nvme_rdma/srcversion 2>/dev/null || true)
+		if [ ! -e /sys/module/nvme_rdma/initstate ] \
+		   && modinfo -F filename nvme_rdma 2>/dev/null | grep -q /updates/; then
+			echo "OK: nvme-rdma override installed (not loaded yet; next modprobe loads it)"
+		elif [ "$loaded" = "$ondisk" ] \
+		   && modinfo -F filename nvme_rdma 2>/dev/null | grep -q /updates/; then
+			echo "OK: nvme-rdma P2PDMA override active (loaded)"
+		else
+			echo "WARNING: override installed but a DIFFERENT nvme-rdma build is still loaded" >&2
+			echo "         (stock, or an older override; reload blocked by an active fabric?)" >&2
+			echo "         disconnect, then: modprobe -r nvme_rdma && modprobe nvme_rdma" >&2
+		fi
+	else
+		echo "WARNING: nvme-rdma override build refused/failed (kernel outside target families?) -- campaign runs with STOCK nvme-rdma (no P2P on rdma legs)" >&2
+	fi
+else
+	echo "WARNING: nvme-rdma tarball unpack failed -- skipping override; campaign runs with STOCK nvme-rdma" >&2
+fi
+rm -rf "${NTMP:-}" 2>/dev/null || true
+fi
 install -m0644 "$HERE/udev/63-ms-raid-arrays.rules" /usr/lib/udev/rules.d/
 udevadm control --reload
 grep -q 'Personalities' /proc/msstat && echo "OK: /proc/msstat live"
