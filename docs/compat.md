@@ -43,6 +43,7 @@ for the rationale.
 | `badblocks_check()` argument types | ~6.11 (sector_t outputs) | Pre-6.11 used `int *bad_sectors`; we wrap to `sector_t *` | `HAVE_BADBLOCKS_CHECK_SECTOR_T_OUTPUTS` | 262-284 |
 | `alloc_page_buffers()` argument count | ~6.11 (2-arg) | Pre-6.11 took `(page, size, retry)`; wrap to add the third arg | `HAVE_ALLOC_PAGE_BUFFERS_2ARG` | 286-302 |
 | `bh_submit()`, `bio_endio_bh()` | ~7.2 | buffer_head bio submit/complete helpers md-bitmap.c uses; ports them for pre-7.2 kernels (`guard_bio_eod` dropped — not module-exported) | `HAVE_BH_SUBMIT` | 537-605 |
+| `BLK_STS_P2PDMA` | 7.2 (upstream P2PDMA completion-handling series) | Block-status value for an unroutable PCI peer-to-peer transfer. Every shipped kernel predates it, but the P2PDMA completion patch (`dkms/patches/0012`) references the constant in ordinary C, so it must be defined regardless; on kernels lacking it, that patch also synthesizes the status (translating `BLK_STS_INVAL`/`BLK_STS_TARGET` on a P2P-tagged completion), since the native value can't otherwise be observed | `HAVE_BLK_STS_P2PDMA` | 621-646 |
 
 ### Source-level patches (in `dkms/patches/`)
 

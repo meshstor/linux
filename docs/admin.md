@@ -169,6 +169,110 @@ cat /sys/block/ms0/ms/bitmap_type
 
 The legacy term "bitmap" in this output refers to the internal bitmap.
 
+## P2PDMA (GPUDirect Storage) advertise policy and status
+
+`ms` arrays can advertise PCI peer-to-peer DMA capability
+(`BLK_FEAT_PCI_P2PDMA`) so GPU-resident I/O (e.g. NVIDIA GPUDirect Storage)
+can DMA directly to/from member NVMe devices, bypassing the CPU bounce
+buffer. Whether the array advertises is controlled by one module parameter
+and reported by one read-only sysfs attribute.
+
+### `ms_mod.p2pdma_advertise`
+
+A module parameter on `ms_mod`, read/write at
+`/sys/module/ms_mod/parameters/p2pdma_advertise`:
+
+| Value | Behavior |
+|---|---|
+| `auto` (default) | Advertise P2PDMA only when **every** non-faulty member's own queue advertises it. `ms` is a pure router that never touches the pages itself — each member's driver does the actual DMA mapping — so a member that cannot map P2P pages must never be handed P2P I/O. |
+| `always` | Force the advertisement on regardless of member capability. Escape hatch for a topology where a P2P-capable path is hidden behind a non-advertising gendisk — see "RHEL 10 / nvme-rdma" below. |
+| `never` | Force the advertisement off. |
+
+Set at load time (`modprobe ms_mod p2pdma_advertise=always`) or at runtime
+(`echo always > /sys/module/ms_mod/parameters/p2pdma_advertise`); a running
+array re-evaluates its advertisement on the next member add/remove event, not
+instantaneously on the parameter write.
+
+**`always` is host-wide, not per-array.** It applies to *every* `ms` array on
+the machine — including one whose member is genuinely not P2P-capable. On
+that array, forcing the advertisement on does not create working P2P; a P2P
+write to the non-capable member fails and starts recording badblocks against
+it (see "What actually happens on an unroutable member" below), and once its
+badblock table is exhausted (~512 entries) that member is faulted and the
+array degrades. `always` is a deliberate, informed choice for a host where
+every `ms` array's members are known-P2P-capable (e.g. all-local-NVMe, or
+verified-advertising rdma legs) — not a default to reach for blindly. Use
+`p2pdma_status` (below) per array before setting it host-wide.
+
+### `/sys/block/msN/ms/p2pdma_status`
+
+Read-only, per-array. One leading array-level line, then one line per
+member:
+
+```
+$ cat /sys/block/ms0/ms/p2pdma_status
+array advertise=yes policy=auto
+nvme1n1 advertise=yes observed=ok
+nvme2n1 advertise=yes observed=ok
+```
+
+- The array line's `advertise=` is the array's own gendisk queue feature bit
+  (the same bit GPUDirect Storage/`ITER_ALLOW_P2PDMA` consults) — not a
+  re-derivation of policy. `policy=` echoes the active `p2pdma_advertise`
+  value.
+- Each member line's `advertise=` is that member's own queue capability
+  (what feeds the `auto` policy's member-AND). `observed=` is a latch on the
+  first completion status seen for that member: `none` (no P2P I/O
+  completed yet), `ok`, `p2pdma` (a real or translated P2P-unroutable
+  completion), or `other` (any other error). The latch resets on array
+  stop/start and on member add/remove.
+- Purely observational — reading it never gates, refuses, or alters I/O.
+  Use it to tell apart "never advertised for this member" from "advertised,
+  and P2P writes are being fenced" — both otherwise look identical from the
+  GPU application's side (a silent bounce-buffer fallback).
+
+### What actually happens on an unroutable member
+
+If a member cannot route a P2P transfer, the completion is **not** treated
+as a device error the way an ordinary I/O error is:
+
+- The failing range is recorded as a **bad block** on that member
+  (`rdev_set_badblocks()`).
+- The member is **not** faulted and **`WantReplacement` is not set** — an
+  unroutable P2P path is a property of the PCIe topology, not of member
+  health, so it must not trigger replacement/rebuild.
+- The **master write still succeeds**, served off the surviving mirror
+  leg(s). The application sees no error.
+
+This only holds up to roughly 512 badblock entries per member. Past that,
+`rdev_set_badblocks()` itself faults the member and the array degrades —
+loud in `dmesg` and `/proc/msstat` (member marked faulty, personality line
+shows the reduced `[U_]`/`[_U]` state), but silent to the application, which
+never saw a failed write. A member that is genuinely, persistently
+unreachable for P2P (as opposed to one transient miss) will hit this
+exhaustion path on sustained P2P traffic and get ejected — this is the
+mechanism `p2pdma_advertise=always` rides when forced onto an array with a
+non-P2P member (see above).
+
+### RHEL 10 / nvme-rdma: `p2pdma_advertise=always` is the only remedy
+
+An nvme-rdma namespace on RHEL 10 always gets a multipath head (`nvme_core`
+there is built `CONFIG_NVME_MULTIPATH=y` with the runtime `multipath`
+parameter removed, so there is no `nvme_core.multipath=N` boot option to fall
+back to), and `BLK_FEAT_PCI_P2PDMA` never propagates onto the head gendisk
+even though the hidden path device carries it. Under the default `auto`
+policy an array with such a member correctly refuses to advertise. On RHEL
+10, `p2pdma_advertise=always` is the *only* way to get GDS-native onto an
+rdma leg — there is no boot-parameter alternative. On Ubuntu there are two
+remedies: boot `nvme_core.multipath=N`, or set `p2pdma_advertise=always`.
+
+One related cosmetic note: the patched nvme-rdma driver's multipath I/O
+accounting is skipped for statuses returned directly from `queue_rq` (an
+upstream nvme-multipath quirk, not introduced by this package), so operators
+running an rdma leg behind a RHEL 10 multipath head will see multipath
+accounting oddities for every unroutable P2P I/O. Cosmetic only — it does not
+affect the badblock/degrade behavior above.
+
 ## raid1 ↔ raid10 takeover
 
 The takeover converts a 2-disk raid1 mirror into a 4-disk raid10 array
