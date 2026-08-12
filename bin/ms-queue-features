@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# ms-queue-features — does a block device's request_queue advertise
+# BLK_FEAT_PCI_P2PDMA?  No sysfs exposes queue_limits.features, so read it
+# kernel-side: a one-shot bpftrace probe on the generic submit path, fired by a
+# tiny O_DIRECT read we trigger ourselves.  BTF-only (no vmlinux/DWARF).
+#
+# Usage:  ms-queue-features /dev/DEV [-q]
+# Exit:   0 advertised, 1 not advertised, 2 usage, 4 cannot probe (skip)
+set -u
+DEV=${1:-}
+[ -n "$DEV" ] || { echo "usage: ms-queue-features /dev/DEV [-q]" >&2; exit 2; }
+QUIET=${2:-}
+[ -b "$DEV" ] || { echo "not a block device: $DEV" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "SKIP: root required" >&2; exit 4; }
+command -v bpftrace >/dev/null 2>&1 || { echo "SKIP: bpftrace not installed" >&2; exit 4; }
+
+# The queue belongs to the gendisk: resolve partition -> whole disk.
+KN=$(lsblk -no PKNAME "$DEV" 2>/dev/null | head -1)
+[ -n "$KN" ] || KN=$(lsblk -no KNAME "$DEV" 2>/dev/null | head -1)
+[ -n "$KN" ] || { echo "SKIP: cannot resolve kernel name for $DEV" >&2; exit 4; }
+
+# Bit position: parse the running kernel's headers; fallback 12 (6.11..6.17).
+KDIR=${KDIR:-/lib/modules/$(uname -r)/build}
+BIT=$(grep -h 'define BLK_FEAT_PCI_P2PDMA' "$KDIR/include/linux/blkdev.h" 2>/dev/null \
+	| grep -o 'BIT([0-9]*)' | grep -o '[0-9]*' | head -1 || true)
+BIT=${BIT:-12}
+
+FF=/sys/kernel/tracing/available_filter_functions
+PROBE=""
+for f in submit_bio submit_bio_noacct submit_bio_noacct_nocheck; do
+	grep -q "^$f\b" "$FF" 2>/dev/null && { PROBE=$f; break; }
+done
+[ -n "$PROBE" ] || { echo "SKIP: no submit-path probe point in $FF" >&2; exit 4; }
+
+OUT=$(mktemp)
+cleanup() { kill "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null; rm -f "$OUT"; }
+bpftrace -e '
+kprobe:'"$PROBE"' {
+	$b = (struct bio *)arg0;
+	if (strncmp($b->bi_bdev->bd_disk->disk_name, str($1), 31) == 0) {
+		printf("features=0x%x\n", $b->bi_bdev->bd_disk->queue->limits.features);
+		exit();
+	}
+}' "$KN" > "$OUT" 2>/dev/null &
+BPID=$!
+trap cleanup EXIT
+for _ in $(seq 40); do grep -q Attaching "$OUT" 2>/dev/null && break; sleep 0.25; done
+grep -q Attaching "$OUT" || { echo "SKIP: bpftrace failed to attach" >&2; exit 4; }
+timeout 10 dd if="$DEV" of=/dev/null bs=4096 count=1 iflag=direct status=none 2>/dev/null || true
+for _ in $(seq 40); do grep -q features= "$OUT" && break; sleep 0.25; done
+
+VAL=$(grep -o 'features=0x[0-9a-f]*' "$OUT" | head -1 | cut -d= -f2)
+[ -n "$VAL" ] || { echo "SKIP: probe never fired for $KN (device suspended?)" >&2; exit 4; }
+if [ $(( VAL >> BIT & 1 )) -eq 1 ]; then
+	[ "$QUIET" = -q ] || echo "$DEV: BLK_FEAT_PCI_P2PDMA advertised (features=$VAL bit=$BIT)"
+	exit 0
+else
+	[ "$QUIET" = -q ] || echo "$DEV: NOT advertised (features=$VAL bit=$BIT)"
+	exit 1
+fi
