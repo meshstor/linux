@@ -97,7 +97,7 @@ run_leg_fail() {  # NAME TARGET_DEV
 	injected=$(gds_injector_injected); remaining=$(gds_injector_remaining)
 	gds_injector_disarm    # BINDING: disarm before ANY convergence check
 	[ "$injected" -ge 1 ] || { gds_verdict p7 "p7h_${name}_kernel" FAIL "injected=0"; echo "FAIL: [$name] injector never fired" >&2; exit 1; }
-	[ "$remaining" -eq 0 ] || { gds_verdict p7 "p7h_${name}_kernel" FAIL "remaining=$remaining"; echo "FAIL: [$name] budget not consumed" >&2; exit 1; }
+	[ "$remaining" -le 0 ] || { gds_verdict p7 "p7h_${name}_kernel" FAIL "remaining=$remaining"; echo "FAIL: [$name] budget not all spent (<=0: all spent or over — injector counter is racy under 4-worker completion)" >&2; exit 1; }
 	awk '/^ms0 :/{print;getline;print}' /proc/msstat | grep -q '\[UU\]' \
 		|| { gds_verdict p7 "p7h_${name}_kernel" FAIL "a leg was faulted"; echo "FAIL: [$name] arm must fault nothing" >&2; exit 1; }
 	gds_assert_no_badblocks /dev/ms0 \
