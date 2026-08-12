@@ -186,6 +186,16 @@ column -t -s $'\t' /root/gds-results/verdict.tsv 2>/dev/null || cat /root/gds-re
 # evidence is missing without an accepted reason)
 ```
 
+**Forcing the transport:** the campaign auto-detects (`rdma`→`rxe`→`tcp`) and,
+with an mlx5 HCA present-but-**link-down**, picks `rdma` and then SKIPs the
+fabric phases "no RDMA-capable address". To force a substrate pass
+`--transport tcp|rxe|rdma` on the campaign CLI — the `GDS_TRANSPORT` env var is
+honored only by the **standalone** `test_*.sh` scripts, **not** by
+`gds-campaign` (its `--transport` beats any env). e.g. to exercise the rdma
+path on a down-ported box, create a soft-RoCE device
+(`sudo rdma link add rxe0 type rxe netdev <up-iface>`) and run
+`--transport rxe`.
+
 The campaign continues past failures; it stops only on a node-heartbeat wedge
 (exit 3). Read `verdict.tsv`, not just the exit code. Two **expected** oddities:
 
@@ -469,19 +479,64 @@ their members — the smoke and P6 were instead funneled through a free-member
 guard (`nvme1n1p1` + `nvme2n1p1`, both off the md0 disk). md0 verified
 `[UU]` before and after every step.
 
+**2026-07-07 (L40S gpu-cluster-manassas, 6.17.0-35, cuFile 1.15.1 / GDS
+1.15.1.6, nvidia 595.71.05).** Full GPU-path campaign reproduced green after
+one tooling fix: the witness grepped only stderr for bpftrace's `Attaching…`
+banner, but bpftrace 0.20.2 emits it on **stdout**, so every GPU-witnessed
+phase falsely SKIPped "witness could not attach" (fixed on `gds-campaign`:
+grep both streams). Post-fix: P1 native PASS (control map=0 / native map>0),
+**P2 headline p2p_bios=520 legs identical**, P7a/P7b/P7c_kernel/**P7d raid10
+`[UUUU]`**/P7e A/B all PASS; P4a/P4b/P6-narrowness PASS; P5 baseline
+false-advertise PASS. Then **rebooted with `nvme_core.multipath=N`** and, with
+the mlx5 ports still uncabled (link-DOWN), created a soft-RoCE device
+(`rdma link add rxe0 type rxe netdev bond0`) and ran the rdma gates: **P4c
+rdma_gate PASS "override+virt-DMA: refusal is correct (ib_uses_virt_dma)"** —
+the first reading with BOTH removable maskers gone (multipath head split +
+missing override), isolating the residual non-advertisement to the by-design
+virt-DMA refusal and closing the 2026-07-03 two-masker root-cause. P3 raid1 +
+raid10 fabric (rdma/rxe) PASS (advertise_consistency `array=0==AND`, Finding E
+`local=1 remote=0`, compat-fallback clean, legs consistent); nvme-rdma override
+confirmed as the running module during the rdma connect (srcversion match).
+Still gated on cabling: P7g/h native both-legs and P4c **positive** member-AND
+(rxe is virt-DMA, UNREPRESENTATIVE for the native data path). Standing product
+escalation refined: `p7c_userspace` is **not** a 1.15 artifact — the mid-IO
+(execution-time) compat non-retry is an open NVIDIA Known Issue through cuFile
+**r1.18** (briefing §4.6a 4th finding); only stage-2 self-heal closes it
+in-house.
+
 ## Post-cabling procedure — the gated P7g/P7h window (first actions when the RoCE ports go live)
 
 1. `sudo rdma link delete rxe0` — the stale soft-RoCE device P0
    auto-created would otherwise skew substrate classification and
    address selection toward virt-DMA.
-2. Boot with `nvme_core.multipath=N` (kernel cmdline, or
-   `options nvme_core multipath=N` in modprobe.d + initramfs regen +
-   reboot) — P0 captures the value; P7g/h SKIP with "boot
-   nvme_core.multipath=N and rerun" until this is done. Pre-window
-   planning item — not discoverable mid-window. NB device naming
-   changes (no head node).
+2. Boot with `nvme_core.multipath=N`. **Verified recipe (2026-07-07,
+   nvme_core is a module loaded from initramfs for a root-on-md box) —
+   set it in BOTH places so it can't be missed, then confirm before reboot:**
+   ```bash
+   echo 'options nvme_core multipath=N' | sudo tee /etc/modprobe.d/nvme-multipath.conf
+   sudo sed -i 's/^\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 nvme_core.multipath=N"/' /etc/default/grub
+   sudo update-initramfs -u && sudo update-grub
+   # verify BEFORE rebooting (both must hit):
+   sudo lsinitramfs /boot/initrd.img-$(uname -r) | grep modprobe.d/nvme-multipath
+   sudo grep -c "vmlinuz-$(uname -r).*nvme_core.multipath=N" /boot/grub/grub.cfg   # want >=1
+   # after reboot: cat /sys/module/nvme_core/parameters/multipath  -> N
+   ```
+   P0 captures the value; P7g/h SKIP with "boot nvme_core.multipath=N and
+   rerun" until this is done. Pre-window planning item — not discoverable
+   mid-window. NB device naming changes (no head node), and the regkey
+   `p2pmem` is lazy — run `gdscheck -p` once after reboot to re-create it.
+   **Post-reboot rig hazard (auto-handled since 2026-07-07):** a reboot
+   incrementally assembles leftover superblocks on the *test* partitions into
+   stray inactive `/dev/mdN`, which renumbers the real root array (e.g.
+   `md0`→`md127`, alarming but harmless) and holds the partitions EBUSY. P0
+   now reaps any md array whose members are all `*-meshstor-test-*` and
+   zero-superblocks them; if running phases standalone, do it by hand first
+   (`mdadm --stop /dev/mdN` for the strays, then `mdadm --zero-superblock`
+   each test partition — confirm root/boot stay on their nvme0/1 arrays).
 3. Re-run `sudo ./install.sh` if the kit was refreshed (version bump
-   required if override source changed).
+   required if override source changed). Modules are not auto-`modprobe`d on
+   boot — `modprobe ms_mod raid1_ms raid10_ms` (or rerun install.sh) and
+   confirm `grep Personalities /proc/msstat`.
 4. Run the p4 rdma gate, then `--phases p0,p7`: P7g asserts a witnessed
    NATIVE write over [local, rdma] legs with both legs verified through
    the nvmet backing device, and P7h asserts the CPU/kernel bounce retry

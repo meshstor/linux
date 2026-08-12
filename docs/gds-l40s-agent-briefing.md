@@ -312,7 +312,7 @@ gdsio.
 | `test_divergence_inval.sh` | P6 | **Narrowness proof**: injected non-P2P INVAL keeps upstream swallow semantics (rc=0, `[UU]`, leg stale) AND the stage-1 arm does not fire (no breadcrumb); IOERR control correctly faults the leg. |
 | `test_injector_smoke.sh` | — | GPU-free: module-qualified resolver fires with in-tree raid1 co-loaded; `p2p_only=1` filters plain writes to injected=0; bare-symbol refuse rule. |
 | `test_p7a_inval_arm.sh` / `test_p7b_target_arm.sh` | P7a/b | Stage-1 arm on real GPU I/O (INVAL / TARGET era keying): witnessed native write FAILS loud, `[UU]`, badblocks empty, breadcrumb, injected≥1 @ remaining=1. |
-| `test_p7c_compat_convergence.sh` | P7c | Production posture (`allow_compat_mode: true`): kernel side must PASS; userspace bounce-retry pair may SKIP "cuFile compat mode does not retry mid-IO errors". |
+| `test_p7c_compat_convergence.sh` | P7c | Production posture (`allow_compat_mode: true`): kernel side must PASS; userspace bounce-retry pair may SKIP "cuFile compat mode does not retry mid-IO errors" (NVIDIA-acknowledged Known Issue through cuFile r1.18 — see §4.6a 4th finding). |
 | `test_p7d_raid10_arm.sh` | P7d | P7a on CSI raid10 via `raid10_ms:raid10_end_write_request`; SKIP "fewer than 4 test partitions". |
 | `test_p7e_ab_contrast.sh` | P7e | A/B on gds1 (orchestrator swaps/restores): injected≥1 + witnessed P2P + rc=0 + NO breadcrumb, manifest-guarded. |
 | `test_p7g_rdma_native.sh` / `test_p7h_rdma_leg_fail.sh` | P7g/h | Gated native RDMA both-legs / any-leg-fails-retries; SKIPs name the exact gate (transport, multipath=N boot, advertise, cuFile rdma policy). |
@@ -379,6 +379,23 @@ Log-shape note: cuFile 1.15 writes `cufile_<pid>_<date>.log` (ignores the config
 tail) and its per-I/O native marker is `p2p mode: 1 compat: 0` at TRACE — the probe was fixed
 live to parse both (commit on `gds-campaign`).
 
+**4th cuFile finding (2026-07-07) — the compat-retry asymmetry P7c hits is NVIDIA-documented
+through the LATEST release, not a 1.15 artifact.** P7c's userspace half presumes that when the
+kernel fails a native P2P write mid-flight (`BLK_STS_INVAL`/EINVAL), cuFile catches it and
+retries via CPU bounce so the app write still succeeds. It does not — gdsio returns rc≠0 and the
+legs are not converged (the `p7c_userspace SKIP`). This is **not specific to cuFile 1.15**:
+NVIDIA's GPUDirect Storage Release Notes list it as an **open Known Issue through r1.18** (the
+current release as of this writing) — *"only I/Os that fail with -EOPNOTSUPP at submission time
+are retried via the compat path by libcufile. I/Os that fail with this error during execution
+time are not retried via the compat path."* Same architecture (submission-time-only compat
+retry); the wording names GPFS/`-EOPNOTSUPP`, but the mechanism — libcufile never retries an I/O
+that already failed mid-transfer — is general and unchanged across 1.15→1.18. So `p7c_userspace
+SKIP` is **version-durable and vendor-acknowledged**: the meshstor stage-1 arm + array are
+correct (`p7c_kernel` PASS), and the missing piece is a cuFile capability NVIDIA itself lists as
+unfixed in the latest release. Upgrading cuFile does not change this; the only in-house path to a
+transparent-convergence PASS is the deferred **stage-2 self-heal** (in-driver CPU bounce), not a
+tooling tweak. Ref: `docs.nvidia.com/gpudirect-storage/release-notes` (r1.18 Known Issues).
+
 ---
 
 ## 5. Phase plan and the EXPECTED RESULTS MATRIX
@@ -399,7 +416,7 @@ faults) — but all run in the **single default invocation** (`--phases` default
 | **P5** | `bin/gds-campaign --phases p5 --kit <dir>` | baseline swap: tcp-leg array **falsely** advertises (baseline has no member-AND) = expected finding; restore featured PASS | needs `--kit`; else SKIP |
 | **P6** | `sudo bash …/test_divergence_inval.sh` | PASS: `non-P2P INVAL swallowed (narrowness proof) -- rc=0, [UU], leg1 stale, no breadcrumb (injected=N)` | PASS (loop substrate ok, GPU-independent; runs even with in-tree raid1 loaded) |
 | **P7a/b** | `--phases p0,p7` (campaign manages the spoof) | PASS: `stage-1 INVAL arm on raid1 (injected=N, write failed loud, no fault, no badblocks, breadcrumb)` (b: TARGET) | SKIP rc=4 (gdsio absent) — INCOMPLETE on a GPU box |
-| **P7c** | (same invocation) | kernel rows PASS; userspace PASS `compat convergence` or SKIP `cuFile compat mode does not retry mid-IO errors` (escalate to product) | SKIP |
+| **P7c** | (same invocation) | kernel rows PASS; userspace PASS `compat convergence` or SKIP `cuFile compat mode does not retry mid-IO errors` (escalate to product — NVIDIA Known Issue thru r1.18, §4.6a) | SKIP |
 | **P7d** | (same invocation) | PASS raid10 parity, or SKIP `fewer than 4 test partitions` | SKIP |
 | **P7e** | (same invocation, kit required) | PASS: `gds1 A/B contrast — old silent swallow reproduced (injected=N, rc=0, no breadcrumb)`; `p7 restore PASS` after | SKIP (no kit) — INCOMPLETE on a GPU box |
 | **P7g/h** | (same invocation) | cabled RoCE + override + multipath=N: PASS native both-legs / fail-leg retries; else SKIP naming the exact gate | SKIP |

@@ -8,8 +8,20 @@ GDS_DIR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$GDS_DIR_SELF/../lib.sh"
 
 GDS_RESULTS="${GDS_RESULTS:-/tmp/gds-results.$$}"
-# repo layout: gds/ is 6 levels below the root; kit layout overrides GDS_BIN.
-GDS_BIN="${GDS_BIN:-$(cd "$GDS_DIR_SELF/../../../../../.." && pwd)/bin}"
+# Locate the tools bin/. Repo layout has gds/ 6 levels below the root; the kit
+# layout is shallower (kit/selftests/p2pdma/gds/), so a fixed 6-up overshoots to
+# "//bin" and gds_tool can't find the witness on a STANDALONE kit run (the
+# campaign exports GDS_BIN explicitly, so it was masked there). Walk upward for
+# the bin/ that actually holds the witness so both layouts work; fall back to the
+# repo 6-up if nothing is found (gds_tool then tries PATH).
+if [ -z "${GDS_BIN:-}" ]; then
+	_gds_d=$GDS_DIR_SELF
+	for _ in 1 2 3 4 5 6 7; do
+		_gds_d=$(cd "$_gds_d/.." && pwd)
+		[ -x "$_gds_d/bin/gds-p2p-witness" ] && { GDS_BIN=$_gds_d/bin; break; }
+	done
+	GDS_BIN="${GDS_BIN:-$(cd "$GDS_DIR_SELF/../../../../../.." && pwd)/bin}"
+fi
 GDSIO="${GDSIO:-$(command -v gdsio || echo /usr/local/cuda/gds/tools/gdsio)}"
 GDSCHECK="${GDSCHECK:-$(command -v gdscheck || echo /usr/local/cuda/gds/tools/gdscheck)}"
 GDS_XFS_OPTS="noatime,nodiratime,logbufs=8,logbsize=256k,inode64,noquota"

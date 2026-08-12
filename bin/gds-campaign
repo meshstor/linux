@@ -227,6 +227,28 @@ p0() {
 	fi
 	local parts; parts=$(ls /dev/disk/by-partlabel/*-meshstor-test-* 2>/dev/null | head -4 | tr '\n' ' ')
 	verd $p partitions INFO "${parts:-none}"
+	# Rig-safety: a reboot BETWEEN runs incrementally assembles leftover
+	# superblocks on the test partitions into stray inactive /dev/mdN, which
+	# renumbers the real root array (md0 -> md127, alarming) and holds the
+	# partitions EBUSY so array-create fails. Reap any md array whose members are
+	# ALL *-meshstor-test-* partitions (never an active/root array — those carry
+	# non-test members), then zero the superblocks so assembly can't re-grab them.
+	local _tset _md _mdn _mem _m _allts
+	_tset=" $(for _l in /dev/disk/by-partlabel/*-meshstor-test-*; do [ -e "$_l" ] && basename "$(readlink -f "$_l")"; done 2>/dev/null | tr '\n' ' ') "
+	for _md in /sys/block/md*; do
+		[ -e "$_md/md/array_state" ] || continue
+		_mem=$(ls "$_md/md" 2>/dev/null | sed -n 's/^dev-//p')
+		[ -n "$_mem" ] || continue
+		_allts=1
+		for _m in $_mem; do case "$_tset" in *" $_m "*) : ;; *) _allts=0 ;; esac; done
+		[ "$_allts" = 1 ] || continue
+		_mdn=$(basename "$_md")
+		log "P0: reaping stray test-partition array /dev/$_mdn (members: $_mem)"
+		"$MDADM" --stop "/dev/$_mdn" 2>/dev/null || mdadm --stop "/dev/$_mdn" 2>/dev/null || true
+	done
+	for _l in /dev/disk/by-partlabel/*-meshstor-test-*; do
+		[ -e "$_l" ] && { "$MDADM" --zero-superblock "$_l" 2>/dev/null || true; }
+	done
 	HB_DEV=$(echo "$parts" | awk '{print $1}')
 	echo "TRANSPORT=$TRANSPORT" > "$RESULTS/env.sh"
 	echo "HB_DEV=${HB_DEV:-}" >> "$RESULTS/env.sh"
