@@ -16,6 +16,17 @@ sudo bin/gds-campaign --rehearsal --kit build/gds-kit-0.2.0   # P0-P6 green; P7a
 scp build/gds-kit-0.2.0.tar.gz l40s:/opt/
 ```
 
+**Build the kit on a box running the SAME kernel as the L40S target.** The kit
+ships DKMS source tarballs and records per-variant `raid1_ms`/`raid10_ms`
+srcversions in `kit-manifest.tsv`, computed on the build box. Those srcversions
+fold in the build-time `feature_flags.h` — the `HAVE_*` capability probe that
+runs against the build box's headers. On the target, DKMS rebuilds each variant
+against the *target's* running kernel, so any kernel — or `HAVE_*` — delta shifts
+the target's loaded srcversions away from the manifest, and the P0
+`ms_module_identity` gate fails identity and FAILGATEs the whole run before a
+single GPU I/O. **Pre-flight:** confirm `uname -r` matches on both boxes (e.g.
+both `6.17.0-35`) before `gds-make-kit`.
+
 If `bin/gds-make-kit` wedges during its internal `rebuild-main` (`git am`) on a
 build box with `commit.gpgsign=true` and an unreachable ssh/gpg signing key,
 disable signing for the build — `git config commit.gpgsign false` (or export
