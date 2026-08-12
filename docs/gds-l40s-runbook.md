@@ -278,10 +278,13 @@ the gds1 swap and the restore, the box is on the PRE-FIX module: run
 P7a FAIL with rc=0 ⇒ the arm did not fire ⇒ check the variant:
 `cat /sys/module/raid1_ms/srcversion` vs the gdsM manifest row.
 
-P7c FAIL on its kernel row with "no native attempt witnessed" ⇒ lenient-mode
-cuFile may skip the native path entirely — treat it as the cuFile-policy
-hatch: record, SKIP-equivalent, escalate to product; do not chase a kernel
-bug.
+P7c `p7c_kernel` **SKIP** "cuFile compat mode does not retry mid-IO errors" ⇒
+lenient-mode cuFile skipped the native path entirely (witness p2p_bios==0 with
+a clean kernel delta — no breadcrumb, no I/O error). This is the cuFile-policy
+hatch, not a kernel bug: it is a whitelisted SKIP (does not escalate to
+INCOMPLETE), banked as a product escalation. Do not chase a kernel bug. (A
+broken arm that *did* attempt native still fails the breadcrumb assertion in
+the p2p_bios>0 path → a real FAIL, so this SKIP cannot mask a kernel defect.)
 
 ## Step 6 (OPTIONAL, crash-riskiest — only after all evidence above is off-box): strict GDS write against the falsely-advertising BASELINE array
 
