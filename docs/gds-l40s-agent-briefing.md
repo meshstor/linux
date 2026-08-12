@@ -15,13 +15,34 @@ importantly — **which failures you may fix and which you must never paper over
 
 ## 0. TL;DR — what you're proving and the one-line goal
 
-The meshstor `ms_*` RAID driver (a renamed fork of Linux MD) has a 4-commit **P2PDMA feature**
+The meshstor `ms_*` RAID driver (a renamed fork of Linux MD) has a **P2PDMA feature**
 that lets NVMe SSDs DMA **directly to/from L40S GPU memory** (GPUDirect Storage, "GDS native"),
 bypassing CPU bounce buffers — across a topology of **local NVMe legs + remote NVMe-over-Fabrics
 legs** (the MeshStor-CSI production shape). Your job: **prove GDS-native actually works through an
-`ms` raid1/raid10 array, prove the per-member safety gating is correct, and prove the stage-1
-fail-the-write integrity fix** (P6 = its narrowness, P7 = the arm on real GPU I/O) — all with
+`ms` raid1/raid10 array, prove the per-member safety gating is correct, and prove the v6
+P2PDMA completion-handling behavior** (P6 = its narrowness, P7 = the arm on real GPU I/O) — all with
 kernel-level evidence, not just cuFile's self-reporting.
+
+> **2026-07-29 rework, read this before anything below.** The `p2pdma` branch was rebuilt on
+> upstream's own v6 P2PDMA completion-handling series (upstreamed `md_bio_is_p2pdma()` +
+> `raid1_write_error()` + the R1BIO_P2PDMA/R10BIO_P2PDMA tag), with meshstor's per-member
+> advertise gate, the `p2pdma_advertise=auto|always|never` policy knob, and the
+> `p2pdma_status` diagnostics report layered on top (see `docs/admin.md`). **The old "stage-1
+> fail-the-write" design this document was originally written against is GONE.** The new
+> behavior: a P2P-tagged completion that cannot route is recorded as a **bad block**, the
+> member is **not** faulted, **`WantReplacement` is not set**, and the **master write
+> succeeds** off the surviving leg — the opposite of the old fail-loud design. Only past
+> ~512 badblock entries does the member get faulted and the array degrade (loud in
+> dmesg/`/proc/msstat`, silent to the application). This section-by-section pass updates the
+> normative descriptions (what the feature does, what each phase proves); it does **not**
+> rewrite the P6/P7 selftests under `tools/testing/selftests/md/p2pdma-vm/gds/`, which still
+> assert the retired design and need a separate pass before their exact PASS strings can be
+> trusted again — treat any exact tool-output string below that still reads "fails loud" /
+> "no badblocks" / "breadcrumb" as **pre-rework and unverified against the current branch**,
+> not as this document's current claim. Historical, dated run-log entries (e.g. "L40S
+> 2026-07-02 outcome snapshot", "shadecloud 2026-07-07") are untouched — they are records of
+> what was actually observed against the pre-rework module at the time and are not rewritten
+> to match the new design.
 
 Success = the `verdict.tsv` shows the headline phases PASS with the **kernel witness** confirming
 GPU-BAR pages traversed the array and the NVMe took the P2P DMA path.
@@ -67,35 +88,68 @@ The four commits (in `drivers/md`, already built into the loaded modules):
    bios (merging P2P bios from different pgmaps at the member queue would map later segments with
    the wrong bus address → silent DMA corruption), and `raid1_write_request` **excludes P2P bios
    from write-behind** (write-behind CPU-touches pages, illegal for MMIO GPU pages).
-4. **Stage-1 fail-the-write (SHIPPED 2026-07-03)** — the era-keyed completion arm: a P2P-marked
-   bio (`R1BIO_P2P`/`R10BIO_P2P`) completing `BLK_STS_INVAL` (≥6.17 dma-map) or `BLK_STS_TARGET`
-   (older kernels / fabrics) fails the WHOLE write loud (EINVAL to the submitter), faults no leg,
-   records no badblocks, and logs the ratelimited `"no P2P path for peer pages"` breadcrumb.
-   Non-P2P INVAL keeps upstream's swallow semantics — P6 proves that narrowness.
+4. **v6 P2PDMA completion handling (REWORKED 2026-07-29, supersedes the old "stage-1
+   fail-the-write" design described in earlier revisions of this doc)** — the branch was
+   rebuilt on upstream's own v6 P2PDMA completion-handling series rather than carrying a
+   meshstor-only completion arm. A P2P-tagged bio (`R1BIO_P2PDMA`/`R10BIO_P2PDMA`, renamed
+   from the retired `R1BIO_P2P`/`R10BIO_P2P`) whose completion status means "no P2P path" —
+   literal `BLK_STS_P2PDMA` on a kernel that can emit it, or `BLK_STS_INVAL`/`BLK_STS_TARGET`
+   translated to it by the DKMS compat layer (`dkms/patches/0012`) on kernels that can't —
+   is handled exactly like upstream's own topology-aware design: the failing range is
+   recorded as a **bad block**, the member is **NOT faulted**, **`WantReplacement` is NOT
+   set**, and the **master write still succeeds**, served off the surviving mirror leg(s).
+   Past ~512 badblock entries `rdev_set_badblocks()` itself faults the member and the array
+   degrades — loud in dmesg/`/proc/msstat`, silent to the application. Non-P2P INVAL keeps
+   upstream's ordinary swallow semantics unchanged — P6 proves that narrowness. Two new
+   meshstor-only pieces ride alongside: the `p2pdma_advertise=auto|always|never` module
+   parameter (policy override for the per-member advertise gate) and the read-only
+   `/sys/block/msN/ms/p2pdma_status` diagnostics report — see `docs/admin.md` for both.
 
-Origin history (post-rewrite, 2026-07-03 — every campaign pin must be origin-reachable):
-gate `9e2b65d6` → hot-add clear `0fb37cf5` (= the kit's gds1 pin, last pre-fix md commit) →
-raid1 arm `2fd76615` → raid10 arm `01f5d48d`; `origin/p2pdma` head `0d119251`; composed
-`origin/meshstor-main@9478967d` (= the kit's gdsM, the module every phase runs on).
+Origin history (REWORKED 2026-07-29, supersedes the pre-rework hashes this doc used to cite):
+the `p2pdma` branch was reset onto upstream `master`@`ef76f702` and rebuilt via `git am` of
+upstream's OWN v6 P2PDMA completion-handling series (`178f2659`..`a80daaa9`, 7 patches — the
+old md-commit hashes cited by earlier revisions of this doc, e.g. `9e2b65d6`/`0fb37cf5`, no
+longer exist on this branch; the pre-rework tip is preserved only under the local tag
+`p2pdma-prev6`), with meshstor's own value-add layered on top as `[MESHSTOR]`-tagged commits:
+per-member advertise gate `cb9920c7` → the `p2pdma_advertise` policy knob `cef31e11` →
+hot-add/remove re-evaluation `775a3c92` → per-member `p2pdma_status` diagnostics `d4511c61`
+(a use-after-free + missing stop-time reset fixed in `0f9d543f`) → the array-level
+`p2pdma_status` line `768b1c81` (current branch tip). `origin/meshstor-main`'s composition
+picks up this new tip the next time `bin/rebuild-meshstor-main` runs — the kit's gdsM SHA
+cited elsewhere in this document as `9478967d` is from BEFORE this rework and no longer
+matches; treat every gdsM/gds1 SHA in the historical run logs below as pre-rework evidence,
+not a live pin. The DKMS compat layer that lets pre-7.2 kernels build without a native
+`BLK_STS_P2PDMA` status (`dkms/patches/0012`) lives on `gds-campaign`, not on this branch.
 
-### 1.3 The integrity bug is FIXED at stage 1 — what P6 and P7 now prove
+### 1.3 The advertise gate is coarser than per-I/O reachability — what P6 and P7 now prove
 The advertise gate is **coarser than per-I/O reachability**: the real per-I/O check is
-`pci_p2pdma_state()` in the DMA-map path, which returns **`BLK_STS_INVAL`** when *this* GPU's
-pages can't map to *this* member. Historically `raid1_should_handle_error()` swallowed that
-status (silent mirror divergence). **Stage-1 fail-the-write shipped** (§1.2 item 4): on gdsM the
-P2P-keyed completion arm fails such writes loud instead.
+`pci_p2pdma_state()` in the DMA-map path, which returns **`BLK_STS_INVAL`** (or, translated by
+the compat layer, literal `BLK_STS_P2PDMA`) when *this* GPU's pages can't map to *this* member.
+**As of the 2026-07-29 v6 rework, this is handled exactly the way upstream's own design
+handles it — NOT by failing the write loud.** The failing range is recorded as a bad block,
+the member is not faulted, `WantReplacement` is not set, and the master write succeeds off the
+surviving leg; only past ~512 badblock entries does the member get faulted and the array
+degrade. (Earlier revisions of this document described a meshstor-only "stage-1 fail-the-write"
+arm that failed such writes loud with no badblocks recorded — that design is retired; see
+§1.2 item 4.)
 
 - **P6 = narrowness proof.** It injects INVAL into plain (non-P2P) CPU writes; the swallow MUST
-  still happen (rc=0, `[UU]`, stale leg) and the breadcrumb MUST be absent. There is no
-  "flip-on-landing" state anymore — the old `[FLIP]` guidance is gone; a P6 FAIL is a real
-  regression in either direction.
-- **P7 = the arm on real GPU I/O** (gdsM, CSI shape): P7a/b era keying (INVAL/TARGET ⇒ loud
-  EINVAL, no fault, no badblocks, breadcrumb), P7c `allow_compat_mode: true` production posture
-  (split verdicts — kernel side must pass; the mid-IO bounce-retry pair may SKIP on the named
-  cuFile-policy hatch), P7d raid10 parity, P7e A/B contrast on the pre-fix gds1 (silent swallow,
-  NO breadcrumb — the "both variants" evidence), P7g/h native RDMA both-legs + any-leg-fails
-  (hardware-gated), P7f opportunistic natural arm on a cross-RC topology. Stage 2 (self-heal)
-  remains future work.
+  still happen (rc=0, `[UU]`, stale leg) and the P2P-arm breadcrumb MUST be absent. This
+  invariant is unchanged by the v6 rework — a P6 FAIL is a real regression in either direction.
+- **P7 = the arm on real GPU I/O** (gdsM, CSI shape). **Caveat:** the P7a–h selftests under
+  `tools/testing/selftests/md/p2pdma-vm/gds/` still assert the retired fail-loud design (they
+  predate this rework and have not yet been rewritten), so treat their current PASS/FAIL
+  behavior against a v6-built gdsM as unverified, not as evidence either way, until they are
+  updated. Once updated, the expected shape per subtest is: P7a/b era keying (INVAL/TARGET on
+  a P2P-tagged bio ⇒ badblocked, no fault, no `WantReplacement`, master write succeeds — NOT
+  loud EINVAL), P7c `allow_compat_mode: true` production posture, P7d raid10 parity, P7e A/B
+  contrast against the gds1 pin — **exact pin and behavior TBD** (§3.1's kit-variant caveat: the
+  branch reset means no current commit cleanly represents "advertise gate present, v6
+  completion handling absent"; the old pre-rework tip, `p2pdma-prev6`, still has a completion
+  arm, just the retired fail-loud one, not "no arm at all"), P7g/h native RDMA
+  both-legs + any-leg-fails (hardware-gated), P7f opportunistic natural arm on a cross-RC
+  topology. The deferred self-heal design (in-driver CPU bounce on a P2P miss) remains future
+  work, independent of this rework.
 
 ---
 
@@ -158,6 +212,24 @@ advertises `BLK_FEAT_PCI_P2PDMA` (it has no `supports_pci_p2pdma` ctrl op). Only
   was rxe-only + `multipath=Y`). NB on **≥7.1** P4c reads `stock driver advertises — override
   unnecessary` (INFO): the meshstor-nvme-rdma override only matters on `<7.1` kernels.
 
+**The `p2pdma_advertise=always` remedy (added by the 2026-07-29 v6 rework — a second option
+alongside the boot parameter above).** Both maskers above are really one problem: a P2P-capable
+path hidden behind a non-advertising gendisk. `nvme_core.multipath=N` fixes it by removing the
+head split entirely. `ms_mod.p2pdma_advertise=always` fixes it a different way — by overriding
+the array's per-member advertise decision — and is available on every kernel this package
+targets, whether or not `multipath=N` was booted. **On RHEL 10 the two are NOT
+interchangeable: `always` is the *only* remedy.** RHEL 10's `nvme_core` is
+`CONFIG_NVME_MULTIPATH=y` with the runtime `multipath` parameter compiled out, so there is no
+boot-parameter escape hatch there at all — an rdma namespace always gets a multipath head. On
+Ubuntu both remedies work; boot `nvme_core.multipath=N` if you want every array's advertise
+decision to keep reflecting real per-member capability, or set `p2pdma_advertise=always` if you
+don't want to reboot. `always` is **host-wide** (every `ms` array on the box, not just the one
+with the rdma leg) — see `docs/admin.md` before setting it on a host with any genuinely non-P2P
+array. One related cosmetic note for RHEL 10 heads specifically: the patched nvme-rdma driver's
+multipath I/O accounting is skipped for statuses returned directly from `queue_rq` (an upstream
+nvme-multipath quirk, not introduced by this package), so expect multipath accounting oddities
+for every unroutable P2P I/O there — harmless, but visible.
+
 ---
 
 ## 3. Environment expectations (dev-box ground truth — verify on the L40S)
@@ -182,9 +254,21 @@ load-bearing ones (kernel ≥ 6.11, CONFIG_PCI_P2PDMA=y, BTF, bpftrace); the res
 ### 3.1 The kit (how to get the software onto the L40S box)
 `build/gds-kit-0.2.0.tar.gz` (~1 MB) is self-contained. It ships **three** DKMS variants +
 `kit-manifest.tsv` (per-variant `ms_mod`/`raid1_ms`/`raid10_ms` srcversions):
-- **gdsM** (`*.gdsM`) — `origin/meshstor-main`, the shipping composition incl. stage-1
-  fail-the-write. **This is the featured/default install; every phase runs on it.**
-- **gds1** (`*.gds1`) — `master` + `p2pdma@0fb37cf5` (pinned, pre-fix). **P7e A/B contrast ONLY.**
+- **gdsM** (`*.gdsM`) — `origin/meshstor-main`, the shipping composition, incl. the v6
+  P2PDMA completion handling (badblock-and-continue, §1.2 item 4 — NOT the retired
+  stage-1 fail-the-write design). **This is the featured/default install; every phase runs
+  on it.**
+- **gds1** (`*.gds1`) — a pre-rework `p2pdma` pin. **P7e A/B contrast ONLY.** **Caveat
+  (2026-07-29 rework):** the exact commit this pins to needs re-verifying against whatever
+  `bin/gds-make-kit` next resolves it to — the branch reset means no commit on the *live*
+  `p2pdma` branch today represents "advertise gate present, completion handling absent"; the
+  `p2pdma-prev6` tag (the pre-rework tip) still carries the retired stage-1 fail-the-write
+  arm, not "no arm at all". The commit that WAS the kit's old gds1 pin, `0fb37cf5`
+  ("advertise gate present, no completion arm, genuinely silent-swallow" — the original,
+  meaningful A/B partner) still exists as a git object (verified 2026-07-29: `git cat-file -t
+  0fb37cf5` → `commit`) but is **dangling — contained in no branch or tag** — so it risks
+  `git gc` pruning; re-tag it (`git tag gds1-pin 0fb37cf5`) before the next kit build relies
+  on it. Until re-tagged and re-verified, treat P7e's exact assertions as unconfirmed.
 - **gds0** (`*.gds0`) — verbatim `master` upstream baseline. **P5 baseline** (unconditional advertise).
 
 Plus the nvme-rdma override (`tarballs/meshstor-nvme-rdma-<ver>.dkms.tar.gz`), the `bin/` tools,
@@ -341,7 +425,7 @@ The single orchestrator. Runs phases in **strict priority order**, writes an evi
 `verdict.tsv` (`phase<TAB>test<TAB>PASS|FAIL|SKIP|INFO<TAB>detail`). Node **heartbeat** between
 phases (stops on a wedge, exit 3). **Exit codes: 0 = green; 1 = a FAIL row; 3 = node wedge;
 5 = INCOMPLETE** — on a **GPU-present, non-rehearsal** box a P7 SKIP whose reason is *outside*
-the enumerated hardware-gate / named-cuFile-policy-hatch set masks stage-1 evidence and turns the
+the enumerated hardware-gate / named-cuFile-policy-hatch set masks P2P-arm evidence and turns the
 verdict INCOMPLETE (treat as red). Most SKIPs are still tolerated; only unexpected P7 SKIPs
 escalate. `--rehearsal` = dev-box mode (skips GPU-only probes, never INCOMPLETE). Degradation:
 auto-detects transport (real-rdma → rxe → tcp) and runs GPU-independent assertions even without
@@ -356,9 +440,9 @@ gdsio.
 | `test_gate_tcp_leg_no_advertise.sh` | P4a | Member-AND: a tcp (non-P2P) leg makes the array NOT advertise. |
 | `test_gate_hotadd_clears.sh` | P4b | `clear_on_add`: hot-adding a non-P2P (loop) member to an advertising array clears the advertisement; removal alone preserves it (raid1 + raid10). |
 | `test_gate_rdma_leg_advertise.sh` | P4c | driver×substrate×head-aware rdma-leg advertise gate; the PASS string is the evidence (head-masked / stock-no-op / virt-refusal-correct / override+hw positive incl. member-AND both-advertise). GPU-independent. |
-| `test_divergence_inval.sh` | P6 | **Narrowness proof**: injected non-P2P INVAL keeps upstream swallow semantics (rc=0, `[UU]`, leg stale) AND the stage-1 arm does not fire (no breadcrumb); IOERR control correctly faults the leg. |
+| `test_divergence_inval.sh` | P6 | **Narrowness proof**: injected non-P2P INVAL keeps upstream swallow semantics (rc=0, `[UU]`, leg stale) AND the P2P completion arm does not fire (no breadcrumb); IOERR control correctly faults the leg. **(pre-rework wording; see the top-of-document note — the underlying test still asserts the retired design)** |
 | `test_injector_smoke.sh` | — | GPU-free: module-qualified resolver fires with in-tree raid1 co-loaded; `p2p_only=1` filters plain writes to injected=0; bare-symbol refuse rule. |
-| `test_p7a_inval_arm.sh` / `test_p7b_target_arm.sh` | P7a/b | Stage-1 arm on real GPU I/O (INVAL / TARGET era keying): witnessed native write FAILS loud, `[UU]`, badblocks empty, breadcrumb, injected≥1 @ remaining=1. |
+| `test_p7a_inval_arm.sh` / `test_p7b_target_arm.sh` | P7a/b | P2P completion arm on real GPU I/O (INVAL / TARGET era keying). **(pre-rework wording; see the top-of-document note.)** Expected under the current design: badblocked, not faulted, no `WantReplacement`, master write succeeds — not "FAILS loud". |
 | `test_p7c_compat_convergence.sh` | P7c | Production posture (`allow_compat_mode: true`): kernel side must PASS; userspace bounce-retry pair may SKIP "cuFile compat mode does not retry mid-IO errors" (NVIDIA-acknowledged Known Issue through cuFile r1.18 — see §4.6a 4th finding). |
 | `test_p7d_raid10_arm.sh` | P7d | P7a on CSI raid10 via `raid10_ms:raid10_end_write_request`; SKIP "fewer than 4 test partitions". |
 | `test_p7e_ab_contrast.sh` | P7e | A/B on gds1 (orchestrator swaps/restores): injected≥1 + witnessed P2P + rc=0 + NO breadcrumb, manifest-guarded. |
@@ -441,7 +525,7 @@ are retried via the compat path by libcufile. I/Os that fail with this error dur
 time are not retried via the compat path."* Same architecture (submission-time-only compat
 retry); the wording names GPFS/`-EOPNOTSUPP`, but the mechanism — libcufile never retries an I/O
 that already failed mid-transfer — is general and unchanged across 1.15→1.18. So `p7c_userspace
-SKIP` is **version-durable and vendor-acknowledged**: the meshstor stage-1 arm + array are
+SKIP` is **version-durable and vendor-acknowledged**: the meshstor P2P completion arm + array are
 correct (`p7c_kernel` PASS), and the missing piece is a cuFile capability NVIDIA itself lists as
 unfixed in the latest release. Upgrading cuFile does not change this; the only in-house path to a
 transparent-convergence PASS is the deferred **stage-2 self-heal** (in-driver CPU bounce), not a
@@ -480,10 +564,10 @@ faults) — but all run in the **single default invocation** (`--phases` default
 | **P3 rdma** | `sudo GDS_TRANSPORT=rdma bash …/test_gds_raid1_fabric.sh` | INFO records whether rdma leg advertises (**new data**); if array advertises + gdsio: witnessed native PASS + leg integrity | SKIP if no RDMA NIC / no gdsio |
 | **P4a** | `sudo bash …/test_gate_tcp_leg_no_advertise.sh` | PASS: local adv, tcp ns not, array not | PASS (GPU-independent) |
 | **P4b** | `sudo bash …/test_gate_hotadd_clears.sh` | PASS: advertise → persist on remove → cleared on non-P2P add (raid1+raid10) | PASS (GPU-independent) |
-| **P4c** | `sudo bash …/test_gate_rdma_leg_advertise.sh` | multipath=Y boot (today): PASS "multipath head masks leg advertise; driver=override substrate=…"; post-cabling + multipath=N: PASS "override+hw: leg=adv array=adv (member-AND positive)". Any FAIL = real defect | same — GPU-independent; SKIP only if no RDMA-capable address |
+| **P4c** | `sudo bash …/test_gate_rdma_leg_advertise.sh` | multipath=Y boot (today): PASS "multipath head masks leg advertise; driver=override substrate=…" — remedy is `nvme_core.multipath=N` **or** `ms_mod.p2pdma_advertise=always` (RHEL 10: `always` only, no runtime multipath toggle); post-cabling + multipath=N: PASS "override+hw: leg=adv array=adv (member-AND positive)". Any FAIL = real defect | same — GPU-independent; SKIP only if no RDMA-capable address |
 | **P5** | `bin/gds-campaign --phases p5 --kit <dir>` | baseline swap: tcp-leg array **falsely** advertises (baseline has no member-AND) = expected finding; restore featured PASS. **On ≥7.1 kernels the false-advertise does NOT reproduce** — upstream's own `blk_stack_limits` member-AND clears it, so gds0 correctly non-advertises (expected, not a P5 regression; confirm with `ms-queue-features` per leg) | needs `--kit`; else SKIP |
 | **P6** | `sudo bash …/test_divergence_inval.sh` | PASS: `non-P2P INVAL swallowed (narrowness proof) -- rc=0, [UU], leg1 stale, no breadcrumb (injected=N)` | PASS (loop substrate ok, GPU-independent; runs even with in-tree raid1 loaded) |
-| **P7a/b** | `--phases p0,p7` (campaign manages the spoof) | PASS: `stage-1 INVAL arm on raid1 (injected=N, write failed loud, no fault, no badblocks, breadcrumb)` (b: TARGET) | SKIP rc=4 (gdsio absent) — INCOMPLETE on a GPU box |
+| **P7a/b** | `--phases p0,p7` (campaign manages the spoof) | **(pre-rework wording; see the top-of-document note.)** Expected under the current design: `P2P completion arm on raid1 (injected=N, badblocked, master write succeeds, no fault, no WantReplacement)` (b: TARGET) | SKIP rc=4 (gdsio absent) — INCOMPLETE on a GPU box |
 | **P7c** | (same invocation) | kernel rows PASS; userspace PASS `compat convergence` or SKIP `cuFile compat mode does not retry mid-IO errors` (escalate to product — NVIDIA Known Issue thru r1.18, §4.6a) | SKIP |
 | **P7d** | (same invocation) | PASS raid10 parity, or SKIP `fewer than 4 test partitions` | SKIP |
 | **P7e** | (same invocation, kit required) | PASS: `gds1 A/B contrast — old silent swallow reproduced (injected=N, rc=0, no breadcrumb)`; `p7 restore PASS` after | SKIP (no kit) — INCOMPLETE on a GPU box |
@@ -637,7 +721,7 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 |---|---|---|
 | `modprobe ms_mod` → `Key was rejected by service` | **Secure Boot** rejecting the unsigned DKMS module | `mokutil --sb-state`; enroll a MOK (`bin/mok-enroll`) + reboot, or disable SB in firmware. Do this before anything else. |
 | `mdadm: /dev/ms0` rejected / "unknown device" | using the **system** mdadm on an ms array | Use the patched mdadm (`MDADM=` / kit `bin/mdadm-ms`). System mdadm is only for in-tree `/dev/mdN` cleanup. |
-| rdma leg doesn't advertise (P4c FAIL or unexpected refusal) | in order: multipath head split (expected on multipath=Y — not a driver problem); override not loaded; rxe/siw substrate (expected refusal); BUILD_EXCLUSIVE refused the build; IOMMU/ACS blocks `dma_pci_p2pdma_supported` | walk the ladder: `readlink /sys/class/block/nvmeXnY` contains `nvme-subsystem` ⇒ boot `nvme_core.multipath=N`; `/sys/module/nvme_rdma/srcversion` == `modinfo -F srcversion` + path under `.../updates/` ⇒ else reload; substrate rxe/siw ⇒ correct refusal (post-cabling: `rdma link delete rxe0` first); `dkms status` + install.sh WARNING; only then suspect IOMMU/ACS. NB built-in nvme-rdma shows `(builtin)` from modinfo (P0: built-in (not overridable)), not "absent" |
+| rdma leg doesn't advertise (P4c FAIL or unexpected refusal) | in order: multipath head split (expected on multipath=Y — not a driver problem); override not loaded; rxe/siw substrate (expected refusal); BUILD_EXCLUSIVE refused the build; IOMMU/ACS blocks `dma_pci_p2pdma_supported` | walk the ladder: `readlink /sys/class/block/nvmeXnY` contains `nvme-subsystem` ⇒ boot `nvme_core.multipath=N` **or** set `ms_mod.p2pdma_advertise=always` (RHEL 10: `always` is the *only* option — no runtime `multipath` parameter exists there); `/sys/module/nvme_rdma/srcversion` == `modinfo -F srcversion` + path under `.../updates/` ⇒ else reload; substrate rxe/siw ⇒ correct refusal (post-cabling: `rdma link delete rxe0` first); `dkms status` + install.sh WARNING; only then suspect IOMMU/ACS. NB built-in nvme-rdma shows `(builtin)` from modinfo (P0: built-in (not overridable)), not "absent" |
 | P0 `pci_p2pdma_config FAIL` | kernel built without `CONFIG_PCI_P2PDMA=y` | **Stop** — native P2P is impossible on this kernel. Report; use a kernel with it =y. Not fixable in tooling. |
 | gdsio errors on flags / unexpected `-x`/`-V` behavior | the wrappers' gdsio flags (`-d 0 -w 4 -s 256M -i 1M -x {0,1} -I {0,1} -V`) were written from docs, **never run against a real gdsio** | `gdsio -h` FIRST; if mode numbering or verify semantics differ, fix ONLY the two wrappers `gds_gdsio_write`/`gds_gdsio_readverify` in `gds/lib.sh` (they isolate this exact risk), re-run unit gate + P1. |
 | cuFile refuses the file on an ms array (`Unsupported block device` / `RAID level not supported` / `RAID member not supported`) despite witness proving raw-partition native | one of cuFile's **three userspace gates** (§4.6a): missing `MD_*` props (msadm/rule), the **raid0-only level policy**, or a non-PCIe member transport | Walk the §4.6a ladder in order: `udevadm info --query=property /dev/msN | grep MD_` (empty → install `/usr/sbin/msadm` + trigger); `RAID level not supported` → expected on raid1/raid10, use the test-only level-spoof for kernel-path evidence + escalate as product finding; `unknown NVMe transport` → cuFile's own member AND, working as designed. |
@@ -650,9 +734,9 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 | P3 array advertises with a **tcp** leg | member-AND regression **or** you're on the **baseline** (`*.gds0`) or **pre-fix** (`*.gds1`) package | `ms-queue-features` each member; `dkms status` (featured must be `*.gdsM`, not `*.gds0`/`*.gds1`); cross-check `cat /sys/module/raid1_ms/srcversion` vs the gdsM manifest row. If featured and it still advertises → real bug in `raid1_can_advertise_p2pdma`; capture and report. |
 | P4b advertisement not cleared after non-P2P `--add` | `clear_on_add` regression, or add landed as spare and clear fires on activation | `mdadm --detail /dev/ms0`; re-read advertise after the member is truly active. If still advertising with an active non-P2P member → real bug. |
 | P6/P7 FAIL "injector never fired" | module-qualified kprobe didn't bind; wrong module loaded; module build failed | check the test's `gds_kallsyms_check` output (`raid1_ms:raid1_end_write_request` must resolve exactly once); `dmesg` for insmod errors; rebuild `make -C dkms/inval-inject`; verify the variant srcversion against the manifest. |
-| P6 shows the "no P2P path" breadcrumb | the stage-1 arm fired for a NON-P2P bio | **kernel bug — escalate, do not loosen the test.** |
+| P6 shows the "no P2P path" breadcrumb | the P2P completion arm fired for a NON-P2P bio | **kernel bug — escalate, do not loosen the test.** |
 | P7a fails with gdsio rc=0 | the arm did not fire → wrong module variant loaded (gds1/gds0 left behind), or injector mis-aimed | `cat /sys/module/raid1_ms/srcversion` vs the gdsM row of `kit-manifest.tsv`; re-run `sudo ./install.sh`; check `injected` count in the `.out`. |
-| P7a/b/d/e all FAIL with `p2p_bios=0 ... cmd_rc=1` (gdsio rc≠0) | **downstream of a P1 FAIL — NOT a stage-1 regression.** No native P2P write existed, so the arm was never exercised (it needs a real `R1BIO_P2P`/`R10BIO_P2P` bio). Whole-box native GDS is broken, not the fix. | Confirm it's downstream, not a real arm defect: the `.out` shows the injector resolved (`raid1_end_write_request in [raid1_ms]: 1 copies`) and `.dmesg` has **no `no P2P path` breadcrumb, no leg-fault, no badblocks** (arm didn't run). Fix P1 (usually the `iommu=pt` IOMMU gate, §3.2) and re-run — do **not** escalate as a stage-1 regression. A real arm defect instead shows `p2p_bios>0` with the wrong completion behavior. |
+| P7a/b/d/e all FAIL with `p2p_bios=0 ... cmd_rc=1` (gdsio rc≠0) | **downstream of a P1 FAIL — NOT a P2P-arm regression.** No native P2P write existed, so the arm was never exercised (it needs a real `R1BIO_P2PDMA`/`R10BIO_P2PDMA` bio). Whole-box native GDS is broken, not the fix. | Confirm it's downstream, not a real arm defect: the `.out` shows the injector resolved (`raid1_end_write_request in [raid1_ms]: 1 copies`) and `.dmesg` has **no `no P2P path` breadcrumb, no leg-fault, no badblocks** (arm didn't run). Fix P1 (usually the `iommu=pt` IOMMU gate, §3.2) and re-run — do **not** escalate as a P2P-arm regression. A real arm defect instead shows `p2p_bios>0` with the wrong completion behavior. |
 | Campaign exit 5 (INCOMPLETE) | a P7 subtest SKIPped for a reason outside the expected gates/hatches on a GPU box | read the `INCOMPLETE:` log lines; fix the named rig condition and re-run `--phases p0,p7` (p0 refreshes env.sh — a p0-less run only inherits a previous run's values). Treat as red, not as a pass. |
 | Node wedged, kthreads in D state | a real deadlock; or you ran with `MD_SUBSYS=md` | **Never set `MD_SUBSYS=md`** — the raid10 recovery-freeze test wedges in-tree kthreads (reboot to clear). Copy `results/` off, reboot, resume with `--phases`. |
 | Array won't create ("device busy"/superblock) | stale superblock or udev grabbed the device | `mdadm --stop`; `mdadm --zero-superblock <dev>` (system mdadm for /dev/mdN, patched for members); `wipefs -a` as last resort on a **test** partition only. |
@@ -683,8 +767,9 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 - A shipped-feature assertion genuinely FAILs (member-AND, clear_on_add, silent-divergence
   behavior changed) — this is a real finding, the whole point of the campaign.
 - P1 can't do native GDS at all (topology/ACS/driver) — needs a human hardware call.
-- P6 shows the stage-1 breadcrumb, or any P7 kernel-side row FAILs (arm not firing / firing too
-  wide / faulting legs / recording badblocks) — that is a real stage-1 regression on the shipping
+- P6 shows the P2P-arm breadcrumb, or any P7 kernel-side row FAILs (arm not firing / firing too
+  wide / faulting a member for a routable transfer / mis-recording badblocks) — that is a real
+  P2P-arm regression on the shipping
   composition, the single most valuable finding this campaign can produce.
 - You're tempted to change what a test asserts.
 
@@ -717,7 +802,7 @@ bin/gds-p2p-witness                               native-path witness (bpftrace)
 bin/gds-make-kit                                  kit builder
 bin/probe-cufile-recognition                      cuFile RAID-classification probe (§4.6)
 bin/mok-enroll                                    MOK enrollment helper (git checkout only, not in kit)
-tools/testing/selftests/md/p2pdma-vm/gds/            P0–P6 phase tests + the P7a–h stage-1 subtests + injector smoke + lib.sh + unit test
+tools/testing/selftests/md/p2pdma-vm/gds/            P0–P6 phase tests + the P7a–h P2P-arm subtests (pre-rework; need updating, see the top-of-document note) + injector smoke + lib.sh + unit test
 tools/testing/selftests/md/p2pdma-vm/lib.sh          Layer-B helpers (sourced by gds/lib.sh)
 tools/testing/selftests/md/p2pdma-vm/test_*.sh       Layer-B non-P2P regression suite (run under P4)
 dkms/inval-inject/                                status injector + README (make -C to build)
@@ -727,8 +812,12 @@ build/gds-kit-0.2.0.tar.gz                        the scp-able kit (3 variants +
 ```
 Design spec + implementation plan (deeper rationale, gitignored local archive):
 `docs/superpowers/specs/2026-07-01-gds-l40s-p2pdma-campaign-design.md` and
-`docs/superpowers/plans/2026-07-01-gds-l40s-campaign.md`. Stage-1 fail-the-write is **landed**
-(§1.2 item 4); the still-deferred **stage-2 self-heal** design lives on branch `p2pdma` as
+`docs/superpowers/plans/2026-07-01-gds-l40s-campaign.md` — **both describe the retired
+stage-1 fail-the-write design; superseded by
+`docs/superpowers/specs/2026-07-29-p2pdma-v6-rework-design.md`**, which documents the
+current v6 P2PDMA completion handling (§1.2 item 4). The still-deferred **self-heal**
+design (in-driver CPU bounce on a P2P miss) remains future work, independent of the v6
+rework, and lives on branch `p2pdma` as
 `docs/…p2pdma-blk-sts-inval-and-self-heal-followup.md`.
 
 ---
@@ -740,7 +829,7 @@ Design spec + implementation plan (deeper rationale, gitignored local archive):
 3. **Verify gdsio's interface:** `gdsio -h` — cross-check the wrappers' flags (`-x` mode numbering, `-V` verify, `-I` read/write) before P1; fix only the two lib wrappers if they differ (§8 row). Pick the GPU index for `-d`: `nvidia-smi topo -m` — choose the GPU with the tightest path (PIX/PXB, not SYS) to the test NVMe.
 4. **Partitions:** `sudo bin/perf-make-test-partitions /dev/nvmeXnY` (4K-LBA NVMe with trailing free space; make 4 across two drives for the raid10 fabric case, passed via `GDS_PART_LIST`). Confirm `/dev/disk/by-partlabel/*-meshstor-test-*`.
 5. **Kernel check for the witness (§7):** if not a 6.17-class kernel, verify the pgmap/enum offsets and recalibrate on P1 before trusting P2/P3.
-6. **Run the full campaign in one invocation** (`bin/gds-campaign --kit $PWD --results …` defaults to `p0..p7`), reading `verdict.tsv` after it: P0 → P1 → P2 (+ **`probe-cufile-recognition` on P2's mounted array**, §4.6) → P3(tcp then rdma) → P4a/b/c → **P6 the narrowness proof** (no longer needs its own invocation — the module-qualified probe made it run inline, even on root-on-md) → **P7 the stage-1 arm on GPU I/O** (the campaign manages its raid0 spoof) → P5's baseline swap. Exit 5 = INCOMPLETE (an unexpected P7 SKIP on a GPU box — treat as red). The manual strict-gdsio-on-baseline step (runbook §6) only once everything else is on disk.
+6. **Run the full campaign in one invocation** (`bin/gds-campaign --kit $PWD --results …` defaults to `p0..p7`), reading `verdict.tsv` after it: P0 → P1 → P2 (+ **`probe-cufile-recognition` on P2's mounted array**, §4.6) → P3(tcp then rdma) → P4a/b/c → **P6 the narrowness proof** (no longer needs its own invocation — the module-qualified probe made it run inline, even on root-on-md) → **P7 the P2P completion arm on GPU I/O** (the campaign manages its raid0 spoof) → P5's baseline swap. Exit 5 = INCOMPLETE (an unexpected P7 SKIP on a GPU box — treat as red). The manual strict-gdsio-on-baseline step (runbook §6) only once everything else is on disk.
 7. **Collect evidence** (§10) **before** the window ends.
 
 Work from the git checkout or the kit; keep the operator informed of every FAIL with its `.out` +
