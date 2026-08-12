@@ -43,11 +43,13 @@ kprobe:'"$PROBE"' {
 		printf("features=0x%x\n", $b->bi_bdev->bd_disk->queue->limits.features);
 		exit();
 	}
-}' "$KN" > "$OUT" 2>/dev/null &
+}' "$KN" > "$OUT" 2>&1 &
 BPID=$!
 trap cleanup EXIT
-for _ in $(seq 40); do grep -q Attaching "$OUT" 2>/dev/null && break; sleep 0.25; done
-grep -q Attaching "$OUT" || { echo "SKIP: bpftrace failed to attach" >&2; exit 4; }
+# bpftrace's attach banner is "Attaching N probes..." (<=0.20) or "Attached N
+# probe(s)" (>=0.21, and on stderr) -- match both wordings on the merged stream.
+for _ in $(seq 40); do grep -qE 'Attach(ing|ed)' "$OUT" 2>/dev/null && break; sleep 0.25; done
+grep -qE 'Attach(ing|ed)' "$OUT" || { echo "SKIP: bpftrace failed to attach" >&2; exit 4; }
 timeout 10 dd if="$DEV" of=/dev/null bs=4096 count=1 iflag=direct status=none 2>/dev/null || true
 for _ in $(seq 40); do grep -q features= "$OUT" && break; sleep 0.25; done
 

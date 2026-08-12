@@ -105,8 +105,10 @@ bpftrace "$PROG" > "$WORK/trc" 2> "$WORK/err" &
 BPID=$!
 trap cleanup EXIT
 cleanup() { kill "$BPID" 2>/dev/null; wait "$BPID" 2>/dev/null; rm -rf "$WORK"; }
-for _ in $(seq 60); do grep -q Attaching "$WORK/trc" 2>/dev/null && break; sleep 0.25; done
-if ! grep -q Attaching "$WORK/trc" 2>/dev/null; then
+# bpftrace's attach banner is "Attaching N probes..." (<=0.20) or "Attached N
+# probe(s)" (>=0.21) -- and it prints to stderr ($WORK/err), not stdout.
+for _ in $(seq 60); do grep -qE 'Attach(ing|ed)' "$WORK/err" 2>/dev/null && break; sleep 0.25; done
+if ! grep -qE 'Attach(ing|ed)' "$WORK/err" 2>/dev/null; then
 	cat "$WORK/err" >&2; cleanup
 	echo "SKIP: bpftrace failed to attach" >&2; exit 4
 fi
