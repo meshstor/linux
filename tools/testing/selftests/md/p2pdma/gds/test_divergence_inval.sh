@@ -47,10 +47,12 @@ SZ=$(blockdev --getsz "$M1")
 # Defensive: a leftover 1.2 superblock on either member (e.g. a prior
 # interrupted run) lets udev incremental-assembly grab the freshly created
 # dm-flakey device the instant it appears, autoloading the in-tree raid1
-# personality module -- which silently reintroduces the exact
-# kprobe-symbol ambiguity the SKIP guard above exists to prevent (observed
-# live: the kprobe bound to in-tree raid1's raid1_end_write_request instead
-# of raid1_ms's, so it never fired for our array's completions).
+# personality module -- which reintroduces the bare-symbol kprobe-symbol
+# ambiguity the module-qualified probe below (raid1_ms:...) now resolves
+# through anyway; zeroing the superblocks additionally keeps a stray
+# /dev/mdN from assembling on our members (observed live before the
+# module-qualified fix: the kprobe bound to in-tree raid1's
+# raid1_end_write_request instead of raid1_ms's, so it never fired).
 "$MDADM" --zero-superblock "$M0" >/dev/null 2>&1 || true
 "$MDADM" --zero-superblock "$M1" >/dev/null 2>&1 || true
 

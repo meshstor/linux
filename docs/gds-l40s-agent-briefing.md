@@ -15,12 +15,13 @@ importantly — **which failures you may fix and which you must never paper over
 
 ## 0. TL;DR — what you're proving and the one-line goal
 
-The meshstor `ms_*` RAID driver (a renamed fork of Linux MD) has a 3-commit **P2PDMA feature**
+The meshstor `ms_*` RAID driver (a renamed fork of Linux MD) has a 4-commit **P2PDMA feature**
 that lets NVMe SSDs DMA **directly to/from L40S GPU memory** (GPUDirect Storage, "GDS native"),
 bypassing CPU bounce buffers — across a topology of **local NVMe legs + remote NVMe-over-Fabrics
 legs** (the MeshStor-CSI production shape). Your job: **prove GDS-native actually works through an
-`ms` raid1/raid10 array, prove the per-member safety gating is correct, and reproduce the one
-known integrity bug** — all with kernel-level evidence, not just cuFile's self-reporting.
+`ms` raid1/raid10 array, prove the per-member safety gating is correct, and prove the stage-1
+fail-the-write integrity fix** (P6 = its narrowness, P7 = the arm on real GPU I/O) — all with
+kernel-level evidence, not just cuFile's self-reporting.
 
 Success = the `verdict.tsv` shows the headline phases PASS with the **kernel witness** confirming
 GPU-BAR pages traversed the array and the NVMe took the P2P DMA path.
@@ -40,13 +41,13 @@ You edit **upstream-named source** (`md.c`, `raid1.c`, `mddev`); a rename pass g
 `ms_*` product at build time. For this campaign you do **not** touch `drivers/md` at all — all
 work is test tooling on the `meshstor-harness` branch.
 
-### 1.2 The P2PDMA feature being validated (3 shipped commits on branch `p2pdma`)
+### 1.2 The P2PDMA feature being validated (4 shipped commits on branch `p2pdma`, composed into `meshstor-main@9478967d`)
 PCI **P2PDMA** lets one PCIe device DMA to another's memory (NVMe ↔ GPU BAR) without bouncing
 through host RAM. The block layer marks such bios and the queue advertises capability via the
 `BLK_FEAT_PCI_P2PDMA` queue-limits feature (bit 12). It is deliberately **excluded** from
 `BLK_FEAT_INHERIT_MASK`, so a stacking driver like md must set it **explicitly**.
 
-The three commits (in `drivers/md`, already built into the loaded modules):
+The four commits (in `drivers/md`, already built into the loaded modules):
 
 1. **Per-member advertise gate** — `raid1_can_advertise_p2pdma()` (in `raid1-10.c`, used by both
    raid1 and raid10): the array sets `BLK_FEAT_PCI_P2PDMA` **only when every non-faulty member's
@@ -62,19 +63,35 @@ The three commits (in `drivers/md`, already built into the loaded modules):
    bios (merging P2P bios from different pgmaps at the member queue would map later segments with
    the wrong bus address → silent DMA corruption), and `raid1_write_request` **excludes P2P bios
    from write-behind** (write-behind CPU-touches pages, illegal for MMIO GPU pages).
+4. **Stage-1 fail-the-write (SHIPPED 2026-07-03)** — the era-keyed completion arm: a P2P-marked
+   bio (`R1BIO_P2P`/`R10BIO_P2P`) completing `BLK_STS_INVAL` (≥6.17 dma-map) or `BLK_STS_TARGET`
+   (older kernels / fabrics) fails the WHOLE write loud (EINVAL to the submitter), faults no leg,
+   records no badblocks, and logs the ratelimited `"no P2P path for peer pages"` breadcrumb.
+   Non-P2P INVAL keeps upstream's swallow semantics — P6 proves that narrowness.
 
-### 1.3 The known, UNFIXED integrity bug (you will reproduce it, not fix it)
-The advertise gate is **coarser than per-I/O reachability**. `blk_queue_pci_p2pdma(q)` means "this
-queue can do P2P with *something*"; it does **not** mean a *specific* GPU can reach this member. The
-real per-I/O check is `pci_p2pdma_state()` in the DMA-map path, which returns **`BLK_STS_INVAL`**
-when *this* GPU's pages can't map to *this* member (crossing a root complex, ACS isolation,
-multi-switch topology).
+Origin history (post-rewrite, 2026-07-03 — every campaign pin must be origin-reachable):
+gate `9e2b65d6` → hot-add clear `0fb37cf5` (= the kit's gds1 pin, last pre-fix md commit) →
+raid1 arm `2fd76615` → raid10 arm `01f5d48d`; `origin/p2pdma` head `0d119251`; composed
+`origin/meshstor-main@9478967d` (= the kit's gdsM, the module every phase runs on).
 
-Today `raid1_should_handle_error()` treats `BLK_STS_INVAL` as **benign** → the failed leg is
-marked uptodate → the **master bio reports success** even though the write never reached that
-leg's media → **silent mirror divergence** (a later read from the stale leg returns garbage).
-This is documented as a deferred follow-up (fail-the-write + self-heal). **Your P6 test reproduces
-this bug deterministically as evidence — a PASS in P6 means "the bug is present as expected."**
+### 1.3 The integrity bug is FIXED at stage 1 — what P6 and P7 now prove
+The advertise gate is **coarser than per-I/O reachability**: the real per-I/O check is
+`pci_p2pdma_state()` in the DMA-map path, which returns **`BLK_STS_INVAL`** when *this* GPU's
+pages can't map to *this* member. Historically `raid1_should_handle_error()` swallowed that
+status (silent mirror divergence). **Stage-1 fail-the-write shipped** (§1.2 item 4): on gdsM the
+P2P-keyed completion arm fails such writes loud instead.
+
+- **P6 = narrowness proof.** It injects INVAL into plain (non-P2P) CPU writes; the swallow MUST
+  still happen (rc=0, `[UU]`, stale leg) and the breadcrumb MUST be absent. There is no
+  "flip-on-landing" state anymore — the old `[FLIP]` guidance is gone; a P6 FAIL is a real
+  regression in either direction.
+- **P7 = the arm on real GPU I/O** (gdsM, CSI shape): P7a/b era keying (INVAL/TARGET ⇒ loud
+  EINVAL, no fault, no badblocks, breadcrumb), P7c `allow_compat_mode: true` production posture
+  (split verdicts — kernel side must pass; the mid-IO bounce-retry pair may SKIP on the named
+  cuFile-policy hatch), P7d raid10 parity, P7e A/B contrast on the pre-fix gds1 (silent swallow,
+  NO breadcrumb — the "both variants" evidence), P7g/h native RDMA both-legs + any-leg-fails
+  (hardware-gated), P7f opportunistic natural arm on a cross-RC topology. Stage 2 (self-heal)
+  remains future work.
 
 ---
 
@@ -141,7 +158,7 @@ load-bearing ones (kernel ≥ 6.11, CONFIG_PCI_P2PDMA=y, BTF, bpftrace); the res
 | `CONFIG_DEBUG_INFO_BTF` | `=y` | **`=y`** — the bpftrace tools are BTF-only (no DWARF) |
 | bpftrace | v0.20.2 | present |
 | nvme-cli | 2.8 | present (flag caveat above) |
-| ms modules | `ms_mod`,`raid1_ms`,`raid10_ms` loaded; `dkms: meshstor-ms/0.1.0.gds1` | install from kit (below) |
+| ms modules | `ms_mod`,`raid1_ms`,`raid10_ms` loaded; `dkms: meshstor-ms/0.2.0.gdsM` (featured) | install from kit (below) |
 | `/proc/msstat` | `Personalities : [raid1] [raid10]` | same after modprobe |
 | Secure Boot | off | **check `mokutil --sb-state` FIRST** — with SB enabled, unsigned DKMS modules are rejected at modprobe (`Key was rejected by service`). Enroll the DKMS MOK + reboot (`bin/mok-enroll` in the git checkout — **not shipped in the kit**; on a kit-only box use `mokutil --import /var/lib/dkms/mok.pub` or `…/shim/mok/…` per Ubuntu DKMS docs), or disable SB, **before** anything else — this alone can eat the window |
 | GDS tools | **absent** on dev box | **`gdsio`+`gdscheck` REQUIRED on L40S** (CUDA 12.8+, NVIDIA **open** kernel module) — checked, not installed, by the kit |
@@ -149,27 +166,34 @@ load-bearing ones (kernel ≥ 6.11, CONFIG_PCI_P2PDMA=y, BTF, bpftrace); the res
 | mdadm | patched build at `/home/mykola/mdadm/mdadm` (kit: `bin/mdadm-ms`) | **required for ms arrays** — the stock/system mdadm **rejects `/dev/msN`** (unknown device names/major). Use the system mdadm only for in-tree `/dev/mdN` cleanup |
 
 ### 3.1 The kit (how to get the software onto the L40S box)
-`build/gds-kit-0.1.0.tar.gz` (~1 MB) is self-contained: featured (`*.gds1`, member-AND) + baseline
-(`*.gds0`, upstream unconditional-advertise) DKMS tarballs, the nvme-rdma override
-(`tarballs/meshstor-nvme-rdma-<ver>.dkms.tar.gz`), the `bin/` tools, the `gds/`
-selftests, the `inval-inject/` module source, the udev rule, `install.sh`, and the runbook.
-`install.sh` also best-effort-installs the nvme-rdma P2PDMA override — look for the OK/WARNING
-line (WARNING = campaign runs on the STOCK driver; P0 records which). On the
-box:
+`build/gds-kit-0.2.0.tar.gz` (~1 MB) is self-contained. It ships **three** DKMS variants +
+`kit-manifest.tsv` (per-variant `ms_mod`/`raid1_ms`/`raid10_ms` srcversions):
+- **gdsM** (`*.gdsM`) — `origin/meshstor-main`, the shipping composition incl. stage-1
+  fail-the-write. **This is the featured/default install; every phase runs on it.**
+- **gds1** (`*.gds1`) — `master` + `p2pdma@0fb37cf5` (pinned, pre-fix). **P7e A/B contrast ONLY.**
+- **gds0** (`*.gds0`) — verbatim `master` upstream baseline. **P5 baseline** (unconditional advertise).
+
+Plus the nvme-rdma override (`tarballs/meshstor-nvme-rdma-<ver>.dkms.tar.gz`), the `bin/` tools,
+the `gds/` selftests, the `inval-inject/` module source, the udev rule, `install.sh`, and the
+runbook. `install.sh` installs the **featured gdsM** package, `/usr/sbin/msadm`, the udev rule,
+the manifest, and best-effort-installs the nvme-rdma P2PDMA override — look for the OK/WARNING
+line (WARNING = campaign runs on the STOCK driver; P0 records which). On the box:
 ```
-tar xzf gds-kit-0.1.0.tar.gz && cd gds-kit-0.1.0
-sudo ./install.sh                      # featured ms variant + nvme-rdma override + modprobe + udev rule
+tar xzf gds-kit-0.2.0.tar.gz && cd gds-kit-0.2.0
+sudo ./install.sh                      # featured (gdsM) + /usr/sbin/msadm + nvme-rdma override + udev rule + manifest
+test -x /usr/sbin/msadm && echo msadm-ok
 sudo bin/perf-make-test-partitions /dev/nvmeXnY   # two (or 4) 25GiB GPT test partitions
-sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign --results /root/gds-results
+sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign --kit $PWD --results /root/gds-results
 ```
 If you are instead working **from the git checkout** at `/home/mykola/linux-meshstor` (patched
 mdadm at `/home/mykola/mdadm/mdadm`, modules already installed), you can run the selftests and
-`bin/gds-campaign` directly without the kit.
+`bin/gds-campaign` directly without the kit (P5/P7e A/B swaps then SKIP — they need `--kit`).
 
-**Kit gap (found live):** `install.sh` installs the udev rule but NOT the `/usr/sbin/msadm`
-binary that the rule's `IMPORT{program}` runs. Do it manually right after `install.sh`:
-`sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm`. Without it `/dev/msN` gets **no** `MD_*`
-udev properties and cuFile fails with "Unsupported block device: /dev/ms0".
+**Resolved (was a live-found gap):** early kits installed the udev rule but NOT the
+`/usr/sbin/msadm` binary the rule's `IMPORT{program}` runs, so `/dev/msN` got no `MD_*`
+properties and cuFile failed "Unsupported block device: /dev/ms0". **`install.sh` now installs
+`/usr/sbin/msadm`**, and P0 gates on `msadm_present`. If P0's `msadm_present` ever FAILs on an
+old kit, install it by hand: `sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm`.
 
 ### 3.2 NVIDIA driver enablement for kernel-native P2PDMA (all found live on the L40S)
 
@@ -239,20 +263,29 @@ and counts:
 - **6.17-shaped** (folio→pgmap cast, enum value): a materially different kernel could miscount
   silently. It's for the L40S 6.17-class target; see §7 if the box differs.
 
-### 4.3 `dkms/inval-inject/` — the divergence injector (TEST-ONLY kprobe module)
-Plain kbuild module (never a dkms package, never ship). A kprobe on `raid1_end_write_request`
-rewrites a matching member's write completion **`BLK_STS_IOERR` → `BLK_STS_INVAL`**. Paired with
-`dm-flakey error_writes` under one leg, it reproduces the exact P2P partial-reachability failure
-shape without a GPU. Params: `disk=`, `partno=`, `remaining=` (arm), `injected=` (ro counter).
-Refuses to matter while in-tree `raid1` is loaded (symbol ambiguity — the test guards this).
+### 4.3 `dkms/inval-inject/` — the status injector (TEST-ONLY kprobe module)
+Plain kbuild module (never a dkms package, never ship). A kprobe on the **module-qualified**
+`raid1_ms:raid1_end_write_request` (or `raid10_ms:raid10_end_write_request`) rewrites a matching
+member's data-write completion status. Params: `disk=`, `partno=`, `match=ioerr|success|any`,
+`to_status=inval|target|N`, `p2p_only=` (defaults: 0 for `match=ioerr`, 1 otherwise — MANDATORY
+1 on mounted-fs rigs, XFS journal traffic traverses the probe), `remaining=` (arm), `injected=`
+(ro). insmod REFUSES a bare `symbol=` in the live-traffic modes; in-tree `raid1` being loaded no
+longer matters (the old mis-bind is what used to SKIP P6 on root-on-md boxes). Each test owns a
+full insmod→arm→disarm→rmmod cycle; the campaign's EXIT trap force-disarms and unloads it on any
+abort. See `dkms/inval-inject/README.md` for the interception-scope proof (bitmap/SB traffic
+never reaches the probe) and the completion-time bvec P2P filter rationale.
 
 ### 4.4 `bin/gds-campaign [--rehearsal] [--phases LIST] [--transport auto|rdma|rxe|tcp] [--results DIR] [--kit DIR]`
 The single orchestrator. Runs phases in **strict priority order**, writes an evidence tree
 `results/gds-campaign-<ts>/<phase>/` with per-phase `.out` + `.dmesg` deltas and a cumulative
 `verdict.tsv` (`phase<TAB>test<TAB>PASS|FAIL|SKIP|INFO<TAB>detail`). Node **heartbeat** between
-phases (stops on a wedge, exit 3). Campaign exits non-zero iff any row is FAIL (SKIPs tolerated).
-`--rehearsal` = dev-box mode (skips GPU-only probes). Degradation: auto-detects transport
-(real-rdma → rxe → tcp) and runs GPU-independent assertions even without gdsio.
+phases (stops on a wedge, exit 3). **Exit codes: 0 = green; 1 = a FAIL row; 3 = node wedge;
+5 = INCOMPLETE** — on a **GPU-present, non-rehearsal** box a P7 SKIP whose reason is *outside*
+the enumerated hardware-gate / named-cuFile-policy-hatch set masks stage-1 evidence and turns the
+verdict INCOMPLETE (treat as red). Most SKIPs are still tolerated; only unexpected P7 SKIPs
+escalate. `--rehearsal` = dev-box mode (skips GPU-only probes, never INCOMPLETE). Degradation:
+auto-detects transport (real-rdma → rxe → tcp) and runs GPU-independent assertions even without
+gdsio.
 
 ### 4.5 The selftests (also runnable standalone as `sudo bash <path>`)
 | File | Phase | What it asserts |
@@ -263,7 +296,14 @@ phases (stops on a wedge, exit 3). Campaign exits non-zero iff any row is FAIL (
 | `test_gate_tcp_leg_no_advertise.sh` | P4a | Member-AND: a tcp (non-P2P) leg makes the array NOT advertise. |
 | `test_gate_hotadd_clears.sh` | P4b | `clear_on_add`: hot-adding a non-P2P (loop) member to an advertising array clears the advertisement; removal alone preserves it (raid1 + raid10). |
 | `test_gate_rdma_leg_advertise.sh` | P4c | driver×substrate×head-aware rdma-leg advertise gate; the PASS string is the evidence (head-masked / stock-no-op / virt-refusal-correct / override+hw positive incl. member-AND both-advertise). GPU-independent. |
-| `test_divergence_inval.sh` | P6 | **Reproduces the bug**: injected INVAL is swallowed → write reports success, `[UU]` preserved, leg silently stale; IOERR control correctly faults the leg. PASS = bug present as expected. |
+| `test_divergence_inval.sh` | P6 | **Narrowness proof**: injected non-P2P INVAL keeps upstream swallow semantics (rc=0, `[UU]`, leg stale) AND the stage-1 arm does not fire (no breadcrumb); IOERR control correctly faults the leg. |
+| `test_injector_smoke.sh` | — | GPU-free: module-qualified resolver fires with in-tree raid1 co-loaded; `p2p_only=1` filters plain writes to injected=0; bare-symbol refuse rule. |
+| `test_p7a_inval_arm.sh` / `test_p7b_target_arm.sh` | P7a/b | Stage-1 arm on real GPU I/O (INVAL / TARGET era keying): witnessed native write FAILS loud, `[UU]`, badblocks empty, breadcrumb, injected≥1 @ remaining=1. |
+| `test_p7c_compat_convergence.sh` | P7c | Production posture (`allow_compat_mode: true`): kernel side must PASS; userspace bounce-retry pair may SKIP "cuFile compat mode does not retry mid-IO errors". |
+| `test_p7d_raid10_arm.sh` | P7d | P7a on CSI raid10 via `raid10_ms:raid10_end_write_request`; SKIP "fewer than 4 test partitions". |
+| `test_p7e_ab_contrast.sh` | P7e | A/B on gds1 (orchestrator swaps/restores): injected≥1 + witnessed P2P + rc=0 + NO breadcrumb, manifest-guarded. |
+| `test_p7g_rdma_native.sh` / `test_p7h_rdma_leg_fail.sh` | P7g/h | Gated native RDMA both-legs / any-leg-fails-retries; SKIPs name the exact gate (transport, multipath=N boot, advertise, cuFile rdma policy). |
+| `test_p7f_topology.sh` | P7f | Opportunistic cross-RC natural arm: PASS (EINVAL+breadcrumb+witnessed) / SKIP (userspace refusal or whitelisted platform) — never FAIL on witnessed success. |
 | `test_unit_helpers.sh` | — | Rootless unit test + `bash -n` gate over every campaign file. Run after any edit. |
 
 Env knobs the tests honor: `MDADM=` (patched mdadm path), `GDSIO=`/`GDSCHECK=` (tool paths;
@@ -330,7 +370,8 @@ live to parse both (commit on `gds-campaign`).
 
 ## 5. Phase plan and the EXPECTED RESULTS MATRIX
 
-Run priority order; highest-value/lowest-risk first. P5/P6 last (they swap packages / inject faults).
+Run priority order; highest-value/lowest-risk first. P5/P6/P7 last (they swap packages / inject
+faults) — but all run in the **single default invocation** (`--phases` defaults to `p0..p7`).
 
 | Phase | Command (from repo root, as root) | Expected on a healthy P2P-capable L40S | Expected if GPU/gdsio absent |
 |---|---|---|---|
@@ -343,12 +384,20 @@ Run priority order; highest-value/lowest-risk first. P5/P6 last (they swap packa
 | **P4b** | `sudo bash …/test_gate_hotadd_clears.sh` | PASS: advertise → persist on remove → cleared on non-P2P add (raid1+raid10) | PASS (GPU-independent) |
 | **P4c** | `sudo bash …/test_gate_rdma_leg_advertise.sh` | multipath=Y boot (today): PASS "multipath head masks leg advertise; driver=override substrate=…"; post-cabling + multipath=N: PASS "override+hw: leg=adv array=adv (member-AND positive)". Any FAIL = real defect | same — GPU-independent; SKIP only if no RDMA-capable address |
 | **P5** | `bin/gds-campaign --phases p5 --kit <dir>` | baseline swap: tcp-leg array **falsely** advertises (baseline has no member-AND) = expected finding; restore featured PASS | needs `--kit`; else SKIP |
-| **P6** | `sudo bash …/test_divergence_inval.sh` | PASS: `BLK_STS_INVAL swallowed … injected=N` (N≥1), `[UU]` preserved, leg stale | PASS (loop substrate ok, GPU-independent) |
+| **P6** | `sudo bash …/test_divergence_inval.sh` | PASS: `non-P2P INVAL swallowed (narrowness proof) -- rc=0, [UU], leg1 stale, no breadcrumb (injected=N)` | PASS (loop substrate ok, GPU-independent; runs even with in-tree raid1 loaded) |
+| **P7a/b** | `--phases p0,p7` (campaign manages the spoof) | PASS: `stage-1 INVAL arm on raid1 (injected=N, write failed loud, no fault, no badblocks, breadcrumb)` (b: TARGET) | SKIP rc=4 (gdsio absent) — INCOMPLETE on a GPU box |
+| **P7c** | (same invocation) | kernel rows PASS; userspace PASS `compat convergence` or SKIP `cuFile compat mode does not retry mid-IO errors` (escalate to product) | SKIP |
+| **P7d** | (same invocation) | PASS raid10 parity, or SKIP `fewer than 4 test partitions` | SKIP |
+| **P7e** | (same invocation, kit required) | PASS: `gds1 A/B contrast — old silent swallow reproduced (injected=N, rc=0, no breadcrumb)`; `p7 restore PASS` after | SKIP (no kit) — INCOMPLETE on a GPU box |
+| **P7g/h** | (same invocation) | cabled RoCE + override + multipath=N: PASS native both-legs / fail-leg retries; else SKIP naming the exact gate | SKIP |
+| **P7f** | (same invocation) | PASS natural arm on cross-RC pair; SKIP otherwise (never FAIL on witnessed native success) | SKIP |
 
 **Dev-box confirmed live (banked evidence):** P4a, P4b, P6 all PASS; P1/P2/P3-GDS SKIP (no gdsio);
-P3 advertise-consistency PASS at raid1 + raid10 (tcp: `local=1 remote=0`, array=0). P6 reproduced
-with `injected=64`. So on the L40S the **new** results are P1/P2/P3-native (GPU), the P3-rdma
-Finding-E answer, and the cuFile-recognition verdict (§4.6).
+P3 advertise-consistency PASS at raid1 + raid10 (tcp: `local=1 remote=0`, array=0). (The pre-fix
+divergence repro that P6 used to be showed `injected=64`; P6 is now the narrowness proof and the
+GPU-free P7 injector smoke covers the arm-side plumbing.) So on the L40S the **new** results are
+P1/P2/P3-native (GPU), the full P7 arm-on-hardware set, the P3-rdma Finding-E answer, and the
+cuFile-recognition verdict (§4.6).
 
 **L40S confirmed live (2026-07-02, gpu-cluster-manassas, nvidia 595.71.05):** P0 PASS; P1 PASS
 (control map=0 / native map_hits=512); P2 PASS **kernel-witnessed under the §4.6a level-spoof**
@@ -356,25 +405,28 @@ Finding-E answer, and the cuFile-recognition verdict (§4.6).
 (raid0-only policy), which is the expected shape on cuFile 1.15, not a regression; recognition
 probe rc=0. P3 tcp raid1+raid10 PASS; P3 rdma answered on rxe (leg does not advertise); P4a/P4b
 PASS; P5 PASS incl. the manual strict-gdsio step (benign userspace refusal, §4.6a gate 3);
-P6 permanent SKIP on that box (root fs on in-tree md RAID1 → `raid1.ko` unremovable — the guard
-is correct; don't fight it, bank the dev-box repro).
+P6 SKIPped on that box **at the time** (root fs on in-tree md RAID1 → `raid1.ko` unremovable →
+the then-current kprobe-ambiguity guard). **That guard is now RETIRED** — the module-qualified
+injector probe makes P6 (now the narrowness proof) and all of P7 producible on root-on-md targets;
+a re-run expects `p6 divergence PASS narrowness: ...` there.
 
 **Pacing for a few-hours window** (rough budgets): P0 ~10 min, P1 ~15, P2 ~20, P3 ~30, P4 ~30,
-P5 ~20, P6 remainder. Add `probe-cufile-recognition` right after P2 (~10 min) while its array is
-still mounted. Evidence flushes per-phase, so a truncated window still yields conclusions.
+P5 ~20, P6 ~10, P7 remainder (P7a–e ~30 on a GPU box; P7g/h only in the cabled-RoCE window). Add
+`probe-cufile-recognition` right after P2 (~10 min) while its array is still mounted. Evidence
+flushes per-phase, so a truncated window still yields conclusions.
 
-**Risk ordering is deliberate:** P5 and P6 are last because they are the phases most likely to
-wedge or crash the node (false-advertise routing, fault injection) — by then all shipped-commit
+**Risk ordering is deliberate:** P5, P6 and P7 are last because they swap packages / inject faults
+(P5's baseline swap, P7e's gds1 A/B swap, the P6/P7 status injection) — by then all shipped-commit
 evidence is on disk. P5 also has an **optional manual step** (runbook §6): with the baseline
 package installed and a tcp-leg array mounted, drive a **strict** gdsio write under the witness and
 save dmesg — this is the single crash-riskiest action of the window; do it only after p0–p4
 evidence is safely on disk, and expect anything from BLK_STS_INVAL errors to works-but-slow (P2P
 pages have kernel vaddrs, so nvme-tcp's CPU copy may function with degraded performance). Whatever
-happens **is** the finding — record it verbatim. After any P5 activity, verify the box is back on
-the featured package: `dkms status` must show `*.gds1`, and a fresh tcp-leg array must NOT
-advertise (member-AND is featured-only). If the featured re-install fails, the campaign aborts
-loudly with exit 3 and the box is left on baseline — reinstall featured before trusting anything
-that runs afterwards.
+happens **is** the finding — record it verbatim. After any P5 or P7e swap, verify the box is back
+on the **featured gdsM** package: `dkms status` must show `*.gdsM` (NOT `*.gds1`, the pre-fix
+contrast pin), and a fresh tcp-leg array must NOT advertise (member-AND is featured-only). If the
+featured re-install fails, the campaign aborts loudly with exit 3 and the box is left on the
+swapped-in variant — reinstall gdsM before trusting anything that runs afterwards.
 
 ---
 
@@ -383,15 +435,12 @@ that runs afterwards.
 These were hit and root-caused during development. **Do not "fix" the campaign in response to
 these — handle them operationally as described.**
 
-1. **P6 SKIPs after P4 in an unattended full run.** P4 creates arrays; writing md superblocks makes
-   **udev's `64-md-raid-assembly.rules` autoload the in-tree `raid1`/`raid10` modules** and
-   incrementally assemble. In-tree `raid1` then shares the `raid1_end_write_request` symbol with
-   `raid1_ms`, so the P6 kprobe binding is ambiguous and the test **guards by SKIPping** when
-   `/sys/module/raid1` exists.
-   **→ Operational fix:** run **P6 as its own invocation**: stop any in-tree md array
-   (`cat /proc/mdstat`; `mdadm --stop` with the **system** mdadm), `sudo modprobe -r raid1 raid10`,
-   then run `test_divergence_inval.sh` (or `--phases p6`). Confirm with
-   `grep raid1_end_write_request /proc/kallsyms` showing only `[raid1_ms]`.
+1. **(RETIRED) P6 used to SKIP when in-tree raid1 was loaded.** The injector now probes the
+   module-qualified `raid1_ms:raid1_end_write_request`, so udev autoloading in-tree `raid1` (or
+   root-on-md pinning it) no longer matters — P6 runs in the main invocation and on root-on-md
+   boxes. If an injector test still reports a resolution SKIP, read the `gds_kallsyms_check`
+   line in its `.out`: the module named there is missing/duplicated — that is a rig problem,
+   not a reason to force-unload anything.
 
 2. **`merge_control` FAIL on fast NVMe (any scheduler).** The Layer-B
    `test_nonp2p_merge_control.sh` (run under P4) asserts >0 member write-merges, but on fast
@@ -430,10 +479,9 @@ these — handle them operationally as described.**
    **→ Not a regression** — install the test-only `/run` udev override for the GDS-native
    phases and remove it after (§4.6a gate 2). The advertise assertion inside P2 is unaffected.
 
-8. **P6 permanently SKIPs on boxes whose root fs lives on in-tree md** (common on cloud L40S
-   nodes — the Manassas box boots from an md RAID1 pair). `raid1.ko` can never be unloaded, so
-   the kprobe-ambiguity guard always fires. **→ Bank the dev-box reproduction; do not try to
-   defeat the guard.**
+8. **(RETIRED) P6 on root-on-md boxes.** The module-qualified probe made the narrowness proof
+   producible on the Manassas-class targets (root on in-tree md RAID1) — no guard to defeat,
+   nothing to bank remotely. Expect `p6 divergence PASS narrowness: ...` there now.
 
 ---
 
@@ -481,13 +529,15 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 | P2 witness `p2p_bios=0` but cuFile says native | cuFile bounced silently; or witness attach failed | Check witness `-o` dump: if `host_bios>0` the probe fired and cuFile really bounced (real FAIL — investigate cuFile/topology). If witness rc=4, it's a SKIP not FAIL. |
 | P2/P3 witness `p2p_bios>0` on a **CPU** run (false positive) | pgmap union misread on wrong kernel (§7) | Recalibrate on P1 (control must be 0). If control ≠ 0, fix the folio/enum in `gds-p2p-witness` and re-verify. |
 | P2 `advertise FAIL` intermittently | probe flake (rc=4 folded) — should already SKIP | Confirm you're on the post-fix tests (three-way rc). Re-run; a genuine `advertise FAIL` on an all-NVMe array = real member-AND regression (investigate the feature, not the test). |
-| P3 array advertises with a **tcp** leg | member-AND regression **or** you're on the **baseline** package | `ms-queue-features` each member; `dkms status` (must be `*.gds1` featured, not `*.gds0`). If featured and it still advertises → real bug in `raid1_can_advertise_p2pdma`; capture and report. |
+| P3 array advertises with a **tcp** leg | member-AND regression **or** you're on the **baseline** (`*.gds0`) or **pre-fix** (`*.gds1`) package | `ms-queue-features` each member; `dkms status` (featured must be `*.gdsM`, not `*.gds0`/`*.gds1`); cross-check `cat /sys/module/raid1_ms/srcversion` vs the gdsM manifest row. If featured and it still advertises → real bug in `raid1_can_advertise_p2pdma`; capture and report. |
 | P4b advertisement not cleared after non-P2P `--add` | `clear_on_add` regression, or add landed as spare and clear fires on activation | `mdadm --detail /dev/ms0`; re-read advertise after the member is truly active. If still advertising with an active non-P2P member → real bug. |
-| P6 SKIPs "in-tree raid1 loaded" | udev autoloaded raid1 (hazard #1) | `modprobe -r raid1 raid10` (stop in-tree arrays first), re-run. |
-| P6 FAIL "injector never fired" | kprobe didn't bind; symbol ambiguity; module build failed | `grep raid1_end_write_request /proc/kallsyms` (only `[raid1_ms]`?); `dmesg` for insmod errors; rebuild `make -C dkms/inval-inject`. |
-| P6 FAIL "write returned rc≠0" or a leg faulted | **the bug is fixed** (fail-the-write shipped) OR rig broke | If `raid1_should_handle_error` now handles INVAL, the `[FLIP]` markers in the test must be inverted — this is a *feature landing*, not a test bug; confirm with the operator before flipping. Otherwise check dm-flakey table syntax + `safe_mode_delay`. |
+| P6/P7 FAIL "injector never fired" | module-qualified kprobe didn't bind; wrong module loaded; module build failed | check the test's `gds_kallsyms_check` output (`raid1_ms:raid1_end_write_request` must resolve exactly once); `dmesg` for insmod errors; rebuild `make -C dkms/inval-inject`; verify the variant srcversion against the manifest. |
+| P6 shows the "no P2P path" breadcrumb | the stage-1 arm fired for a NON-P2P bio | **kernel bug — escalate, do not loosen the test.** |
+| P7a fails with gdsio rc=0 | the arm did not fire → wrong module variant loaded (gds1/gds0 left behind), or injector mis-aimed | `cat /sys/module/raid1_ms/srcversion` vs the gdsM row of `kit-manifest.tsv`; re-run `sudo ./install.sh`; check `injected` count in the `.out`. |
+| Campaign exit 5 (INCOMPLETE) | a P7 subtest SKIPped for a reason outside the expected gates/hatches on a GPU box | read the `INCOMPLETE:` log lines; fix the named rig condition and re-run `--phases p0,p7` (p0 refreshes env.sh — a p0-less run only inherits a previous run's values). Treat as red, not as a pass. |
 | Node wedged, kthreads in D state | a real deadlock; or you ran with `MD_SUBSYS=md` | **Never set `MD_SUBSYS=md`** — the raid10 recovery-freeze test wedges in-tree kthreads (reboot to clear). Copy `results/` off, reboot, resume with `--phases`. |
 | Array won't create ("device busy"/superblock) | stale superblock or udev grabbed the device | `mdadm --stop`; `mdadm --zero-superblock <dev>` (system mdadm for /dev/mdN, patched for members); `wipefs -a` as last resort on a **test** partition only. |
+| Array create hits `EBUSY` on a labeled test partition | the `*-meshstor-test-*` label resolves onto a **live md/root array member** (seen on the dev box: `nvme1n1-meshstor-test-2` → `/dev/nvme0n1p4`, a live `md0` member) | **STOP — do the runbook's HARD pre-flight**: `cat /proc/mdstat`; `for L in /dev/disk/by-partlabel/*-meshstor-test-*; do echo "$L -> $(readlink -f "$L")"; done`; `mdadm --detail /dev/md0`. Re-point/drop the overlapping label (`perf-make-test-partitions … --remove` then recreate on free space) before any campaign phase. Never create on a live-array member. |
 
 ---
 
@@ -505,15 +555,18 @@ to fix a genuine tooling bug, and re-run the unit gate + the affected live test 
 - Edit `drivers/md` / the shipped feature to make a test pass (that changes what's under test —
   escalate instead).
 - Set `MD_SUBSYS=md` (wedges in-tree kthreads).
-- Enable `allow_compat_mode: true` to get a "native" pass.
+- Enable `allow_compat_mode: true` to launder a **native** pass (P1/P2/P7g). (P7c *deliberately*
+  runs compat mode to test the production bounce-retry posture — a different assertion, not a
+  native-path claim; its kernel-side arm rows still key on the breadcrumb, not on cuFile.)
 - Push, force-push, or rewrite history without the operator saying so.
 
 **ESCALATE to the operator (report clearly, don't guess) when:**
 - A shipped-feature assertion genuinely FAILs (member-AND, clear_on_add, silent-divergence
   behavior changed) — this is a real finding, the whole point of the campaign.
 - P1 can't do native GDS at all (topology/ACS/driver) — needs a human hardware call.
-- P6's bug appears **fixed** (INVAL now handled) — that's a feature landing; the `[FLIP]` markers
-  need inverting, confirm intent first.
+- P6 shows the stage-1 breadcrumb, or any P7 kernel-side row FAILs (arm not firing / firing too
+  wide / faulting legs / recording badblocks) — that is a real stage-1 regression on the shipping
+  composition, the single most valuable finding this campaign can produce.
 - You're tempted to change what a test asserts.
 
 ---
@@ -545,29 +598,30 @@ bin/gds-p2p-witness                               native-path witness (bpftrace)
 bin/gds-make-kit                                  kit builder
 bin/probe-cufile-recognition                      cuFile RAID-classification probe (§4.6)
 bin/mok-enroll                                    MOK enrollment helper (git checkout only, not in kit)
-tools/testing/selftests/md/p2pdma/gds/            the 6 phase tests + lib.sh + unit test
+tools/testing/selftests/md/p2pdma/gds/            P0–P6 phase tests + the P7a–h stage-1 subtests + injector smoke + lib.sh + unit test
 tools/testing/selftests/md/p2pdma/lib.sh          Layer-B helpers (sourced by gds/lib.sh)
 tools/testing/selftests/md/p2pdma/test_*.sh       Layer-B non-P2P regression suite (run under P4)
-dkms/inval-inject/                                divergence injector (make -C to build)
+dkms/inval-inject/                                status injector + README (make -C to build)
 dkms/udev/63-ms-raid-arrays.rules                 cuFile RAID-classification udev rule
 docs/gds-l40s-runbook.md                          concise window runbook (procedure + abort)
-build/gds-kit-0.1.0.tar.gz                        the scp-able kit
+build/gds-kit-0.2.0.tar.gz                        the scp-able kit (3 variants + manifest)
 ```
 Design spec + implementation plan (deeper rationale, gitignored local archive):
 `docs/superpowers/specs/2026-07-01-gds-l40s-p2pdma-campaign-design.md` and
-`docs/superpowers/plans/2026-07-01-gds-l40s-campaign.md`. The deferred integrity-bug design lives
-on branch `p2pdma` as `docs/…p2pdma-blk-sts-inval-and-self-heal-followup.md`.
+`docs/superpowers/plans/2026-07-01-gds-l40s-campaign.md`. Stage-1 fail-the-write is **landed**
+(§1.2 item 4); the still-deferred **stage-2 self-heal** design lives on branch `p2pdma` as
+`docs/…p2pdma-blk-sts-inval-and-self-heal-followup.md`.
 
 ---
 
 ## 12. First moves on the L40S box (suggested order)
 
 1. **Sanity:** `mokutil --sb-state` (**Secure Boot must be off or MOK enrolled — see §3, do this first**); `uname -r`; `grep CONFIG_PCI_P2PDMA /boot/config-$(uname -r)`; `command -v bpftrace gdsio gdscheck`; `nvidia-smi`; `modinfo -F license nvidia` (want `GPL`/OpenRM); `cat /proc/driver/nvidia/version` (**≥ 595 on a ≥ 6.15 kernel — else apply §3.2 before anything GDS-native**); apply the §3.2 regkeys + verify `p2pmem/` per GPU; `cat /proc/cmdline` (note iommu settings for the evidence). If `CONFIG_PCI_P2PDMA` ≠ y or the NVIDIA module is proprietary, **stop and report** — native P2P won't work.
-2. **Install:** kit `sudo ./install.sh` (featured ms variant + nvme-rdma override + modprobe + udev rule — note the override's OK/WARNING line), then `sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm` (§3.1 kit gap — required for cuFile classification), or use the checkout's already-loaded modules. Confirm `/proc/msstat` shows `[raid1] [raid10]`. For the GDS-native phases install the §4.6a test-only level-spoof (cuFile 1.15 is raid0-only) and remove it after.
+2. **Install:** kit `sudo ./install.sh` (featured **gdsM** + `/usr/sbin/msadm` + nvme-rdma override + udev rule + manifest — note the override's OK/WARNING line; `test -x /usr/sbin/msadm` should print, and P0 gates on `msadm_present`), or use the checkout's already-loaded modules. Confirm `/proc/msstat` shows `[raid1] [raid10]`. For the manual GDS-native probes (step 4) install the §4.6a test-only level-spoof (cuFile 1.15 is raid0-only) and remove it after — but the **campaign itself now owns and removes the p7 spoof**, so don't fight it during the main run.
 3. **Verify gdsio's interface:** `gdsio -h` — cross-check the wrappers' flags (`-x` mode numbering, `-V` verify, `-I` read/write) before P1; fix only the two lib wrappers if they differ (§8 row). Pick the GPU index for `-d`: `nvidia-smi topo -m` — choose the GPU with the tightest path (PIX/PXB, not SYS) to the test NVMe.
 4. **Partitions:** `sudo bin/perf-make-test-partitions /dev/nvmeXnY` (4K-LBA NVMe with trailing free space; make 4 across two drives for the raid10 fabric case, passed via `GDS_PART_LIST`). Confirm `/dev/disk/by-partlabel/*-meshstor-test-*`.
 5. **Kernel check for the witness (§7):** if not a 6.17-class kernel, verify the pgmap/enum offsets and recalibrate on P1 before trusting P2/P3.
-6. **Run in priority order**, reading `verdict.tsv` after each: P0 → P1 → P2 (+ **`probe-cufile-recognition` on P2's mounted array**, §4.6) → P3(tcp then rdma) → P4a → P4b → P4c → then **P6 in its own invocation** (unload in-tree raid1 first) → P5 last (needs `--kit`; verify featured restored after; the manual strict-gdsio-on-baseline step only once everything else is on disk).
+6. **Run the full campaign in one invocation** (`bin/gds-campaign --kit $PWD --results …` defaults to `p0..p7`), reading `verdict.tsv` after it: P0 → P1 → P2 (+ **`probe-cufile-recognition` on P2's mounted array**, §4.6) → P3(tcp then rdma) → P4a/b/c → **P6 the narrowness proof** (no longer needs its own invocation — the module-qualified probe made it run inline, even on root-on-md) → **P7 the stage-1 arm on GPU I/O** (the campaign manages its raid0 spoof) → P5's baseline swap. Exit 5 = INCOMPLETE (an unexpected P7 SKIP on a GPU box — treat as red). The manual strict-gdsio-on-baseline step (runbook §6) only once everything else is on disk.
 7. **Collect evidence** (§10) **before** the window ends.
 
 Work from the git checkout or the kit; keep the operator informed of every FAIL with its `.out` +

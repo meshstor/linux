@@ -4,15 +4,40 @@ Copy-paste procedure for the few-hours hardware window. Deep context, expected
 results per phase, and the full debugging playbook live in
 `docs/gds-l40s-agent-briefing.md` — hand that file to an assisting model.
 Every block below is paste-able as-is; run everything **from the kit root**
-(`cd /opt/gds-kit-0.1.0`) as a sudo-capable user.
+(`cd /opt/gds-kit-0.2.0`) as a sudo-capable user.
 
 ## Before the window (dev machine)
 
 ```bash
-bin/gds-make-kit 0.1.0                       # -> build/gds-kit-0.1.0.tar.gz
-sudo bin/gds-campaign --rehearsal            # every row PASS or SKIP-with-GPU-only-reason
-scp build/gds-kit-0.1.0.tar.gz l40s:/opt/
+bash tools/testing/selftests/md/p2pdma/gds/test_unit_helpers.sh   # want: PASS: unit helpers
+sudo bash tools/testing/selftests/md/p2pdma/gds/test_injector_smoke.sh  # resolver+filter smoke
+bin/gds-make-kit 0.2.0                       # -> build/gds-kit-0.2.0.tar.gz (3 variants + manifest)
+sudo bin/gds-campaign --rehearsal --kit build/gds-kit-0.2.0   # P0-P6 green, P7a-e live, P7g/h/f SKIP
+scp build/gds-kit-0.2.0.tar.gz l40s:/opt/
 ```
+
+If `bin/gds-make-kit` wedges during its internal `rebuild-main` (`git am`) on a
+build box with `commit.gpgsign=true` and an unreachable ssh/gpg signing key,
+disable signing for the build — `git config commit.gpgsign false` (or export
+`GIT_CONFIG_PARAMETERS` / run with `-c commit.gpgsign=false`) — then re-run. The
+kit's DKMS tarballs are content-only; signing has no bearing on them.
+
+### Kit variants + identity manifest
+
+| variant | source | role |
+|---|---|---|
+| **gdsM** | `origin/meshstor-main` (SHA in manifest; `9478967d` at design time) | **featured/default install** — the shipping composition, stage-1 fail-the-write included; every phase runs on it |
+| gds1 | `master` + `p2pdma@0fb37cf5` (pinned, pre-fix) | P7e A/B contrast ONLY |
+| gds0 | verbatim `master` | P5 baseline (upstream unconditional advertise) |
+
+`kit-manifest.tsv` (kit root, copied beside the tarballs by install.sh) records
+per-variant srcversions for `ms_mod`, `raid1_ms` AND `raid10_ms` — the stage-1
+delta is invisible in `ms_mod`'s srcversion, so the campaign's
+`ms_module_identity` gate compares the personality modules. A stale loaded
+variant triggers a gdsM reinstall; parse rows with `bin/gds-kit-manifest
+<manifest> <variant> ref|tarball|srcversions`. After ANY module swap:
+`cat /sys/module/raid1_ms/srcversion` must equal the manifest row of the
+variant you expect.
 
 ## On the box — step 0: sanity gates (do these FIRST; each can kill the window)
 
@@ -61,16 +86,32 @@ driver version gate above is not met; P1 will fail with map_hits=0.
 ## Step 1: install + partitions
 
 ```bash
-tar xzf /opt/gds-kit-0.1.0.tar.gz -C /opt && cd /opt/gds-kit-0.1.0
-sudo ./install.sh                             # featured ms variant + nvme-rdma override + modprobe + udev rule
-sudo install -m0755 bin/mdadm-ms /usr/sbin/msadm   # REQUIRED: the udev rule's IMPORT{program}
-                                              # runs /usr/sbin/msadm; install.sh does not install
-                                              # it (known gap) and without it /dev/msN gets NO
-                                              # MD_* properties -> cuFile "Unsupported block device"
+tar xzf /opt/gds-kit-0.2.0.tar.gz -C /opt && cd /opt/gds-kit-0.2.0
+sudo ./install.sh                             # featured (gdsM) + nvme-rdma override + udev rule + /usr/sbin/msadm + manifest
+test -x /usr/sbin/msadm && echo msadm-ok      # install.sh now installs it; P0 gates on msadm_present
 grep Personalities /proc/msstat               # want: [raid1] [raid10]
 sudo bin/perf-make-test-partitions /dev/nvmeXnY    # 4K-LBA NVMe with trailing free space
 ls /dev/disk/by-partlabel/*-meshstor-test-*   # want: >=2 labels (4, across two drives, for raid10 fabric)
 ```
+
+**HARD pre-flight — labeled test partitions must NOT overlap a live array.**
+A stale/mis-pointed partlabel can resolve to a disk that is already a member of
+a live md array (on the dev box, `nvme1n1-meshstor-test-2` resolved to
+`/dev/nvme0n1p4`, a **live `md0` root-RAID member**). A campaign phase that
+creates an array on such a partition hits `EBUSY` at best and can disturb the
+**root array** at worst. Before the first run, prove the labels are safe:
+
+```bash
+cat /proc/mdstat                              # note every live md member
+lsblk -o NAME,PARTLABEL,MOUNTPOINT,FSTYPE     # map each *-meshstor-test-* label to its disk
+for L in /dev/disk/by-partlabel/*-meshstor-test-*; do echo "$L -> $(readlink -f "$L")"; done
+mdadm --detail /dev/md0 2>/dev/null           # (system mdadm) confirm none of the above are members
+```
+
+Any test label that resolves onto a live md/root member → **re-point or drop
+that label** (`sudo bin/perf-make-test-partitions … --remove` then recreate on
+truly-free space) before running the campaign. Do not proceed with an
+overlapping label.
 
 `install.sh` now also installs the **meshstor-nvme-rdma override**
 (nvme-rdma + the 23528aa P2PDMA backport, overriding via /updates).
@@ -96,7 +137,14 @@ If the installed gdsio's mode numbering or verify flag differs, fix ONLY
 re-run `bash selftests/p2pdma/gds/test_unit_helpers.sh` (want `PASS: unit helpers`).
 Pick the `-d` GPU index with the tightest PCIe path to the NVMe (step 0's topo output).
 
-## Step 3: the main run (p0–p5; p6 runs separately — see step 5)
+## Step 3: the main run (p0–p7 in one invocation)
+
+The module-qualified injector probe un-SKIPped p6 on root-on-md boxes, and
+p7 installs/verifies its own raid0 spoof and removes it — including via an
+EXIT trap on aborts. The campaign takes ownership of the spoof whenever p7
+runs (overwriting any pre-installed rule) and removes it at exit, so manual
+post-campaign steps that need it — steps 4 and 6 — must reinstall the rule
+themselves.
 
 **cuFile 1.15 gate (found live): cuFile registers files only on `MD_LEVEL=raid0`
 arrays** — raid1/raid10 are refused in userspace ("RAID level not supported by
@@ -120,9 +168,11 @@ checks from the level, and production behavior on a lied-to cuFile is untested
 beyond these probes.
 
 ```bash
-sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign \
-     --phases p0,p1,p2,p3,p4,p5 --results /root/gds-results
+sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign --results /root/gds-results
 column -t -s $'\t' /root/gds-results/verdict.tsv 2>/dev/null || cat /root/gds-results/verdict.tsv
+# exit 0 = green; 1 = a FAIL row; 5 = INCOMPLETE (a P7 SKIP outside the
+# expected gate/hatch set on a GPU-present box — treat as RED: stage-1
+# evidence is missing without an accepted reason)
 ```
 
 The campaign continues past failures; it stops only on a node-heartbeat wedge
@@ -133,11 +183,16 @@ The campaign continues past failures; it stops only on a node-heartbeat wedge
   PM9A3: requests dispatch before they can queue). Treat the FAIL as
   environment noise, not a p2pdma regression.
 - **p5 restore check:** after p5, confirm the featured package is back —
-  `dkms status | grep meshstor` must show `*.gds1`. If the campaign aborted
-  with exit 3 during p5, the box is on the BASELINE module: rerun
-  `sudo ./install.sh` before anything else.
+  `dkms status | grep meshstor` must show `*.gdsM` (the featured variant is
+  now **gdsM**, not `.gds1` — `.gds1` is the pre-fix A/B-contrast pin). If the
+  campaign aborted with exit 3 during p5, the box is on the BASELINE (`.gds0`)
+  module: rerun `sudo ./install.sh` before anything else.
 
 ## Step 4: cuFile RAID-classification probe (needs a mounted ms array — the tests stop theirs)
+
+NB the campaign removed its own raid0 spoof at exit, so this step and step 6
+must (re)install the rule themselves before expecting cuFile raid0 behavior:
+`sudo mkdir -p /run/udev/rules.d && printf 'SUBSYSTEM=="block", KERNEL=="ms*", ENV{MD_LEVEL}="raid0"\n' | sudo tee /run/udev/rules.d/64-ms-raid0-spoof.rules && sudo udevadm control --reload`.
 
 ```bash
 M0=$(ls /dev/disk/by-partlabel/*-meshstor-test-* | sed -n 1p)
@@ -166,26 +221,70 @@ sysfs only). Exit 1 = compat fallback; the kernel side may still be perfect
 3. "unknown NVMe transport type ... transport: tcp" → cuFile also rejects
    nvme-tcp RAID members in userspace (its own member-transport AND).
 
-## Step 5: p6 divergence repro — its OWN invocation (p4 traffic makes udev reload in-tree raid1, which steals the kprobe symbol and p6 SKIPs)
+## Step 5: p6 — the stage-1 NARROWNESS proof (runs inside the main invocation)
 
-```bash
-cat /proc/mdstat                              # stop any in-tree /dev/mdN with the SYSTEM mdadm first
-sudo modprobe -r raid1 raid10                 # clear the in-tree copies
-sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign --phases p6 --results /root/gds-results
+The injector now binds module-qualified (`raid1_ms:raid1_end_write_request`),
+so in-tree `raid1` being loaded — udev autoload or root-on-md — no longer
+steals the probe; the old "own invocation" dance is gone. Want:
+`p6 divergence PASS narrowness: injected=N rc=0 msstat=[UU] leg1=stale(A)
+no-breadcrumb` — a plain-bio INVAL is still swallowed (upstream semantics)
+AND the stage-1 arm did not fire ("no P2P path" absent). If p6 shows the
+breadcrumb: the arm fired for a non-P2P bio — kernel bug, escalate, do not
+loosen the test. Standalone rerun if needed:
+`sudo MDADM=$PWD/bin/mdadm-ms GDS_KIT_DIR=$PWD bin/gds-campaign --phases p6 --results /root/gds-results`.
+NB any rerun truncates `verdict.tsv` in the shared `--results` dir (it
+describes that invocation only) — the earlier full table survives in
+`campaign.log`.
+
+## Step 5b: p7 — stage-1 fail-the-write on real GPU I/O (runs inside the main invocation)
+
+What to expect in `verdict.tsv` (all on gdsM, CSI array shape, spoof managed
+by the phase itself):
+
+```
+p7  spoof        PASS  behavioral: scratch ms array reports MD_LEVEL=raid0
+p7  p7a          PASS  EINVAL surfaced injected=N [UU] badblocks-empty breadcrumb
+p7  p7b          PASS  TARGET keyed: EINVAL surfaced injected=N [UU] badblocks-empty breadcrumb
+p7  p7c_kernel   PASS  breadcrumb, [UU], badblocks-empty, injected=N, disarmed pre-convergence
+p7  p7c_userspace PASS gdsio rc=0 (bounce retry) + per-leg sha convergence
+                  (or SKIP "cuFile compat mode does not retry mid-IO errors" -> product escalation)
+p7  p7d          PASS  raid10: EINVAL surfaced ... (or SKIP "fewer than 4 test partitions")
+p7  p7g / p7h    PASS on cabled RoCE + multipath=N boot; else SKIP naming the exact gate
+p7  p7e          PASS  gds1 contrast: injected=N p2p-witnessed rc=0 no-breadcrumb
+p7  restore      PASS  gdsM restored after A/B contrast (srcversion re-asserted)
+p7  p7f          PASS natural arm / SKIP (no cross-RC pair, userspace refusal, or whitelisted)
+final spoof_removed / injector_unloaded  PASS
 ```
 
-Want: `p6 divergence PASS ... injected=N` — PASS means the known bug reproduced
-(write reported success while a leg went silently stale). A p6 SKIP right after
-a combined run is not an abort — rerun standalone as above.
+If the campaign aborts mid-p7 (exit 3): the EXIT trap already removed the
+spoof and disarmed/unloaded the injector — verify with
+`ls /run/udev/rules.d/64-ms-raid0-spoof.rules` (must be absent) and
+`lsmod | grep inval_inject` (must be empty). If the abort happened between
+the gds1 swap and the restore, the box is on the PRE-FIX module: run
+`sudo ./install.sh` (installs gdsM) before trusting anything else.
+
+P7a FAIL with rc=0 ⇒ the arm did not fire ⇒ check the variant:
+`cat /sys/module/raid1_ms/srcversion` vs the gdsM manifest row.
+
+P7c FAIL on its kernel row with "no native attempt witnessed" ⇒ lenient-mode
+cuFile may skip the native path entirely — treat it as the cuFile-policy
+hatch: record, SKIP-equivalent, escalate to product; do not chase a kernel
+bug.
 
 ## Step 6 (OPTIONAL, crash-riskiest — only after all evidence above is off-box): strict GDS write against the falsely-advertising BASELINE array
 
 ```bash
-# swap to baseline
+# the campaign removed its raid0 spoof at exit — reinstall it for this manual step
+sudo mkdir -p /run/udev/rules.d
+printf 'SUBSYSTEM=="block", KERNEL=="ms*", ENV{MD_LEVEL}="raid0"\n' \
+    | sudo tee /run/udev/rules.d/64-ms-raid0-spoof.rules >/dev/null
+sudo udevadm control --reload
+# swap to baseline (featured install.sh put gdsM on the box; remove that first)
 TB=$(ls $PWD/tarballs/*gds0*.dkms.tar.gz); TMP=$(mktemp -d); tar xzf "$TB" -C "$TMP"
 VER=$(ls "$TMP" | sed 's/^meshstor-ms-//'); sudo cp -r "$TMP/meshstor-ms-$VER" /usr/src/
+FEATURED=$(dkms status meshstor-ms 2>/dev/null | grep -o 'meshstor-ms/[^,:]*gdsM' | head -1)
 sudo modprobe -r raid10_ms raid1_ms ms_mod
-sudo dkms remove meshstor-ms/0.1.0.gds1 --all; sudo dkms add "meshstor-ms/$VER" && sudo dkms install "meshstor-ms/$VER"
+sudo dkms remove "${FEATURED:-meshstor-ms/0.2.0.gdsM}" --all; sudo dkms add "meshstor-ms/$VER" && sudo dkms install "meshstor-ms/$VER"
 sudo modprobe ms_mod && sudo modprobe raid1_ms && sudo modprobe raid10_ms
 # local + loopback-tcp array (the shape baseline FALSELY advertises)
 M0=$(ls /dev/disk/by-partlabel/*-meshstor-test-* | sed -n 1p)
@@ -225,7 +324,8 @@ sudo dmesg > /root/dmesg-after-p5manual.txt
 sudo umount /mnt/ms0; sudo $PWD/bin/mdadm-ms --stop /dev/ms0
 sudo nvme disconnect -n "$NQN"; sudo rm -f "$PT/subsystems/$NQN"; sudo rmdir "$PT"
 echo 0 | sudo tee "$SS/namespaces/1/enable" >/dev/null; sudo rmdir "$SS/namespaces/1" "$SS"
-sudo ./install.sh && dkms status | grep gds1
+sudo ./install.sh && dkms status | grep gdsM
+sudo rm -f /run/udev/rules.d/64-ms-raid0-spoof.rules && sudo udevadm control --reload
 ```
 
 Whatever happens (INVAL errors, works-but-slow, oops) **is** the finding — save
@@ -259,13 +359,24 @@ scp /root/gds-evidence.tgz <you>@<devbox>:/tmp/    # plus /var/log/kern.log if a
 
 p1 = box does native GDS (witness-calibrated); p2 = **headline** — GDS-native on
 ms raid1, kernel-witnessed, both legs identical; p3 = CSI fabric topology +
-whether an nvme-rdma leg advertises P2P (new empirical data); p4 = member-AND +
-hot-add-clear + rdma-leg advertise gate (P4c) + Layer-B non-P2P regressions;
-p5 = upstream-baseline falsely
-advertises with a tcp leg (justifies the fork's member-AND); p6 = BLK_STS_INVAL
-silent divergence reproduced (evidence for the fail-the-write follow-up);
-step 4's probe = cuFile actually classifies `/dev/msN` as RAID and takes the
-real P2P path (the kernel flag alone is necessary, not sufficient).
+whether an nvme-rdma leg advertises P2P; p4 = member-AND + hot-add-clear +
+rdma-leg advertise gate (P4c) + Layer-B non-P2P regressions; p5 =
+upstream-baseline falsely advertises with a tcp leg (justifies the fork's
+member-AND); p6 = **stage-1 narrowness** — a non-P2P INVAL keeps upstream
+swallow semantics and the arm does NOT fire (no breadcrumb); p7 = **stage-1
+fail-the-write on real GPU I/O** — p7a/b the era-keyed arm (INVAL/TARGET ⇒
+EINVAL loud, no fault, no badblocks, breadcrumb), p7c compat convergence
+(production posture), p7d raid10 parity, p7e A/B contrast on pre-fix gds1
+(old silent swallow, no breadcrumb), p7g/h native RDMA both-legs + any-leg
+fallback (gated), p7f opportunistic natural-arm topology; step 4's probe =
+cuFile actually classifies `/dev/msN` as RAID and takes the real P2P path.
+
+Where each piece of stage-1 evidence can be produced: p7a–e = dev box
+(rehearsal) AND the L40S target (the module-qualified probe made root-on-md
+boxes injectable — the same fix un-SKIPped p6 there); p7g/h = only a box
+with cabled hardware RoCE, the nvme-rdma override, and a
+`nvme_core.multipath=N` boot; p7f = only a box whose test NVMe pair spans
+root complexes.
 
 P4c expectations (do not "fix" a PASS-refusal):
 
@@ -286,9 +397,14 @@ valid PASS for the latter.
 
 All of the above achieved except two hardware impossibilities on that box:
 P3 real-RoCE (mlx5 ports uncabled; answered on rxe, labeled UNREPRESENTATIVE:
-nvme-rdma loopback leg does NOT advertise on 6.17) and P6 (root fs on in-tree
-md RAID1 → `raid1.ko` unremovable → guard SKIPs; repro stays banked from the
-dev box, injected=64). P2 kernel-witnessed under the step-3 spoof:
+nvme-rdma loopback leg does NOT advertise on 6.17) and — **as of that
+2026-07-02 run** — P6 (root fs on in-tree md RAID1 → `raid1.ko` unremovable →
+the then-current kprobe-ambiguity guard SKIPped; dev-box repro of the old
+bug was injected=64). **SINCE RETIRED:** the module-qualified injector probe
+(`raid1_ms:raid1_end_write_request`) removed that guard, so P6 — now the
+stage-1 *narrowness* proof, not a bug repro — runs on root-on-md boxes too;
+expect `p6 divergence PASS narrowness: …` on the next window.
+P2 kernel-witnessed under the step-3 spoof:
 p2p_bios=520 / map_hits=779 / legs identical; recognition probe rc=0.
 Standing product escalations: (1) cuFile 1.15 is raid0-only — CSI raid1/raid10
 volumes cannot do cuFile-native GDS without an NVIDIA-side change or a
@@ -308,16 +424,31 @@ masker 1 only. On rxe the expected result stays negative regardless
 (virt-DMA refusal — correct; verified live on the dev box 2026-07-03:
 head features=0x10093 vs member 0x11093, bit 12 masked).
 
-## Post-cabling procedure (first actions when the RoCE ports go live)
+## Post-cabling procedure — the gated P7g/P7h window (first actions when the RoCE ports go live)
 
 1. `sudo rdma link delete rxe0` — the stale soft-RoCE device P0
    auto-created would otherwise skew substrate classification and
    address selection toward virt-DMA.
 2. Boot with `nvme_core.multipath=N` (kernel cmdline, or
    `options nvme_core multipath=N` in modprobe.d + initramfs regen +
-   reboot) — removes masker 2; NB device naming changes (no head node).
+   reboot) — P0 captures the value; P7g/h SKIP with "boot
+   nvme_core.multipath=N and rerun" until this is done. Pre-window
+   planning item — not discoverable mid-window. NB device naming
+   changes (no head node).
 3. Re-run `sudo ./install.sh` if the kit was refreshed (version bump
    required if override source changed).
-4. Run the p4 rdma gate (or the full campaign): this is where the
-   override×hw positive rows — leg advertises, raid1 array advertises
-   (member-AND both-advertise) — first become reachable.
+4. Run the p4 rdma gate, then `--phases p0,p7`: P7g asserts a witnessed
+   NATIVE write over [local, rdma] legs with both legs verified through
+   the nvmet backing device, and P7h asserts the CPU/kernel bounce retry
+   when either leg fails (fail-local + fail-remote sub-runs). A cuFile
+   userspace refusal ("cuFile member-transport policy (rdma)") is a SKIP
+   + product escalation, not a FAIL — the P5-manual precedent.
+
+**P7g/h witness precondition (target-kernel).** The `map_hits` witness gates
+on `--expect-map nonzero`, which needs the target kernel to expose the P2P
+DMA-map path (`__pci_p2pdma_update_state` / `pci_p2pdma_*`) in bpftrace's
+function list — confirm with
+`bpftrace -l 'kprobe:pci_p2pdma_*' 'kprobe:__pci_p2pdma_update_state'`
+(present on 6.17-class). A kernel that lacks these symbols would read
+`map_hits=0` on a genuinely-native write and **false-FAIL** P7g/h — recalibrate
+on P1 (native must read map>0) before trusting the RDMA rows.
