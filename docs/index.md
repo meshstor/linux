@@ -32,6 +32,14 @@ Reading order:
 - [performance.md](performance.md) — measured perf characteristics
   with guidance on when llbitmap is a win.
 
+## If you are validating GPUDirect Storage / P2PDMA
+
+- [gds-ai-pc-rerun-runbook.md](gds-ai-pc-rerun-runbook.md) — the full
+  check list for the ai-pc rig (Ubuntu 26.04 / 7.0, mixed local+nvme-rdma
+  ms raid1): machine identity, the hazards that have already cost data,
+  the GPU BAR1>=VRAM gate, and the ordered re-run commands.
+- [gds-l40s-runbook.md](gds-l40s-runbook.md) — the rented-L40S campaign.
+
 ## If you are maintaining the project
 
 - [architecture.md](architecture.md) — design vocabulary used by

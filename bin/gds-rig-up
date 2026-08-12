@@ -1,0 +1,75 @@
+#!/bin/bash
+# rig-up.sh — rebuild the mixed-leg ms raid1 reference rig on ai-pc (Ubuntu 26.04/7.0).
+#   local leg : by-partlabel/p2p-local
+#   rdma leg  : nvmet-rdma export of by-partlabel/p2p-back over mlx5, connected back
+#   array     : /dev/ms0 raid1, lockless bitmap
+# Idempotent-ish: tears down an existing rig first. Run as root.
+set -u
+MDADM=${MDADM:-/home/mykola/mdadm/mdadm}
+SUB=mesh-loop
+TADDR=10.99.0.1
+
+# DEVICE IDENTITY — NEVER hardcode /dev/nvmeXnY. Kernel NVMe enumeration is NOT
+# stable across reboots: on 2026-08-06 nvme0n1 flipped from the WD test drive to
+# the Kingston WINDOWS drive between boots, and a hardcoded path pointed this rig
+# at Windows partitions. Use the PARTLABELs created by us, and refuse to run if
+# they don't resolve or if the resolved disk carries a Windows/EFI signature.
+LOCAL_LEG=/dev/disk/by-partlabel/p2p-local
+BACK_DEV=/dev/disk/by-partlabel/p2p-back
+for d in "$LOCAL_LEG" "$BACK_DEV"; do
+	[ -e "$d" ] || { echo "FATAL: $d does not resolve — refusing to guess device names"; exit 1; }
+done
+LOCAL_LEG=$(readlink -f "$LOCAL_LEG"); BACK_DEV=$(readlink -f "$BACK_DEV")
+PARENT=/dev/$(lsblk -no pkname "$LOCAL_LEG")
+if lsblk -no FSTYPE "$PARENT" | grep -qi ntfs || lsblk -no PARTTYPENAME "$PARENT" 2>/dev/null | grep -qi 'microsoft\|EFI'; then
+	echo "FATAL: $PARENT carries Windows/EFI signatures — refusing to touch it"; exit 1
+fi
+echo "== using legs: local=$LOCAL_LEG back=$BACK_DEV (parent $PARENT)"
+
+echo "== teardown any prior rig"
+$MDADM --stop /dev/ms0 2>/dev/null
+nvme disconnect -n $SUB >/dev/null 2>&1
+rm -f /sys/kernel/config/nvmet/ports/1/subsystems/$SUB 2>/dev/null
+rmdir /sys/kernel/config/nvmet/ports/1 2>/dev/null
+echo 0 > /sys/kernel/config/nvmet/subsystems/$SUB/namespaces/1/enable 2>/dev/null
+rmdir /sys/kernel/config/nvmet/subsystems/$SUB/namespaces/1 2>/dev/null
+rmdir /sys/kernel/config/nvmet/subsystems/$SUB 2>/dev/null
+
+echo "== modules"
+modprobe ms_mod; modprobe raid1_ms; modprobe raid10_ms
+modprobe nvme-rdma; modprobe nvmet; modprobe nvmet-rdma
+
+echo "== fabric addresses (idempotent)"
+ip addr add 10.99.0.1/30 dev enp3s0f0np0 2>/dev/null
+ip addr add 10.99.0.2/30 dev enp3s0f1np1 2>/dev/null
+ip link set enp3s0f0np0 up; ip link set enp3s0f1np1 up
+
+echo "== nvmet-rdma target"
+S=/sys/kernel/config/nvmet/subsystems/$SUB
+mkdir -p $S; echo 1 > $S/attr_allow_any_host
+mkdir -p $S/namespaces/1
+echo "$BACK_DEV" > $S/namespaces/1/device_path
+echo 1 > $S/namespaces/1/enable
+P=/sys/kernel/config/nvmet/ports/1
+mkdir -p $P
+echo ipv4 > $P/addr_adrfam; echo rdma > $P/addr_trtype
+echo $TADDR > $P/addr_traddr; echo 4420 > $P/addr_trsvcid
+ln -s $S $P/subsystems/$SUB 2>/dev/null
+
+echo "== connect initiator"
+nvme connect -t rdma -a $TADDR -s 4420 -n $SUB || exit 1
+sleep 2
+RLEG=$(nvme list | awk '/Linux/{print $1}' | head -1)
+[ -n "$RLEG" ] || { echo "FATAL: rdma leg not found"; exit 1; }
+echo "   rdma leg = $RLEG"
+
+echo "== evict in-kernel md (it auto-assembles ms members: identical superblock)"
+for m in /dev/md[0-9]*; do [ -b "$m" ] && $MDADM --stop "$m" >/dev/null 2>&1; done
+
+echo "== assemble array"
+$MDADM --create /dev/ms0 --level=1 --raid-devices=2 --bitmap=lockless --run \
+    "$LOCAL_LEG" "$RLEG" || exit 1
+sleep 2
+cat /proc/msstat
+echo "== p2pdma_status:"
+cat /sys/block/ms0/ms/p2pdma_status
