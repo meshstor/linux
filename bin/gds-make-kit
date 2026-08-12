@@ -127,7 +127,9 @@ manifest_row gds1 "master@$GDS0_SHA+p2pdma@$GDS1_SHA" "meshstor-ms-$VER.gds1.dkm
 manifest_row gdsM "origin/meshstor-main@$GDSM_SHA" "meshstor-ms-$VER.gdsM.dkms.tar.gz"
 echo "== kit-manifest.tsv =="; column -t -s$'\t' "$KIT/kit-manifest.tsv" || cat "$KIT/kit-manifest.tsv"
 mkdir -p "$KIT/selftests"
-cp -r "$ROOT/tools/testing/selftests/md/p2pdma" "$KIT/selftests/"
+# Repo dir is p2pdma-vm (renamed to avoid p2pdma-branch cherry-pick collisions);
+# the kit keeps the flat `selftests/p2pdma` name its layout + gds-campaign expect.
+cp -r "$ROOT/tools/testing/selftests/md/p2pdma-vm" "$KIT/selftests/p2pdma"
 cp -r "$ROOT/dkms/inval-inject" "$KIT/inval-inject"
 cp "$ROOT/dkms/udev/63-ms-raid-arrays.rules" "$KIT/udev/"
 cp "$ROOT/docs/gds-l40s-runbook.md" "$KIT/docs/"

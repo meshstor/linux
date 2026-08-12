@@ -9,9 +9,9 @@ set -u
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SELF_DIR/.." && pwd)
 # repo layout vs kit layout
-if [ -d "$REPO_ROOT/tools/testing/selftests/md/p2pdma/gds" ]; then
-	GDS_TESTS="$REPO_ROOT/tools/testing/selftests/md/p2pdma/gds"
-	LAYERB="$REPO_ROOT/tools/testing/selftests/md/p2pdma"
+if [ -d "$REPO_ROOT/tools/testing/selftests/md/p2pdma-vm/gds" ]; then
+	GDS_TESTS="$REPO_ROOT/tools/testing/selftests/md/p2pdma-vm/gds"
+	LAYERB="$REPO_ROOT/tools/testing/selftests/md/p2pdma-vm"
 	INJ_DIR="$REPO_ROOT/dkms/inval-inject"
 else
 	GDS_TESTS="$SELF_DIR/../selftests/p2pdma/gds"

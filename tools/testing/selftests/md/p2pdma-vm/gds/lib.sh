@@ -4,7 +4,7 @@
 set -u
 
 GDS_DIR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=tools/testing/selftests/md/p2pdma/lib.sh
+# shellcheck source=tools/testing/selftests/md/p2pdma-vm/lib.sh
 . "$GDS_DIR_SELF/../lib.sh"
 
 GDS_RESULTS="${GDS_RESULTS:-/tmp/gds-results.$$}"

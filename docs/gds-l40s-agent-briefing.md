@@ -292,7 +292,7 @@ while every GPU-independent phase still passed. Runbook step 0c has the staging 
 ## 4. The tooling — component contracts
 
 All bash tools: exit **0 = pass, 1 = fail, 4 = skip, 2 = usage**. Tests source
-`tools/testing/selftests/md/p2pdma/gds/lib.sh` (which sources the Layer-B
+`tools/testing/selftests/md/p2pdma-vm/gds/lib.sh` (which sources the Layer-B
 `../lib.sh`), use `trap`-based teardown, and default `MDADM=/home/mykola/mdadm/mdadm`
 (override with `MDADM=` or the kit's `bin/mdadm-ms`).
 
@@ -717,9 +717,9 @@ bin/gds-p2p-witness                               native-path witness (bpftrace)
 bin/gds-make-kit                                  kit builder
 bin/probe-cufile-recognition                      cuFile RAID-classification probe (§4.6)
 bin/mok-enroll                                    MOK enrollment helper (git checkout only, not in kit)
-tools/testing/selftests/md/p2pdma/gds/            P0–P6 phase tests + the P7a–h stage-1 subtests + injector smoke + lib.sh + unit test
-tools/testing/selftests/md/p2pdma/lib.sh          Layer-B helpers (sourced by gds/lib.sh)
-tools/testing/selftests/md/p2pdma/test_*.sh       Layer-B non-P2P regression suite (run under P4)
+tools/testing/selftests/md/p2pdma-vm/gds/            P0–P6 phase tests + the P7a–h stage-1 subtests + injector smoke + lib.sh + unit test
+tools/testing/selftests/md/p2pdma-vm/lib.sh          Layer-B helpers (sourced by gds/lib.sh)
+tools/testing/selftests/md/p2pdma-vm/test_*.sh       Layer-B non-P2P regression suite (run under P4)
 dkms/inval-inject/                                status injector + README (make -C to build)
 dkms/udev/63-ms-raid-arrays.rules                 cuFile RAID-classification udev rule
 docs/gds-l40s-runbook.md                          concise window runbook (procedure + abort)
