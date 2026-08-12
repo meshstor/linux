@@ -18,7 +18,10 @@ MDADM_BIN="${MDADM_BIN:-/home/${SUDO_USER:-$USER}/mdadm/mdadm}"
 
 # Variant identity pins (every SHA must be origin-reachable — §1 rule of the
 # 2026-07-03 stage-1 validation design; local rewrite leftovers don't ship).
-PIN_GDS1=0fb37cf5          # p2pdma@0fb37cf5: last pre-fix md commit (hot-add clear)
+PIN_GDS1=cefe89a2          # p2pdma "clear P2P advertise on non-P2P hot-add": the
+                           # last pre-fix md commit (gate + hot-add-clear, BEFORE
+                           # the stage-1 fail-the-write arm). Rebasing origin/p2pdma
+                           # orphans this SHA — the refusal below prints the new one.
 if [ "$SKIP_TB" = --skip-tarballs ]; then
 	# The manifest must describe the tarballs ACTUALLY built earlier — never
 	# freshly recomputed refs (origin may have moved since that build). The
@@ -28,8 +31,18 @@ if [ "$SKIP_TB" = --skip-tarballs ]; then
 	. "$ROOT/build/gds-kit-shas.env"
 else
 	git -C "$ROOT" fetch origin p2pdma meshstor-main master
-	git -C "$ROOT" merge-base --is-ancestor "$PIN_GDS1" origin/p2pdma \
-		|| { echo "gds1 pin $PIN_GDS1 is not reachable from origin/p2pdma — refusing" >&2; exit 1; }
+	git -C "$ROOT" merge-base --is-ancestor "$PIN_GDS1" origin/p2pdma || {
+		# origin/p2pdma was rebased and orphaned the pin. The correct commit
+		# is the parent of the earliest stage-1 arm ("fail P2P writes loud");
+		# surface it so re-pinning is a 10-second verify-and-bump, not a dig.
+		cand=$(git -C "$ROOT" rev-list --reverse --grep='fail P2P writes loud' \
+			origin/master..origin/p2pdma 2>/dev/null | head -1)
+		[ -n "$cand" ] && cand=$(git -C "$ROOT" rev-parse --short "$cand^" 2>/dev/null)
+		echo "gds1 pin $PIN_GDS1 is not reachable from origin/p2pdma — refusing." >&2
+		echo "  origin/p2pdma was likely rebased; likely new pre-fix pin: ${cand:-<none found>}" >&2
+		[ -n "$cand" ] && echo "  verify: git show -s --format='%s' $cand  (want: clear P2P advertise on non-P2P hot-add)" >&2
+		exit 1
+	}
 	GDS1_SHA=$(git -C "$ROOT" rev-parse "$PIN_GDS1")
 	GDSM_SHA=$(git -C "$ROOT" rev-parse origin/meshstor-main)
 	# gds0/gds1 base = rebuild-main's OWN torvalds mirror (build/torvalds-linux.git),
