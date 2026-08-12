@@ -41,7 +41,9 @@ NR_DISK=$(modinfo -F srcversion nvme_rdma 2>/dev/null || true)
 NR_LOADED=$(cat /sys/module/nvme_rdma/srcversion 2>/dev/null || true)
 DRIVER=stock; DRIVER_NOTE=""
 case "$NR_FILE" in
-*/updates/*)
+# DKMS installs out-of-tree modules under /updates OR /extra depending on the
+# dkms version/distro; both are depmod-preferred over the in-tree /kernel path.
+*/updates/*|*/extra/*)
 	# loadedness via initstate (srcversion can be absent on kernels
 	# without CONFIG_MODULE_SRCVERSION_ALL); build identity via
 	# loaded-vs-ondisk srcversion equality.
@@ -65,11 +67,22 @@ case "$(readlink "/sys/class/block/$(basename "$REMOTE")" 2>/dev/null)" in
 *nvme-subsystem*) IS_HEAD=1;;
 esac
 
+# The remedy for the head split is a nvme_core.multipath=N boot -- but only on
+# kernels that still expose that toggle. RHEL 10 compiles CONFIG_NVME_MULTIPATH=y
+# always-on and REMOVED the module param (modinfo shows no 'multipath:' parm;
+# nvme_core rejects it as "unknown parameter"), so there the leg-level advertise
+# is structurally unreachable, not a boot-flag away.
+if modinfo nvme_core 2>/dev/null | grep -qE '^parm:[[:space:]]*multipath:'; then
+	MP_HINT="boot nvme_core.multipath=N for the leg-level matrix"
+else
+	MP_HINT="no nvme_core.multipath toggle on this kernel (e.g. RHEL always-on native multipath) -- leg-level advertise is structurally unreachable here"
+fi
+
 rc=0; "$QF" "$REMOTE" >/dev/null || rc=$?
 
 if [ "$IS_HEAD" = 1 ]; then
 	case $rc in
-	1)	MSG="multipath head masks leg advertise (BLK_FEAT_PCI_P2PDMA not in BLK_FEAT_INHERIT_MASK); driver=$DRIVER$DRIVER_NOTE substrate=$SUBSTRATE; boot nvme_core.multipath=N for the leg-level matrix"
+	1)	MSG="multipath head masks leg advertise (BLK_FEAT_PCI_P2PDMA not in BLK_FEAT_INHERIT_MASK); driver=$DRIVER$DRIVER_NOTE substrate=$SUBSTRATE; $MP_HINT"
 		gds_verdict p4c rdma_gate PASS "$MSG"
 		echo "PASS: $MSG"
 		exit 0;;
