@@ -87,5 +87,20 @@ if [ -e "$INJ_SRC" ]; then
         || fail "inval_inject: p2p filter must test bi_io_vec->bv_page directly (not bio_has_data)"
 fi
 
+# --- gds-p2p-witness arg validation (rootless: parsing precedes root check) --
+WIT="$REPO_ROOT/bin/gds-p2p-witness"
+if [ -e "$WIT" ]; then
+    out=$("$WIT" --expect-rc bogus -- true 2>&1); rc=$?
+    [ "$rc" = 2 ] || fail "witness --expect-rc bogus: want rc=2, got $rc"
+    echo "$out" | grep -q -- '--expect-rc needs zero|nonzero|any' \
+        || fail "witness --expect-rc bogus: wrong message: $out"
+    out=$("$WIT" --expect-rc 2>&1); rc=$?     # missing value
+    [ "$rc" = 2 ] || fail "witness --expect-rc (missing value): want rc=2, got $rc"
+    if [ "$(id -u)" != 0 ]; then
+        "$WIT" --expect-rc nonzero -- true >/dev/null 2>&1; rc=$?
+        [ "$rc" = 4 ] || fail "witness valid --expect-rc as non-root: want rc=4 (root skip), got $rc"
+    fi
+fi
+
 [ "$FAILED" = 0 ] && echo "PASS: unit helpers" && exit 0
 exit 1

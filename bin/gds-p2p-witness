@@ -15,8 +15,17 @@
 # by the mandatory zero-control runs (P1 calibration / rehearsal).
 #
 # Usage: gds-p2p-witness [--expect-ms zero|nonzero|any]
-#                        [--expect-map zero|nonzero|any] [-o FILE] -- CMD...
+#                        [--expect-map zero|nonzero|any]
+#                        [--expect-rc zero|nonzero|any] [-o FILE] -- CMD...
 # Exit: 0 ok, 1 expectation violated, 2 usage, 4 cannot attach (skip)
+#
+# --expect-rc decouples the wrapped command's exit code from --expect-ms.
+# ABSENT = legacy semantics (kept because existing callers rely on them in
+# both directions): --expect-ms nonzero implies cmd_rc==0; zero/any
+# expectations ignore the rc except the final all-any exit passthrough.
+# GIVEN = the rc is judged only by --expect-rc (any = don't judge), and
+# --expect-ms nonzero tests only the counter. Intentional-failure tests
+# (stage-1 fail-the-write) use --expect-ms nonzero --expect-rc nonzero.
 #
 # NOTE: the bpftrace program's struct-folio cast for ->pgmap and the
 # MEMORY_DEVICE_PCI_P2PDMA enum value are shaped against the 6.17 kernel
@@ -24,9 +33,15 @@
 # could miscount silently rather than fail loud -- verify offsets before
 # trusting this witness elsewhere.
 set -u
-EXPECT_MS=any EXPECT_MAP=any OUTFILE=""
+EXPECT_MS=any EXPECT_MAP=any EXPECT_RC="" OUTFILE=""
 while [ $# -gt 0 ]; do
 	case "$1" in
+		--expect-rc)
+			case "${2:-}" in
+				zero|nonzero|any) EXPECT_RC=$2;;
+				*) echo "gds-p2p-witness: --expect-rc needs zero|nonzero|any" >&2; exit 2;;
+			esac
+			shift 2;;
 		--expect-ms)
 			case "${2:-}" in
 				zero|nonzero|any) EXPECT_MS=$2;;
@@ -43,7 +58,7 @@ while [ $# -gt 0 ]; do
 			[ -n "${2:-}" ] || { echo "gds-p2p-witness: -o needs a path" >&2; exit 2; }
 			OUTFILE=$2; shift 2;;
 		--)           shift; break;;
-		*) echo "usage: gds-p2p-witness [--expect-ms MODE] [--expect-map MODE] [-o FILE] -- CMD..." >&2; exit 2;;
+		*) echo "usage: gds-p2p-witness [--expect-ms MODE] [--expect-map MODE] [--expect-rc MODE] [-o FILE] -- CMD..." >&2; exit 2;;
 	esac
 done
 [ $# -gt 0 ] || { echo "no command given" >&2; exit 2; }
@@ -113,11 +128,25 @@ rm -rf "$WORK"; trap - EXIT
 BAD=0
 case "$EXPECT_MS" in
 	zero)    [ "$P2P" -eq 0 ] || BAD=1;;
-	nonzero) { [ "$P2P" -gt 0 ] && [ "$RC" -eq 0 ]; } || BAD=1;;
+	nonzero)
+		# legacy (no --expect-rc): nonzero counter AND cmd_rc==0.
+		# with --expect-rc given: the rc is judged only by --expect-rc.
+		if [ -n "$EXPECT_RC" ]; then
+			[ "$P2P" -gt 0 ] || BAD=1
+		else
+			{ [ "$P2P" -gt 0 ] && [ "$RC" -eq 0 ]; } || BAD=1
+		fi;;
 esac
 case "$EXPECT_MAP" in
 	zero)    [ "$MAPS" = unavailable ] || [ "$MAPS" -eq 0 ] || BAD=1;;
 	nonzero) [ "$MAPS" != unavailable ] && [ "$MAPS" -gt 0 ] || BAD=1;;
 esac
-[ "$EXPECT_MS" = any ] && [ "$EXPECT_MAP" = any ] && exit "$RC"
+case "$EXPECT_RC" in
+	zero)    [ "$RC" -eq 0 ] || BAD=1;;
+	nonzero) [ "$RC" -ne 0 ] || BAD=1;;
+	any|"")  : ;;
+esac
+# all-any passthrough only in legacy mode (no --expect-rc): callers that
+# pass --expect-rc any explicitly want expectation-exit semantics.
+[ "$EXPECT_MS" = any ] && [ "$EXPECT_MAP" = any ] && [ -z "$EXPECT_RC" ] && exit "$RC"
 exit "$BAD"
