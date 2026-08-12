@@ -103,6 +103,7 @@ gds_cmp_legs() {
 GDS_NVMET_NQN=""
 GDS_NVMET_PORT_ID=7431          # unlikely to collide with a real deployment
 GDS_REMOTE_DEVS=()
+GDS_NVMET_BACKING=()            # local DEV args passed to gds_nvmet_export
 GDS_MNT="${GDS_MNT:-/mnt/gds-test}"
 
 # first IPv4 on an RDMA-capable netdev (hw NIC or rxe); rc 1 if none
@@ -120,6 +121,25 @@ gds_rdma_addr() {
 	return 1
 }
 
+# gds_nvmet_disarm_incremental DEV... -- every DEV is an ephemeral loopback
+# namespace (e.g. /dev/nvme3n1). Its every re-connect is a fresh block-device
+# "add" uevent, which races the distro's in-tree md incremental-assembly rule
+# (system mdadm, *not* our ms_* stack) if the device still carries an mdadm
+# 1.2 superblock from a prior test run -- observed live as the loopback
+# namespace getting auto-grabbed into a stray upstream /dev/mdN out from
+# under us before gds_csi_mdadm_create runs (surfaces as a spurious "array
+# create failed", plus a dangling nvme-subsystem sysfs entry after disconnect
+# because md still holds the namespace open). Stop any such array so the rest
+# of the test (and the next run) gets a clean device.
+gds_nvmet_disarm_incremental() {
+	local dev bn mdn
+	for dev in "$@"; do
+		bn=$(basename "$dev")
+		mdn=$(awk -v d="$bn" '$1 ~ /^md[0-9]+$/ { for (i=3;i<=NF;i++) if ($i ~ ("^" d "\\[")) { print $1; exit } }' /proc/mdstat 2>/dev/null)
+		[ -n "$mdn" ] && mdadm --stop "/dev/$mdn" >/dev/null 2>&1 || true
+	done
+}
+
 # gds_nvmet_export TRANSPORT DEV...  (TRANSPORT: tcp|rdma)
 gds_nvmet_export() {
 	local tr=$1; shift
@@ -133,6 +153,7 @@ gds_nvmet_export() {
 		*) echo "gds_nvmet_export: bad transport '$tr'" >&2; return 1;;
 	esac
 	GDS_NVMET_NQN="nqn.2025-12.io.meshstor:$tr:gdstest:$(hostname -s)"
+	GDS_NVMET_BACKING=("$@")
 	local ss=/sys/kernel/config/nvmet/subsystems/$GDS_NVMET_NQN
 	mkdir -p "$ss" && echo 1 > "$ss/attr_allow_any_host"
 	for dev in "$@"; do
@@ -196,7 +217,10 @@ gds_nvmet_export() {
 				done
 				[ -n "$ns" ] && GDS_REMOTE_DEVS+=("/dev/$(basename "$ns")")
 			done
-			[ "${#GDS_REMOTE_DEVS[@]}" -eq "$want" ] && return 0
+			if [ "${#GDS_REMOTE_DEVS[@]}" -eq "$want" ]; then
+				gds_nvmet_disarm_incremental "${GDS_REMOTE_DEVS[@]}"
+				return 0
+			fi
 		fi
 		sleep 0.2
 	done
@@ -206,6 +230,7 @@ gds_nvmet_export() {
 
 gds_nvmet_teardown() {
 	[ -n "$GDS_NVMET_NQN" ] || return 0
+	[ "${#GDS_REMOTE_DEVS[@]}" -gt 0 ] && gds_nvmet_disarm_incremental "${GDS_REMOTE_DEVS[@]}"
 	nvme disconnect -n "$GDS_NVMET_NQN" >/dev/null 2>&1 || true
 	local p=/sys/kernel/config/nvmet/ports/$GDS_NVMET_PORT_ID
 	local ss=/sys/kernel/config/nvmet/subsystems/$GDS_NVMET_NQN
@@ -218,7 +243,15 @@ gds_nvmet_teardown() {
 		done
 		rmdir "$ss" 2>/dev/null || true
 	fi
-	GDS_NVMET_NQN=""; GDS_REMOTE_DEVS=()
+	# Belt-and-suspenders for the incremental-assembly race described above
+	# gds_nvmet_disarm_incremental: also erase the superblock on the local
+	# backing device so a stray upstream array has nothing left to grab on
+	# the *next* run, instead of relying solely on the just-in-time disarm.
+	local b
+	for b in "${GDS_NVMET_BACKING[@]}"; do
+		[ -n "$b" ] && [ -e "$b" ] && "$MDADM" --zero-superblock "$b" >/dev/null 2>&1 || true
+	done
+	GDS_NVMET_NQN=""; GDS_REMOTE_DEVS=(); GDS_NVMET_BACKING=()
 }
 
 gds_teardown() {
