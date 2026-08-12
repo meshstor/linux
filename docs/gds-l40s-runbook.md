@@ -141,8 +141,17 @@ FAILs while every GPU-independent phase still passes.
 - dmesg floods with `NVRM: GPUn nvAssertFailedNoLog: Assertion failed: pIOVAS != NULL @ io_vaspace.c`;
 - cufile.log shows GPUs `PCIP2PDMACapable:1` **statically** but at runtime
   `gpu attribute pci_p2pdma support: False` → `GPUDirect Storage not supported on current file`;
-- `gdscheck -p` reports `NVMe/NVMeOF/NVMesh : compat` (want `Supported`);
 - P1 FAILs `map_hits=0 cmd_rc=1`.
+
+**Do NOT use plain `gdscheck -p`'s `NVMe : compat` line as a signal — it is config-driven, not
+a platform verdict.** It only mirrors the active cufile.json's `use_pci_p2pdma` flag, and the
+shipped default sets that `false`, so `gdscheck -p` prints `NVMe/NVMeOF : compat` **even when
+native GDS is fully working** (verified: post-fix, with P2 `p2p_bios=520`, `gdscheck -p` still
+said `compat`). To use gdscheck as a real platform probe, point it at a strict config —
+`CUFILE_ENV_PATH_JSON=<json-with-use_pci_p2pdma:true> gdscheck -p` — and want **`NVMe : p2pdma`**
+(not `compat`). In the default `gdscheck -p`, the only load-bearing lines are the per-GPU
+`supports GDS, IOMMU State: …` rows. The authoritative native-path proof is always the P1
+witness (`map_hits>0`).
 
 This is **not a tooling bug and not fixable at run time** — cuFile picks the P2P GPU by
 *storage proximity* (the DMA faults on whichever GPU BAR is nearest the NVMe, regardless of
@@ -161,7 +170,9 @@ sudo grep -c "vmlinuz-$(uname -r).*nvme_core.multipath=N" /boot/grub/grub.cfg
 sudo lsinitramfs /boot/initrd.img-$(uname -r) | grep -c modprobe.d/nvme-multipath
 # then: sudo reboot
 # after reboot confirm the flip: /proc/cmdline has iommu=pt; iommu_group/type -> identity;
-#   /sys/module/nvme_core/parameters/multipath -> N; gdscheck -p -> NVMe: Supported
+#   /sys/module/nvme_core/parameters/multipath -> N.  (Plain `gdscheck -p` STILL prints
+#   NVMe: compat even when native works — it mirrors the default config, not the platform;
+#   use CUFILE_ENV_PATH_JSON=<strict.json> gdscheck -p and want NVMe: p2pdma. Real proof = P1.)
 ```
 (If `GRUB_CMDLINE_LINUX` is already non-empty, append inside the quotes instead of the
 empty-string sed.) The regkey `p2pmem` is lazy — run `gdscheck -p` once post-reboot to
