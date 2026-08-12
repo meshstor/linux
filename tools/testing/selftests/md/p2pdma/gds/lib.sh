@@ -43,6 +43,11 @@ gds_verdict() {
 # gds_cufile_json strict|lenient DIR -> writes DIR/cufile.json, prints path.
 # strict: allow_compat_mode=false so a failed native path is a LOUD error,
 # never a silent CPU bounce (spec: false-pass hazard).
+# NB "block" is a TOP-LEVEL section (sibling of "properties"/"fs"), NOT nested
+# under "fs" — cuFile silently ignores a mis-nested fs.block and keeps the
+# default block.nvme.use_pci_p2pdma=false, so the native path never arms and
+# every GDS write bounces through compat. Verified live on cuFile 1.13/1.18
+# (shadecloud 2026-07-07): mis-nested => map_hits=0; top-level => map_hits=512.
 gds_cufile_json() {
 	local mode=$1 dir=$2 compat=false
 	[ "$mode" = lenient ] && compat=true
@@ -52,12 +57,12 @@ gds_cufile_json() {
   "logging": { "dir": "$dir", "level": "TRACE" },
   "properties": { "use_pci_p2pdma": true, "allow_compat_mode": $compat },
   "fs": {
-    "generic": { "posix_unaligned_writes": false },
-    "block": {
-      "nvme":   { "use_pci_p2pdma": true },
-      "nvmeof": { "use_pci_p2pdma": true },
-      "raid":   { "use_pci_p2pdma": true }
-    }
+    "generic": { "posix_unaligned_writes": false }
+  },
+  "block": {
+    "nvme":   { "use_pci_p2pdma": true },
+    "nvmeof": { "use_pci_p2pdma": true },
+    "raid":   { "use_pci_p2pdma": true }
   }
 }
 JSON
