@@ -18,10 +18,14 @@ MDADM_BIN="${MDADM_BIN:-/home/${SUDO_USER:-$USER}/mdadm/mdadm}"
 
 # Variant identity pins (every SHA must be origin-reachable — §1 rule of the
 # 2026-07-03 stage-1 validation design; local rewrite leftovers don't ship).
-PIN_GDS1=cefe89a2          # p2pdma "clear P2P advertise on non-P2P hot-add": the
-                           # last pre-fix md commit (gate + hot-add-clear, BEFORE
-                           # the stage-1 fail-the-write arm). Rebasing origin/p2pdma
-                           # orphans this SHA — the refusal below prints the new one.
+PIN_GDS1=a80daaa9          # p2pdma "set IO_BLOCKED in case of BLK_STS_P2PDMA":
+                           # the last byte-identical upstream v6 patch, i.e. the
+                           # advertise-only baseline BEFORE the meshstor gate/knob/
+                           # status commits. (The v6 rework deleted the stage-1
+                           # fail-the-write arm the previous pin sat under; its SHA
+                           # cefe89a2 no longer exists on the rebuilt branch.)
+                           # Rebasing origin/p2pdma orphans this SHA — the refusal
+                           # below prints the new one.
 if [ "$SKIP_TB" = --skip-tarballs ]; then
 	# The manifest must describe the tarballs ACTUALLY built earlier — never
 	# freshly recomputed refs (origin may have moved since that build). The
