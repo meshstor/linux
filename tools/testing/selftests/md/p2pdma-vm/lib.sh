@@ -5,6 +5,11 @@
 set -u
 
 MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
+# O_DIRECT-capable dd: Ubuntu 26.04+ makes /usr/bin/dd the Rust uutils rewrite,
+# whose O_DIRECT buffer alignment fails on md/ms queues (dma_alignment=511) while
+# working on raw NVMe — a false failure in any direct-I/O assertion. Prefer the
+# GNU binary the distro ships alongside.
+DD="${DD:-$( [ -x /usr/bin/gnudd ] && echo /usr/bin/gnudd || echo dd )}"
 P2PDMA_LOOPS=()
 P2PDMA_ARRAY=""
 P2PDMA_SUBSTRATE=""
