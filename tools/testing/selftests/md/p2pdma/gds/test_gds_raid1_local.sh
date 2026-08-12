@@ -20,20 +20,24 @@ gds_csi_mdadm_create /dev/ms0 1 "$M0" "$M1" >/dev/null 2>&1 \
 	|| { echo "SKIP: array create failed" >&2; exit 4; }
 P2PDMA_ARRAY=/dev/ms0
 
-"$QF" /dev/ms0 || { gds_verdict p2 advertise FAIL "all-NVMe array not advertising"; exit 1; }
+rc=0; "$QF" /dev/ms0 >/dev/null || rc=$?
+case $rc in
+	0) : ;;
+	1) gds_verdict p2 advertise FAIL "all-NVMe array not advertising"; exit 1;;
+	*) echo "SKIP: cannot probe /dev/ms0 (rc=$rc)" >&2; exit 4;;
+esac
 gds_verdict p2 advertise PASS "array advertises with all-P2P members"
 
 gds_mkfs_mount /dev/ms0 "$GDS_MNT" || { echo "SKIP: mkfs/mount failed" >&2; exit 4; }
 JSON_S=$(gds_cufile_json strict "$GDS_RESULTS/p2")
 
-if ! "$WITNESS" --expect-ms nonzero --expect-map nonzero \
-	-o "$GDS_RESULTS/p2-witness.txt" -- \
-	bash -c "$(declare -f gds_gdsio_write); GDSIO='$GDSIO' GDS_RESULTS='$GDS_RESULTS' gds_gdsio_write '$GDS_MNT' 0 '$JSON_S'"; then
-	gds_verdict p2 native FAIL "P2P pages did not traverse ms_submit_bio (see p2-witness.txt, cufile.log)"
-	echo "FAIL: GDS write on /dev/ms0 was not kernel-native" >&2
-	exit 1
-fi
-gds_verdict p2 native PASS "$(tail -1 "$GDS_RESULTS/p2-witness.txt" 2>/dev/null || true)"
+rc=0; "$WITNESS" --expect-ms nonzero --expect-map nonzero -o "$GDS_RESULTS/p2-witness.txt" -- \
+	bash -c "$(declare -f gds_gdsio_write); GDSIO='$GDSIO' GDS_RESULTS='$GDS_RESULTS' gds_gdsio_write '$GDS_MNT' 0 '$JSON_S'" || rc=$?
+case $rc in
+	0) gds_verdict p2 native PASS "$(tail -1 "$GDS_RESULTS/p2-witness.txt" 2>/dev/null || true)";;
+	4) gds_verdict p2 native SKIP "witness could not attach"; echo "SKIP: witness attach failed" >&2; exit 4;;
+	*) gds_verdict p2 native FAIL "P2P pages did not traverse ms_submit_bio (see p2-witness.txt, cufile.log)"; echo "FAIL: GDS write on /dev/ms0 was not kernel-native" >&2; exit 1;;
+esac
 
 gds_gdsio_readverify "$GDS_MNT" "$JSON_S" \
 	|| { gds_verdict p2 verify FAIL "gdsio read-verify failed"; exit 1; }

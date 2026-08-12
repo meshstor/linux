@@ -14,6 +14,12 @@
 # Usage: gds-p2p-witness [--expect-ms zero|nonzero|any]
 #                        [--expect-map zero|nonzero|any] [-o FILE] -- CMD...
 # Exit: 0 ok, 1 expectation violated, 2 usage, 4 cannot attach (skip)
+#
+# NOTE: the bpftrace program's struct-folio cast for ->pgmap and the
+# MEMORY_DEVICE_PCI_P2PDMA enum value are shaped against the 6.17 kernel
+# (the kit's L40S target); on a materially different kernel the pgmap read
+# could miscount silently rather than fail loud -- verify offsets before
+# trusting this witness elsewhere.
 set -u
 EXPECT_MS=any EXPECT_MAP=any OUTFILE=""
 while [ $# -gt 0 ]; do

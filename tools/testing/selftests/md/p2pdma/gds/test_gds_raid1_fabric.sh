@@ -83,13 +83,13 @@ gds_mkfs_mount /dev/ms0 "$GDS_MNT" || { echo "SKIP: mkfs/mount failed" >&2; exit
 
 if [ "$ARRAY_ADV" = 1 ]; then
 	JSON=$(gds_cufile_json strict "$GDS_RESULTS/p3")
-	if ! "$WITNESS" --expect-ms nonzero --expect-map nonzero \
-		-o "$GDS_RESULTS/p3-witness.txt" -- \
-		bash -c "$(declare -f gds_gdsio_write); GDSIO='$GDSIO' GDS_RESULTS='$GDS_RESULTS' gds_gdsio_write '$GDS_MNT' 0 '$JSON'"; then
-		gds_verdict p3 native FAIL "fabric array advertised but GDS was not kernel-native"
-		exit 1
-	fi
-	gds_verdict p3 native PASS "$(tail -1 "$GDS_RESULTS/p3-witness.txt" 2>/dev/null || true)"
+	rc=0; "$WITNESS" --expect-ms nonzero --expect-map nonzero -o "$GDS_RESULTS/p3-witness.txt" -- \
+		bash -c "$(declare -f gds_gdsio_write); GDSIO='$GDSIO' GDS_RESULTS='$GDS_RESULTS' gds_gdsio_write '$GDS_MNT' 0 '$JSON'" || rc=$?
+	case $rc in
+		0) gds_verdict p3 native PASS "$(tail -1 "$GDS_RESULTS/p3-witness.txt" 2>/dev/null || true)";;
+		4) gds_verdict p3 native SKIP "witness could not attach"; echo "SKIP: witness attach failed" >&2; exit 4;;
+		*) gds_verdict p3 native FAIL "fabric array advertised but GDS was not kernel-native"; exit 1;;
+	esac
 else
 	JSON=$(gds_cufile_json lenient "$GDS_RESULTS/p3")
 	"$WITNESS" --expect-ms zero -o "$GDS_RESULTS/p3-witness.txt" -- \
