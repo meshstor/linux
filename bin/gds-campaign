@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+#
+# gds-campaign — the single command run on the L40S box (and, with --rehearsal,
+# on the dev machine). Probes the environment (P0), then runs the campaign
+# phases in strict priority order, feeding evidence to a results tree as it
+# goes. Phase failures are recorded and the campaign continues (except the
+# P0/P1 gates). See docs/gds-l40s-runbook.md.
+set -u
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SELF_DIR/.." && pwd)
+# repo layout vs kit layout
+if [ -d "$REPO_ROOT/tools/testing/selftests/md/p2pdma/gds" ]; then
+	GDS_TESTS="$REPO_ROOT/tools/testing/selftests/md/p2pdma/gds"
+	LAYERB="$REPO_ROOT/tools/testing/selftests/md/p2pdma"
+	INJ_DIR="$REPO_ROOT/dkms/inval-inject"
+else
+	GDS_TESTS="$SELF_DIR/../selftests/p2pdma/gds"
+	LAYERB="$SELF_DIR/../selftests/p2pdma"
+	INJ_DIR="$SELF_DIR/../inval-inject"
+fi
+export GDS_BIN="$SELF_DIR"
+export GDS_INJ_DIR="$INJ_DIR"
+
+REHEARSAL=0; PHASES="p0,p1,p2,p3,p4,p5,p6"; TRANSPORT=auto
+RESULTS=""; KIT="${GDS_KIT_DIR:-}"
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--rehearsal) REHEARSAL=1; shift;;
+		--phases)    PHASES=$2; shift 2;;
+		--transport) TRANSPORT=$2; shift 2;;
+		--results)   RESULTS=$2; shift 2;;
+		--kit)       KIT=$2; shift 2;;
+		*) echo "usage: gds-campaign [--rehearsal] [--phases LIST] [--transport auto|rdma|rxe|tcp] [--results DIR] [--kit DIR]" >&2; exit 2;;
+	esac
+done
+[ "$(id -u)" = 0 ] || { echo "gds-campaign: must run as root" >&2; exit 2; }
+TS=$(date +%Y%m%d-%H%M%S)
+RESULTS=${RESULTS:-$REPO_ROOT/results/gds-campaign-$TS}
+mkdir -p "$RESULTS"
+export GDS_RESULTS="$RESULTS"
+export MDADM="${MDADM:-/home/mykola/mdadm/mdadm}"
+
+log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$RESULTS/campaign.log"; }
+verd() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS/verdict.tsv"; }
+
+dmesg_mark() { dmesg | wc -l > "$RESULTS/.dmesg-mark"; }
+dmesg_delta() {
+	local mark; mark=$(cat "$RESULTS/.dmesg-mark" 2>/dev/null || echo 0)
+	dmesg | tail -n +"$((mark + 1))" > "$1"
+}
+heartbeat() {
+	timeout 15 cat /proc/msstat > /dev/null 2>&1 || return 1
+	[ -n "${HB_DEV:-}" ] && ! timeout 15 dd if="$HB_DEV" of=/dev/null bs=4096 count=1 iflag=direct status=none 2>/dev/null && return 1
+	return 0
+}
+
+run_test() {  # PHASE NAME SCRIPT [ENV...]
+	local phase=$1 name=$2 script=$3; shift 3
+	local out="$RESULTS/$phase/$name.out" rc
+	mkdir -p "$RESULTS/$phase"
+	dmesg_mark
+	log "[$phase] $name ..."
+	env "$@" GDS_RESULTS="$RESULTS" GDS_BIN="$GDS_BIN" GDS_INJ_DIR="$GDS_INJ_DIR" \
+		MDADM="$MDADM" timeout 1200 bash "$script" > "$out" 2>&1
+	rc=$?
+	dmesg_delta "$RESULTS/$phase/$name.dmesg"
+	case $rc in
+		0) verd "$phase" "$name" PASS "$(tail -1 "$out")"; log "[$phase] $name: PASS";;
+		4) verd "$phase" "$name" SKIP "$(tail -1 "$out")"; log "[$phase] $name: SKIP ($(tail -1 "$out"))";;
+		124) verd "$phase" "$name" FAIL "TIMEOUT"; log "[$phase] $name: TIMEOUT";;
+		*) verd "$phase" "$name" FAIL "rc=$rc $(tail -1 "$out")"; log "[$phase] $name: FAIL rc=$rc";;
+	esac
+	heartbeat || { log "NODE UNHEALTHY after $phase/$name — stopping (see runbook abort procedure)"; exit 3; }
+	return $rc
+}
+
+capture() { # PHASE NAME CMD...
+	local phase=$1 name=$2; shift 2
+	mkdir -p "$RESULTS/$phase"
+	{ echo "\$ $*"; "$@" 2>&1; } > "$RESULTS/$phase/$name.txt" || true
+}
+
+# ---------------------------------------------------------------- P0 preflight
+p0() {
+	local p=p0; mkdir -p "$RESULTS/$p"
+	capture $p uname uname -a
+	capture $p kconfig sh -c 'zcat /proc/config.gz 2>/dev/null | grep -E "CONFIG_PCI_P2PDMA|CONFIG_DEBUG_INFO_BTF" || grep -E "CONFIG_PCI_P2PDMA|CONFIG_DEBUG_INFO_BTF" "/boot/config-$(uname -r)"'
+	grep -q 'CONFIG_PCI_P2PDMA=y' "$RESULTS/$p/kconfig.txt" \
+		&& verd $p pci_p2pdma_config PASS y \
+		|| { verd $p pci_p2pdma_config FAIL "CONFIG_PCI_P2PDMA not =y — native P2P impossible"; return 1; }
+	command -v bpftrace >/dev/null && verd $p bpftrace PASS "$(bpftrace -V 2>&1)" \
+		|| { verd $p bpftrace FAIL "bpftrace missing"; return 1; }
+	capture $p lspci lspci -tvnn
+	capture $p acs sh -c 'lspci -vvv 2>/dev/null | grep -B40 ACSCtl | grep -E "^[0-9a-f]|ACSCtl" || true'
+	capture $p nvme nvme list
+	capture $p rdma sh -c 'command -v ibv_devices && ibv_devices && ibv_devinfo || echo none'
+	if [ "$REHEARSAL" = 0 ]; then
+		capture $p nvidia nvidia-smi
+		capture $p topo nvidia-smi topo -m
+		capture $p openrm sh -c 'modinfo -F license nvidia 2>/dev/null'
+		grep -qi 'GPL' "$RESULTS/$p/openrm.txt" 2>/dev/null \
+			&& verd $p openrm PASS "open kernel module" \
+			|| verd $p openrm WARN "NVIDIA module absent or proprietary — native P2P needs OpenRM"
+		capture $p gdscheck sh -c '"'"${GDSCHECK:-gdscheck}"'" -p || /usr/local/cuda/gds/tools/gdscheck -p'
+	fi
+	# DKMS featured install (kit mode); skip when modules already loaded
+	if ! lsmod | grep -q '^ms_mod '; then
+		if [ -n "$KIT" ] && ls "$KIT"/tarballs/*gds1*.dkms.tar.gz >/dev/null 2>&1; then
+			kit_install_variant featured || { verd $p dkms FAIL "featured install failed"; return 1; }
+		else
+			verd $p dkms FAIL "ms_mod not loaded and no kit tarball"; return 1
+		fi
+	fi
+	verd $p modules PASS "$(lsmod | awk '$1 ~ /^(ms_mod|raid1_ms|raid10_ms)$/ {printf "%s ", $1}')"
+	# udev rule for cuFile RAID classification
+	if [ ! -e /usr/lib/udev/rules.d/63-ms-raid-arrays.rules ]; then
+		local rule="$REPO_ROOT/dkms/udev/63-ms-raid-arrays.rules"
+		[ -e "$rule" ] || rule="$KIT/udev/63-ms-raid-arrays.rules"
+		[ -e "$rule" ] && { install -m0644 "$rule" /usr/lib/udev/rules.d/; udevadm control --reload; }
+	fi
+	# transport decision
+	if [ "$TRANSPORT" = auto ]; then
+		if [ -n "$(ls /sys/class/infiniband 2>/dev/null)" ] && ! ls /sys/class/infiniband | grep -q '^rxe'; then
+			TRANSPORT=rdma
+		elif command -v rdma >/dev/null && rdma link add rxe0 type rxe netdev \
+			"$(ip -o route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')" 2>/dev/null; then
+			TRANSPORT=rxe
+		else
+			TRANSPORT=tcp
+		fi
+	fi
+	verd $p transport INFO "$TRANSPORT"
+	# partitions
+	if [ -n "${GDS_MAKE_PARTITIONS:-}" ]; then
+		"$SELF_DIR/perf-make-test-partitions" "$GDS_MAKE_PARTITIONS" || true
+	fi
+	local parts; parts=$(ls /dev/disk/by-partlabel/*-meshstor-test-* 2>/dev/null | head -4 | tr '\n' ' ')
+	verd $p partitions INFO "${parts:-none}"
+	HB_DEV=$(echo "$parts" | awk '{print $1}')
+	echo "TRANSPORT=$TRANSPORT" > "$RESULTS/env.sh"
+	echo "HB_DEV=${HB_DEV:-}" >> "$RESULTS/env.sh"
+	log "P0 done: transport=$TRANSPORT parts=${parts:-none}"
+}
+
+kit_install_variant() {  # featured|baseline
+	local want=$1 tb ver
+	tb=$(ls "$KIT"/tarballs/*gds$([ "$want" = featured ] && echo 1 || echo 0)*.dkms.tar.gz 2>/dev/null | head -1)
+	[ -n "$tb" ] || { log "no $want tarball in $KIT/tarballs"; return 1; }
+	modprobe -r raid10_ms raid1_ms ms_mod 2>/dev/null || true
+	for v in $(dkms status 2>/dev/null | awk -F'[/,]' '/meshstor-ms/ {print $2}' | sort -u); do
+		dkms remove "meshstor-ms/$v" --all >/dev/null 2>&1 || true
+	done
+	local tmp; tmp=$(mktemp -d)
+	tar xzf "$tb" -C "$tmp"
+	ver=$(ls "$tmp" | sed -n 's/^meshstor-ms-//p' | head -1)
+	rm -rf "/usr/src/meshstor-ms-$ver"; cp -r "$tmp/meshstor-ms-$ver" /usr/src/
+	rm -rf "$tmp"
+	dkms add "meshstor-ms/$ver" >/dev/null && dkms install "meshstor-ms/$ver" >/dev/null \
+		|| return 1
+	modprobe ms_mod && modprobe raid1_ms && modprobe raid10_ms || return 1
+	log "installed $want (meshstor-ms/$ver)"
+}
+
+p1() { run_test p1 raw_baseline "$GDS_TESTS/test_gds_raw_baseline.sh"; }
+p2() { run_test p2 raid1_local "$GDS_TESTS/test_gds_raid1_local.sh"; }
+p3() {
+	local tr=$TRANSPORT
+	[ "$tr" = rxe ] && { tr=rdma; verd p3 note INFO "rxe substrate: UNREPRESENTATIVE for native P2P"; }
+	run_test p3 raid1_fabric "$GDS_TESTS/test_gds_raid1_fabric.sh" GDS_TRANSPORT="$tr" || true
+	local parts; parts=$(ls /dev/disk/by-partlabel/*-meshstor-test-* 2>/dev/null | head -4 | tr '\n' ' ')
+	if [ "$(echo "$parts" | wc -w)" -ge 4 ]; then
+		run_test p3 raid10_fabric "$GDS_TESTS/test_gds_raid1_fabric.sh" \
+			GDS_TRANSPORT="$tr" GDS_RAID10=1 GDS_PART_LIST="$parts" || true
+	else
+		verd p3 raid10_fabric SKIP "fewer than 4 test partitions"
+	fi
+}
+p4() {
+	run_test p4 tcp_no_advertise "$GDS_TESTS/test_gate_tcp_leg_no_advertise.sh" || true
+	run_test p4 hotadd_clears "$GDS_TESTS/test_gate_hotadd_clears.sh" || true
+	local t
+	for t in "$LAYERB"/test_*.sh; do
+		run_test p4 "layerb_$(basename "$t" .sh)" "$t" || true
+	done
+	if [ "$REHEARSAL" = 0 ] && [ -x "$SELF_DIR/probe-cufile-recognition" ] && mountpoint -q /mnt/gds-probe 2>/dev/null; then
+		capture p4 cufile_recognition "$SELF_DIR/probe-cufile-recognition" /mnt/gds-probe
+	fi
+}
+p5() {
+	[ -n "$KIT" ] || { verd p5 baseline SKIP "no kit (baseline tarball unavailable)"; return 0; }
+	kit_install_variant baseline || { verd p5 baseline FAIL "baseline install failed"; return 1; }
+	# baseline advertises unconditionally: a tcp-leg array MUST (falsely) advertise
+	local out; out="$RESULTS/p5/false_advertise.out"; mkdir -p "$RESULTS/p5"
+	dmesg_mark
+	env GDS_RESULTS="$RESULTS" GDS_BIN="$GDS_BIN" MDADM="$MDADM" timeout 1200 \
+		bash "$GDS_TESTS/test_gate_tcp_leg_no_advertise.sh" > "$out" 2>&1
+	local rc=$?
+	dmesg_delta "$RESULTS/p5/false_advertise.dmesg"
+	# On baseline the member-AND test must FAIL with "array advertises" — that
+	# failure IS the evidence (upstream's unconditional advertise is unsafe here).
+	if [ $rc -eq 1 ] && grep -q 'array advertises P2P with a tcp' "$out"; then
+		verd p5 false_advertise PASS "baseline falsely advertises with tcp leg (as predicted)"
+	elif [ $rc -eq 4 ]; then
+		verd p5 false_advertise SKIP "$(tail -1 "$out")"
+	else
+		verd p5 false_advertise FAIL "unexpected rc=$rc — read $out"
+	fi
+	if [ "$REHEARSAL" = 0 ] && [ -x "${GDSIO:-/usr/local/cuda/gds/tools/gdsio}" ]; then
+		verd p5 gds_on_false_advert INFO "manual: strict gdsio on the false-advertising array — see runbook §P5"
+	fi
+	kit_install_variant featured || { verd p5 restore FAIL "featured re-install failed"; return 1; }
+	verd p5 restore PASS "featured package restored"
+	heartbeat || { log "NODE UNHEALTHY after p5"; exit 3; }
+}
+p6() { run_test p6 divergence "$GDS_TESTS/test_divergence_inval.sh" || true; }
+
+# ------------------------------------------------------------------ main
+log "gds-campaign start ts=$TS rehearsal=$REHEARSAL phases=$PHASES results=$RESULTS"
+FAILGATE=0
+case ",$PHASES," in *,p0,*) p0 || FAILGATE=1;; esac
+[ "$FAILGATE" = 1 ] && { log "P0 gate failed — see $RESULTS (diagnosis mode: fix env, rerun)"; }
+if [ "$FAILGATE" = 0 ]; then
+	case ",$PHASES," in *,p1,*)
+		p1; rc=$?
+		if [ $rc -ne 0 ] && [ $rc -ne 4 ] && [ "$REHEARSAL" = 0 ]; then
+			log "P1 gate failed — GDS-native unusable; continuing in advertise-assertion-only mode"
+		fi
+	;; esac
+	case ",$PHASES," in *,p2,*) p2 || true;; esac
+	case ",$PHASES," in *,p3,*) p3;; esac
+	case ",$PHASES," in *,p4,*) p4;; esac
+	case ",$PHASES," in *,p5,*) p5 || true;; esac
+	case ",$PHASES," in *,p6,*) p6;; esac
+fi
+log "campaign finished — verdicts:"
+# column(1) ships in a separate package on some distros (e.g. Ubuntu's
+# bsdextrautils) and may be absent; degrade to a plain dump rather than
+# losing the verdict tee to a "command not found".
+if command -v column >/dev/null 2>&1; then
+	column -t -s $'\t' "$RESULTS/verdict.tsv" | tee -a "$RESULTS/campaign.log"
+else
+	log "(column not found — printing verdict.tsv unaligned)"
+	tee -a "$RESULTS/campaign.log" < "$RESULTS/verdict.tsv"
+fi
+grep -q $'\tFAIL\t' "$RESULTS/verdict.tsv" && exit 1
+exit 0
